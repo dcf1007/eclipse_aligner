@@ -19,24 +19,30 @@ def fit_circle_least_squares(points):
     b = x**2 + y**2
 
     try:
-        solution, _, _, _ = np.linalg.lstsq(a, b, rcond=None)
+        solution, _, rank, _ = np.linalg.lstsq(a, b, rcond=None)
     except np.linalg.LinAlgError:
+        return None
+
+    if rank < 3:
         return None
 
     cx, cy, c = solution
     radius_squared = c + cx**2 + cy**2
-    if radius_squared <= 0:
+    if radius_squared <= 0 or not np.isfinite(radius_squared):
         return None
 
     radius = math.sqrt(radius_squared)
-    distances = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    distances = np.hypot(x - cx, y - cy)
     mean_error = float(np.mean(np.abs(distances - radius)))
+
+    if not all(np.isfinite(value) for value in (cx, cy, radius, mean_error)):
+        return None
 
     return float(cx), float(cy), float(radius), mean_error
 
 
 def angular_coverage(points, cx, cy):
-    """Return the fraction (0..1) of the fitted circle covered by a contour."""
+    """Return the fraction (0..1) of a fitted circle covered by the points."""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 2:
         return 0.0
@@ -51,7 +57,204 @@ def angular_coverage(points, cx, cy):
     wrap_gap = (angles[0] + 2.0 * np.pi) - angles[-1]
     largest_gap = float(np.max(np.append(gaps, wrap_gap)))
 
-    return 1.0 - largest_gap / (2.0 * np.pi)
+    return float(np.clip(1.0 - largest_gap / (2.0 * np.pi), 0.0, 1.0))
+
+
+def _candidate_window_lengths(point_count, min_region_points):
+    """Generate coarse contiguous-region sizes from short arcs to full contour."""
+    min_region_points = max(3, min(min_region_points, point_count))
+    lengths = {min_region_points, point_count}
+
+    length = min_region_points
+    while length < point_count:
+        lengths.add(length)
+        next_length = max(length + 1, int(round(length * 1.35)))
+        length = min(point_count, next_length)
+
+    return sorted(lengths)
+
+
+def _evaluate_circular_region(
+    extended_points,
+    contour_point_count,
+    start,
+    length,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+):
+    """
+    Fit one contiguous section of a closed contour and score how circular it is.
+
+    The region, not the whole contour, is used to estimate the circle.
+    """
+    if length < 3 or length > contour_point_count:
+        return None
+
+    start %= contour_point_count
+    region = extended_points[start : start + length]
+
+    fitted = fit_circle_least_squares(region)
+    if fitted is None:
+        return None
+
+    cx, cy, radius, mean_error = fitted
+    if radius < min_radius or radius > max_radius:
+        return None
+
+    relative_error = mean_error / radius
+    if relative_error > max_relative_error:
+        return None
+
+    coverage = angular_coverage(region, cx, cy)
+    if coverage < min_coverage:
+        return None
+
+    # A tiny region can have an artificially tiny residual, so the score also
+    # rewards angular coverage and the amount of contiguous contour support.
+    # This lets a clean, meaningful arc beat a few coincidental points.
+    error_floor = 0.002
+    support_fraction = length / contour_point_count
+    score = (
+        (coverage**1.5)
+        * math.sqrt(float(length))
+        * (0.75 + 0.25 * math.sqrt(support_fraction))
+        / (relative_error + error_floor)
+    )
+
+    return {
+        "center": (cx, cy),
+        "radius": radius,
+        "error": mean_error,
+        "relative_error": relative_error,
+        "coverage": coverage,
+        "points": region.copy(),
+        "region_start": start,
+        "region_length": length,
+        "contour_points": contour_point_count,
+        "score": score,
+    }
+
+
+def _hill_climb_region(
+    candidate,
+    extended_points,
+    contour_point_count,
+    min_region_points,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+):
+    """Refine the two boundaries of a coarse circular region one point at a time."""
+    best = candidate
+
+    # Boundary moves:
+    #   start - 1, length + 1  -> grow at the beginning
+    #   start,     length + 1  -> grow at the end
+    #   start + 1, length - 1  -> shrink at the beginning
+    #   start,     length - 1  -> shrink at the end
+    moves = ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0))
+
+    for _ in range(80):
+        improved = False
+        current_start = best["region_start"]
+        current_length = best["region_length"]
+
+        for start_delta, length_delta in moves:
+            new_length = current_length + length_delta
+            if new_length < min_region_points or new_length > contour_point_count:
+                continue
+
+            trial = _evaluate_circular_region(
+                extended_points,
+                contour_point_count,
+                current_start + start_delta,
+                new_length,
+                min_radius,
+                max_radius,
+                max_relative_error,
+                min_coverage,
+            )
+            if trial is not None and trial["score"] > best["score"] * (1.0 + 1e-9):
+                best = trial
+                improved = True
+
+        if not improved:
+            break
+
+    return best
+
+
+def find_best_circular_region(
+    points,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+    min_region_points=20,
+):
+    """
+    Find the contiguous part of a closed contour that best follows a circle.
+
+    A multi-scale sliding-window search produces candidate arcs. The strongest
+    candidates are then refined by moving their boundaries point by point.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    point_count = len(points)
+
+    if point_count < max(3, min_region_points):
+        return None
+
+    min_region_points = min(min_region_points, point_count)
+
+    # Duplicate the contour once so a region may cross the contour's 0/N seam.
+    extended_points = np.vstack((points, points))
+    coarse_candidates = []
+
+    for length in _candidate_window_lengths(point_count, min_region_points):
+        # Search more densely for short regions and still sample long regions
+        # sufficiently well. The final boundary refinement removes quantization.
+        step = max(1, length // 8)
+
+        for start in range(0, point_count, step):
+            candidate = _evaluate_circular_region(
+                extended_points,
+                point_count,
+                start,
+                length,
+                min_radius,
+                max_radius,
+                max_relative_error,
+                min_coverage,
+            )
+            if candidate is not None:
+                coarse_candidates.append(candidate)
+
+    if not coarse_candidates:
+        return None
+
+    coarse_candidates.sort(key=lambda item: item["score"], reverse=True)
+
+    # Refining several coarse seeds protects against the highest coarse score
+    # landing near, but not exactly on, the best arc boundaries.
+    best = None
+    for seed in coarse_candidates[:8]:
+        refined = _hill_climb_region(
+            seed,
+            extended_points,
+            point_count,
+            min_region_points,
+            min_radius,
+            max_radius,
+            max_relative_error,
+            min_coverage,
+        )
+        if best is None or refined["score"] > best["score"]:
+            best = refined
+
+    return best
 
 
 def detect_circular_objects(
@@ -63,7 +266,13 @@ def detect_circular_objects(
     max_relative_error=0.08,
     min_coverage=0.12,
 ):
-    """Detect up to max_objects contours compatible with circles or arcs."""
+    """
+    Detect up to max_objects circles from the best circular region of contours.
+
+    The full contour is never required to be circular. For each contour the
+    detector searches for the strongest contiguous circular arc and fits only
+    that region.
+    """
     height, width = binary.shape[:2]
     if max_radius is None:
         max_radius = float(max(width, height))
@@ -75,42 +284,24 @@ def detect_circular_objects(
     )
 
     candidates = []
+    min_region_points = max(12, min_contour_points)
 
     for contour in contours:
-        if len(contour) < min_contour_points:
+        if len(contour) < min_region_points:
             continue
 
-        points = contour.reshape(-1, 2)
-        fitted = fit_circle_least_squares(points)
-        if fitted is None:
-            continue
+        points = contour.reshape(-1, 2).astype(np.float64)
 
-        cx, cy, radius, mean_error = fitted
-        if radius < min_radius or radius > max_radius:
-            continue
-
-        relative_error = mean_error / radius
-        if relative_error > max_relative_error:
-            continue
-
-        coverage = angular_coverage(points, cx, cy)
-        if coverage < min_coverage:
-            continue
-
-        # Prefer long, well-covered contours with low radial fitting error.
-        score = coverage * len(points) / (relative_error + 0.001)
-
-        candidates.append(
-            {
-                "center": (cx, cy),
-                "radius": radius,
-                "error": mean_error,
-                "relative_error": relative_error,
-                "coverage": coverage,
-                "points": points,
-                "score": score,
-            }
+        candidate = find_best_circular_region(
+            points,
+            min_radius=min_radius,
+            max_radius=max_radius,
+            max_relative_error=max_relative_error,
+            min_coverage=min_coverage,
+            min_region_points=min_region_points,
         )
+        if candidate is not None:
+            candidates.append(candidate)
 
     candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
 
@@ -152,7 +343,7 @@ def process_image(
     min_coverage=0.12,
     morphology=False,
 ):
-    """Threshold an image, detect circular objects, and overlay full circles."""
+    """Threshold an image, find circular regions, and overlay inferred circles."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     threshold_mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
 
@@ -189,7 +380,19 @@ def process_image(
         center = (int(round(cx)), int(round(cy)))
         radius_int = int(round(radius))
 
-        # OpenCV uses BGR; (0, 0, 255) is red.
+        # Show the exact contour region that was used for the fit in green.
+        support_points = np.rint(detection["points"]).astype(np.int32).reshape(-1, 1, 2)
+        if len(support_points) >= 2:
+            cv2.polylines(
+                output,
+                [support_points],
+                False,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # Draw the complete circle inferred from that region in red.
         cv2.circle(output, center, radius_int, (0, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(output, center, 3, (0, 0, 255), -1)
 
@@ -197,12 +400,13 @@ def process_image(
         label = (
             f"{index}: r={radius:.1f} "
             f"arc={coverage_degrees:.0f}deg "
-            f"err={detection['relative_error']:.3f}"
+            f"err={detection['relative_error']:.3f} "
+            f"support={detection['region_length']}/{detection['contour_points']}"
         )
         cv2.putText(
             output,
             label,
-            (center[0] + 10, center[1] - 10),
+            (center[0] + 10, max(18, center[1] - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             (0, 0, 255),
@@ -216,8 +420,8 @@ def process_image(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Threshold an image and detect up to two circular objects from "
-            "full circles, partial circles, or arcs."
+            "Threshold an image and detect up to two circles by finding the "
+            "contiguous region of each contour that follows a circle best."
         )
     )
     parser.add_argument("image", help="Path to the input image")
@@ -248,7 +452,7 @@ def main():
         "--min-coverage",
         type=float,
         default=0.12,
-        help="Minimum visible circle fraction, 0..1 (default: 0.12)",
+        help="Minimum angular coverage of the selected circular region, 0..1 (default: 0.12)",
     )
     parser.add_argument(
         "--morphology",
@@ -321,7 +525,9 @@ def main():
                     f"center=({cx:.2f}, {cy:.2f}), "
                     f"radius={detection['radius']:.2f}, "
                     f"coverage={detection['coverage'] * 360.0:.1f} deg, "
-                    f"relative_error={detection['relative_error']:.4f}"
+                    f"relative_error={detection['relative_error']:.4f}, "
+                    f"support_points={detection['region_length']}/"
+                    f"{detection['contour_points']}"
                 )
 
     cv2.destroyAllWindows()
