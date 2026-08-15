@@ -370,6 +370,64 @@ def detect_round_objects(
     return selected
 
 
+def normalize_roi(image, roi):
+    """Clamp an ROI to the image; a missing/empty ROI means the full image."""
+    image_height, image_width = image.shape[:2]
+
+    if roi is None:
+        return (0, 0, image_width, image_height)
+
+    x, y, width, height = (int(round(value)) for value in roi)
+    if width <= 0 or height <= 0:
+        return (0, 0, image_width, image_height)
+
+    x = max(0, min(x, image_width - 1))
+    y = max(0, min(y, image_height - 1))
+    width = max(1, min(width, image_width - x))
+    height = max(1, min(height, image_height - y))
+
+    return (x, y, width, height)
+
+
+def select_detection_roi(image):
+    """
+    Let the user drag a rectangular detection area.
+
+    Enter/Space accepts the rectangle. Esc/C cancels; cancellation deliberately
+    falls back to the whole image so the detector remains usable.
+    """
+    selector_name = "Select detection area"
+    print(
+        "Select the detection area, then press ENTER or SPACE. "
+        "Press C/ESC to use the full image."
+    )
+
+    roi = cv2.selectROI(
+        selector_name,
+        image,
+        showCrosshair=True,
+        fromCenter=False,
+    )
+    cv2.destroyWindow(selector_name)
+    return normalize_roi(image, roi)
+
+
+def offset_detection(detection, offset_x, offset_y):
+    """Convert a detection from ROI-local coordinates to image coordinates."""
+    result = detection.copy()
+
+    cx, cy = detection["center"]
+    result["center"] = (cx + offset_x, cy + offset_y)
+
+    if "points" in detection:
+        points = np.asarray(detection["points"], dtype=np.float64).copy()
+        points[:, 0] += offset_x
+        points[:, 1] += offset_y
+        result["points"] = points
+
+    return result
+
+
 def process_image(
     image,
     threshold_value,
@@ -379,29 +437,33 @@ def process_image(
     min_coverage=0.12,
     morphology=False,
     max_smoothing_passes=12,
+    roi=None,
 ):
-    """Threshold an image, detect round objects, and overlay full fits."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    """Threshold only the selected ROI, detect round objects, and overlay fits."""
+    x, y, width, height = normalize_roi(image, roi)
+    roi_image = image[y : y + height, x : x + width]
+
+    gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
     threshold_mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
 
-    _, binary = cv2.threshold(
+    _, binary_roi = cv2.threshold(
         gray,
         int(threshold_value),
         255,
         threshold_mode,
     )
 
-    binary_for_detection = binary
+    binary_for_detection_roi = binary_roi
     if morphology:
         kernel = np.ones((3, 3), np.uint8)
-        binary_for_detection = cv2.morphologyEx(
-            binary,
+        binary_for_detection_roi = cv2.morphologyEx(
+            binary_roi,
             cv2.MORPH_OPEN,
             kernel,
         )
 
-    detections = detect_round_objects(
-        binary_for_detection,
+    local_detections = detect_round_objects(
+        binary_for_detection_roi,
         max_objects=2,
         min_contour_points=20,
         min_radius=min_radius,
@@ -409,8 +471,31 @@ def process_image(
         min_coverage=min_coverage,
         max_smoothing_passes=max_smoothing_passes,
     )
+    detections = [
+        offset_detection(detection, x, y)
+        for detection in local_detections
+    ]
+
+    # Build full-size threshold images so the preview remains aligned with the
+    # original image. Pixels outside the ROI are black and are never detected.
+    binary = np.zeros(image.shape[:2], dtype=np.uint8)
+    binary_for_detection = np.zeros(image.shape[:2], dtype=np.uint8)
+    binary[y : y + height, x : x + width] = binary_roi
+    binary_for_detection[
+        y : y + height, x : x + width
+    ] = binary_for_detection_roi
 
     output = image.copy()
+
+    # ROI is a detection mask only. Reconstructed geometry may extend beyond it.
+    cv2.rectangle(
+        output,
+        (x, y),
+        (x + width - 1, y + height - 1),
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
     for index, detection in enumerate(detections, start=1):
         cx, cy = detection["center"]
@@ -464,7 +549,7 @@ def process_image(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Threshold an image and detect up to two round objects. "
+            "Threshold a selected image area and detect up to two round objects. "
             "Contours are progressively smoothed and fitted as circles first; "
             "failed circle fits fall back to ellipses."
         )
@@ -532,6 +617,8 @@ def main():
     if image is None:
         raise RuntimeError(f"Could not load image: {args.image}")
 
+    roi = select_detection_roi(image)
+
     window_name = "Circle / Ellipse Detection"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
@@ -568,6 +655,7 @@ def main():
             min_coverage=args.min_coverage,
             morphology=args.morphology,
             max_smoothing_passes=args.max_smoothing_passes,
+            roi=roi,
         )
 
         threshold_preview = cv2.cvtColor(
@@ -575,9 +663,21 @@ def main():
             cv2.COLOR_GRAY2BGR,
         )
 
+        x, y, width, height = roi
+        cv2.rectangle(
+            threshold_preview,
+            (x, y),
+            (x + width - 1, y + height - 1),
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
         status = (
             f"threshold={threshold_value}  "
-            f"max_relative_error={max_relative_error:.3f}"
+            f"max_relative_error={max_relative_error:.3f}  "
+            f"ROI=({x},{y},{width},{height})  "
+            "R=reselect ROI"
         )
         cv2.putText(
             threshold_preview,
@@ -597,6 +697,26 @@ def main():
         if key in (27, ord("q")):
             break
 
+        if key == ord("r"):
+            cv2.destroyWindow(window_name)
+            roi = select_detection_roi(image)
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.createTrackbar(
+                "Threshold",
+                window_name,
+                threshold_value,
+                255,
+                lambda _value: None,
+            )
+            cv2.createTrackbar(
+                "Max error x1000",
+                window_name,
+                max(1, error_slider),
+                500,
+                lambda _value: None,
+            )
+            continue
+
         if key == ord("s"):
             if not cv2.imwrite(args.output, result):
                 raise RuntimeError(f"Could not write output image: {args.output}")
@@ -604,7 +724,8 @@ def main():
             print(f"Saved: {args.output}")
             print(
                 f"threshold={threshold_value}, "
-                f"max_relative_error={max_relative_error:.3f}"
+                f"max_relative_error={max_relative_error:.3f}, "
+                f"roi={roi}"
             )
 
             for index, detection in enumerate(detections, start=1):
