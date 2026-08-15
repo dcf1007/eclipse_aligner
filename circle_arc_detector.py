@@ -1,34 +1,50 @@
 import argparse
 import math
+import time
 
 import cv2
 import numpy as np
 
 
+CONTROL_BAR_HEIGHT = 52
+APPLY_RECT = (10, 9, 120, 35)
+SAVE_RECT = (140, 9, 120, 35)
+MORPH_KERNEL = np.ones((3, 3), dtype=np.uint8)
+
+
 def fit_circle_least_squares(points):
-    """Fit a circle to Nx2 contour points using linear least squares."""
+    """Fit a circle to Nx2 points with a fast centered algebraic fit."""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 3:
         return None
 
     x = points[:, 0]
     y = points[:, 1]
+    xm = float(x.mean())
+    ym = float(y.mean())
 
-    # x^2 + y^2 = 2*cx*x + 2*cy*y + c
-    a = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
-    b = x**2 + y**2
+    u = x - xm
+    v = y - ym
+    z = u * u + v * v
 
-    try:
-        solution, _, rank, _ = np.linalg.lstsq(a, b, rcond=None)
-    except np.linalg.LinAlgError:
+    suu = float(np.dot(u, u))
+    svv = float(np.dot(v, v))
+    suv = float(np.dot(u, v))
+    suz = float(np.dot(u, z))
+    svz = float(np.dot(v, z))
+
+    det = suu * svv - suv * suv
+    scale = suu * svv + 1.0
+    if abs(det) <= 1e-12 * scale:
         return None
 
-    if rank < 3:
-        return None
+    uc = 0.5 * (suz * svv - svz * suv) / det
+    vc = 0.5 * (svz * suu - suz * suv) / det
+    cx = xm + uc
+    cy = ym + vc
 
-    cx, cy, c = solution
-    radius_squared = c + cx**2 + cy**2
-    if radius_squared <= 0 or not np.isfinite(radius_squared):
+    radius_squared = float(z.mean()) + uc * uc + vc * vc
+    if radius_squared <= 0.0 or not np.isfinite(radius_squared):
         return None
 
     radius = math.sqrt(radius_squared)
@@ -42,22 +58,15 @@ def fit_circle_least_squares(points):
 
 
 def angular_coverage(points, cx, cy):
-    """Return the fraction (0..1) of a fitted circle covered by the points."""
+    """Estimate angular coverage of a contiguous contour region without sorting."""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 2:
         return 0.0
 
-    angles = np.mod(
-        np.arctan2(points[:, 1] - cy, points[:, 0] - cx),
-        2.0 * np.pi,
-    )
-    angles = np.sort(angles)
-
-    gaps = np.diff(angles)
-    wrap_gap = (angles[0] + 2.0 * np.pi) - angles[-1]
-    largest_gap = float(np.max(np.append(gaps, wrap_gap)))
-
-    return float(np.clip(1.0 - largest_gap / (2.0 * np.pi), 0.0, 1.0))
+    angles = np.arctan2(points[:, 1] - cy, points[:, 0] - cx)
+    unwrapped = np.unwrap(angles)
+    span = float(np.ptp(unwrapped))
+    return float(np.clip(span / (2.0 * np.pi), 0.0, 1.0))
 
 
 def _candidate_window_lengths(point_count, min_region_points):
@@ -68,7 +77,7 @@ def _candidate_window_lengths(point_count, min_region_points):
     length = min_region_points
     while length < point_count:
         lengths.add(length)
-        next_length = max(length + 1, int(round(length * 1.35)))
+        next_length = max(length + 1, int(round(length * 1.45)))
         length = min(point_count, next_length)
 
     return sorted(lengths)
@@ -84,11 +93,7 @@ def _evaluate_circular_region(
     max_relative_error,
     min_coverage,
 ):
-    """
-    Fit one contiguous section of a closed contour and score how circular it is.
-
-    The region, not the whole contour, is used to estimate the circle.
-    """
+    """Fit and score one contiguous section of a closed contour."""
     if length < 3 or length > contour_point_count:
         return None
 
@@ -111,9 +116,6 @@ def _evaluate_circular_region(
     if coverage < min_coverage:
         return None
 
-    # A tiny region can have an artificially tiny residual, so the score also
-    # rewards angular coverage and the amount of contiguous contour support.
-    # This lets a clean, meaningful arc beat a few coincidental points.
     error_floor = 0.002
     support_fraction = length / contour_point_count
     score = (
@@ -147,17 +149,11 @@ def _hill_climb_region(
     max_relative_error,
     min_coverage,
 ):
-    """Refine the two boundaries of a coarse circular region one point at a time."""
+    """Refine coarse arc boundaries locally."""
     best = candidate
-
-    # Boundary moves:
-    #   start - 1, length + 1  -> grow at the beginning
-    #   start,     length + 1  -> grow at the end
-    #   start + 1, length - 1  -> shrink at the beginning
-    #   start,     length - 1  -> shrink at the end
     moves = ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0))
 
-    for _ in range(80):
+    for _ in range(40):
         improved = False
         current_start = best["region_start"]
         current_length = best["region_length"]
@@ -193,14 +189,9 @@ def find_best_circular_region(
     max_radius,
     max_relative_error,
     min_coverage,
-    min_region_points=20,
+    min_region_points=12,
 ):
-    """
-    Find the contiguous part of a closed contour that best follows a circle.
-
-    A multi-scale sliding-window search produces candidate arcs. The strongest
-    candidates are then refined by moving their boundaries point by point.
-    """
+    """Find the contiguous part of a closed contour that best follows a circle."""
     points = np.asarray(points, dtype=np.float64)
     point_count = len(points)
 
@@ -208,15 +199,11 @@ def find_best_circular_region(
         return None
 
     min_region_points = min(min_region_points, point_count)
-
-    # Duplicate the contour once so a region may cross the contour's 0/N seam.
     extended_points = np.vstack((points, points))
     coarse_candidates = []
 
     for length in _candidate_window_lengths(point_count, min_region_points):
-        # Search more densely for short regions and still sample long regions
-        # sufficiently well. The final boundary refinement removes quantization.
-        step = max(1, length // 8)
+        step = max(1, length // 5)
 
         for start in range(0, point_count, step):
             candidate = _evaluate_circular_region(
@@ -237,10 +224,8 @@ def find_best_circular_region(
 
     coarse_candidates.sort(key=lambda item: item["score"], reverse=True)
 
-    # Refining several coarse seeds protects against the highest coarse score
-    # landing near, but not exactly on, the best arc boundaries.
     best = None
-    for seed in coarse_candidates[:8]:
+    for seed in coarse_candidates[:4]:
         refined = _hill_climb_region(
             seed,
             extended_points,
@@ -257,22 +242,33 @@ def find_best_circular_region(
     return best
 
 
+def _downsample_contour_points(points, max_search_points):
+    """Keep ordered contour geometry while bounding circular-region search cost."""
+    point_count = len(points)
+    if max_search_points <= 0 or point_count <= max_search_points:
+        return points
+
+    indices = np.linspace(
+        0,
+        point_count - 1,
+        max_search_points,
+        dtype=np.int32,
+    )
+    return points[indices]
+
+
 def detect_circular_objects(
     binary,
     max_objects=2,
-    min_contour_points=20,
+    min_contour_points=12,
     min_radius=10.0,
     max_radius=None,
     max_relative_error=0.08,
     min_coverage=0.12,
+    max_contours=100,
+    max_search_points=500,
 ):
-    """
-    Detect up to max_objects circles from the best circular region of contours.
-
-    The full contour is never required to be circular. For each contour the
-    detector searches for the strongest contiguous circular arc and fits only
-    that region.
-    """
+    """Detect up to max_objects circles from circular regions of contours."""
     height, width = binary.shape[:2]
     if max_radius is None:
         max_radius = float(max(width, height))
@@ -280,17 +276,28 @@ def detect_circular_objects(
     contours, _ = cv2.findContours(
         binary,
         cv2.RETR_LIST,
-        cv2.CHAIN_APPROX_NONE,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
 
-    candidates = []
-    min_region_points = max(12, min_contour_points)
+    min_region_points = max(8, min_contour_points)
 
+    usable = []
     for contour in contours:
         if len(contour) < min_region_points:
             continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter < max(12.0, min_radius * min_coverage * math.pi):
+            continue
+        usable.append((perimeter, contour))
 
-        points = contour.reshape(-1, 2).astype(np.float64)
+    usable.sort(key=lambda item: item[0], reverse=True)
+    if max_contours > 0:
+        usable = usable[:max_contours]
+
+    candidates = []
+    for _, contour in usable:
+        points = contour.reshape(-1, 2).astype(np.float64, copy=False)
+        points = _downsample_contour_points(points, max_search_points)
 
         candidate = find_best_circular_region(
             points,
@@ -305,8 +312,6 @@ def detect_circular_objects(
 
     candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
 
-    # RETR_LIST can expose both sides of the same edge. Remove near-identical
-    # circle fits so one physical circle does not consume both result slots.
     selected = []
     for candidate in candidates:
         cx, cy = candidate["center"]
@@ -342,34 +347,34 @@ def process_image(
     max_relative_error=0.08,
     min_coverage=0.12,
     morphology=False,
+    max_contours=100,
+    max_search_points=500,
+    gray=None,
 ):
     """Threshold an image, find circular regions, and overlay inferred circles."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    threshold_mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    if gray is None:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    _, binary = cv2.threshold(
-        gray,
-        int(threshold_value),
-        255,
-        threshold_mode,
-    )
+    threshold_mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray, int(threshold_value), 255, threshold_mode)
 
     binary_for_detection = binary
     if morphology:
-        kernel = np.ones((3, 3), np.uint8)
         binary_for_detection = cv2.morphologyEx(
             binary,
             cv2.MORPH_OPEN,
-            kernel,
+            MORPH_KERNEL,
         )
 
     detections = detect_circular_objects(
         binary_for_detection,
         max_objects=2,
-        min_contour_points=20,
+        min_contour_points=12,
         min_radius=min_radius,
         max_relative_error=max_relative_error,
         min_coverage=min_coverage,
+        max_contours=max_contours,
+        max_search_points=max_search_points,
     )
 
     output = image.copy()
@@ -380,7 +385,6 @@ def process_image(
         center = (int(round(cx)), int(round(cy)))
         radius_int = int(round(radius))
 
-        # Show the exact contour region that was used for the fit in green.
         support_points = np.rint(detection["points"]).astype(np.int32).reshape(-1, 1, 2)
         if len(support_points) >= 2:
             cv2.polylines(
@@ -392,7 +396,6 @@ def process_image(
                 cv2.LINE_AA,
             )
 
-        # Draw the complete circle inferred from that region in red.
         cv2.circle(output, center, radius_int, (0, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(output, center, 3, (0, 0, 255), -1)
 
@@ -415,6 +418,86 @@ def process_image(
         )
 
     return binary, binary_for_detection, output, detections
+
+
+def _point_in_rect(x, y, rect):
+    rx, ry, rw, rh = rect
+    return rx <= x < rx + rw and ry <= y < ry + rh
+
+
+def _make_display(binary_for_detection, result, applied_threshold, elapsed_ms):
+    """Build a bounded-size preview; called only after Apply."""
+    threshold_preview = cv2.cvtColor(binary_for_detection, cv2.COLOR_GRAY2BGR)
+    body = np.hstack((threshold_preview, result))
+
+    max_width = 1600
+    max_body_height = 820
+    scale = min(1.0, max_width / body.shape[1], max_body_height / body.shape[0])
+    if scale < 1.0:
+        body = cv2.resize(
+            body,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+
+    min_width = 560
+    if body.shape[1] < min_width:
+        body = cv2.copyMakeBorder(
+            body,
+            0,
+            0,
+            0,
+            min_width - body.shape[1],
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+
+    bar = np.full((CONTROL_BAR_HEIGHT, body.shape[1], 3), 42, dtype=np.uint8)
+
+    for rect, label in ((APPLY_RECT, "Apply"), (SAVE_RECT, "Save")):
+        x, y, w, h = rect
+        cv2.rectangle(bar, (x, y), (x + w, y + h), (215, 215, 215), -1)
+        cv2.rectangle(bar, (x, y), (x + w, y + h), (245, 245, 245), 1)
+        cv2.putText(
+            bar,
+            label,
+            (x + 28, y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+    status = f"Applied threshold: {applied_threshold}   processing: {elapsed_ms:.1f} ms"
+    cv2.putText(
+        bar,
+        status,
+        (280, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return np.vstack((bar, body))
+
+
+def _print_detections(detections):
+    for index, detection in enumerate(detections, start=1):
+        cx, cy = detection["center"]
+        print(
+            f"Object {index}: "
+            f"center=({cx:.2f}, {cy:.2f}), "
+            f"radius={detection['radius']:.2f}, "
+            f"coverage={detection['coverage'] * 360.0:.1f} deg, "
+            f"relative_error={detection['relative_error']:.4f}, "
+            f"support_points={detection['region_length']}/"
+            f"{detection['contour_points']}"
+        )
 
 
 def main():
@@ -460,9 +543,21 @@ def main():
         help="Apply a 3x3 morphological opening before contour detection",
     )
     parser.add_argument(
+        "--max-contours",
+        type=int,
+        default=100,
+        help="Maximum largest contours searched; 0 means unlimited (default: 100)",
+    )
+    parser.add_argument(
+        "--max-search-points",
+        type=int,
+        default=500,
+        help="Maximum ordered points searched per contour; 0 means unlimited (default: 500)",
+    )
+    parser.add_argument(
         "--output",
         default="detected_circles.png",
-        help="Output image written when S is pressed",
+        help="Output image written by Save or the S key",
     )
     args = parser.parse_args()
 
@@ -474,13 +569,19 @@ def main():
         parser.error("--max-error must be greater than zero")
     if not 0.0 <= args.min_coverage <= 1.0:
         parser.error("--min-coverage must be between 0 and 1")
+    if args.max_contours < 0:
+        parser.error("--max-contours must be zero or greater")
+    if args.max_search_points < 0:
+        parser.error("--max-search-points must be zero or greater")
 
     image = cv2.imread(args.image)
     if image is None:
         raise RuntimeError(f"Could not load image: {args.image}")
 
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
     window_name = "Circle / Arc Detection"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     cv2.createTrackbar(
         "Threshold",
         window_name,
@@ -489,46 +590,73 @@ def main():
         lambda _value: None,
     )
 
+    state = {
+        "apply_requested": True,
+        "save_requested": False,
+        "result": None,
+        "detections": [],
+    }
+
+    def on_mouse(event, x, y, _flags, _userdata):
+        if event != cv2.EVENT_LBUTTONUP:
+            return
+        if _point_in_rect(x, y, APPLY_RECT):
+            state["apply_requested"] = True
+        elif _point_in_rect(x, y, SAVE_RECT):
+            state["save_requested"] = True
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
     while True:
-        threshold_value = cv2.getTrackbarPos("Threshold", window_name)
+        if state["apply_requested"]:
+            state["apply_requested"] = False
+            threshold_value = cv2.getTrackbarPos("Threshold", window_name)
 
-        _, binary_for_detection, result, detections = process_image(
-            image,
-            threshold_value,
-            invert=args.invert,
-            min_radius=args.min_radius,
-            max_relative_error=args.max_error,
-            min_coverage=args.min_coverage,
-            morphology=args.morphology,
-        )
+            started = time.perf_counter()
+            _, binary_for_detection, result, detections = process_image(
+                image,
+                threshold_value,
+                invert=args.invert,
+                min_radius=args.min_radius,
+                max_relative_error=args.max_error,
+                min_coverage=args.min_coverage,
+                morphology=args.morphology,
+                max_contours=args.max_contours,
+                max_search_points=args.max_search_points,
+                gray=gray,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-        threshold_preview = cv2.cvtColor(
-            binary_for_detection,
-            cv2.COLOR_GRAY2BGR,
-        )
-        display = np.hstack((threshold_preview, result))
-        cv2.imshow(window_name, display)
+            state["result"] = result
+            state["detections"] = detections
+            display = _make_display(
+                binary_for_detection,
+                result,
+                threshold_value,
+                elapsed_ms,
+            )
+            cv2.imshow(window_name, display)
 
-        key = cv2.waitKey(20) & 0xFF
+            print(
+                f"Applied threshold {threshold_value}: "
+                f"{len(detections)} object(s), {elapsed_ms:.1f} ms"
+            )
+            _print_detections(detections)
+
+        if state["save_requested"]:
+            state["save_requested"] = False
+            if state["result"] is not None:
+                if not cv2.imwrite(args.output, state["result"]):
+                    raise RuntimeError(f"Could not write output image: {args.output}")
+                print(f"Saved: {args.output}")
+
+        key = cv2.waitKey(30) & 0xFF
         if key in (27, ord("q")):
             break
-
-        if key == ord("s"):
-            if not cv2.imwrite(args.output, result):
-                raise RuntimeError(f"Could not write output image: {args.output}")
-
-            print(f"Saved: {args.output}")
-            for index, detection in enumerate(detections, start=1):
-                cx, cy = detection["center"]
-                print(
-                    f"Object {index}: "
-                    f"center=({cx:.2f}, {cy:.2f}), "
-                    f"radius={detection['radius']:.2f}, "
-                    f"coverage={detection['coverage'] * 360.0:.1f} deg, "
-                    f"relative_error={detection['relative_error']:.4f}, "
-                    f"support_points={detection['region_length']}/"
-                    f"{detection['contour_points']}"
-                )
+        if key in (13, 32):
+            state["apply_requested"] = True
+        elif key == ord("s"):
+            state["save_requested"] = True
 
     cv2.destroyAllWindows()
 
