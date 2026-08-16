@@ -5,15 +5,8 @@ import time
 import cv2
 import numpy as np
 
-from circle_arc_detector_core import (
-    MORPH_KERNEL,
-    _candidate_window_lengths,
-    _evaluate_circular_region,
-    _hill_climb_region,
-    _downsample_contour_points,
-    build_threshold_palette,
-)
 
+MORPH_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
 CONTROL_BAR_HEIGHT = 154
 APPLY_RECT = (10, 9, 130, 36)
@@ -24,10 +17,176 @@ PALETTE_START_X = 410
 SWATCH_WIDTH = 42
 SWATCH_HEIGHT = 30
 SWATCH_GAP = 7
+
 MIN_INTERIOR_FRACTION = 0.50
+MAX_CLASS_CANDIDATES = 30
+MAX_REGIONS_PER_CONTOUR = 4
+
+TRACK_THRESHOLD = "Threshold brightness (0-255)"
+TRACK_MIN_RADIUS = "Minimum circle radius (px)"
+TRACK_MAX_RADIUS = "Maximum circle radius (px)"
+TRACK_MAX_ERROR = "Maximum avg radial error (%)"
+TRACK_MIN_COVERAGE = "Minimum visible arc (%)"
 
 
-def _same_circle_geometry(a, b, center_fraction=0.12, radius_fraction=0.12):
+def _fit_circle(points):
+    """Fast centered algebraic circle fit for Nx2 points."""
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < 3:
+        return None
+
+    x = points[:, 0]
+    y = points[:, 1]
+    xm = float(x.mean())
+    ym = float(y.mean())
+
+    u = x - xm
+    v = y - ym
+    z = u * u + v * v
+
+    suu = float(np.dot(u, u))
+    svv = float(np.dot(v, v))
+    suv = float(np.dot(u, v))
+    suz = float(np.dot(u, z))
+    svz = float(np.dot(v, z))
+
+    det = suu * svv - suv * suv
+    if abs(det) <= 1e-12 * (suu * svv + 1.0):
+        return None
+
+    uc = 0.5 * (suz * svv - svz * suv) / det
+    vc = 0.5 * (svz * suu - suz * suv) / det
+    cx = xm + uc
+    cy = ym + vc
+
+    radius_sq = float(z.mean()) + uc * uc + vc * vc
+    if radius_sq <= 0.0 or not np.isfinite(radius_sq):
+        return None
+
+    radius = math.sqrt(radius_sq)
+    mean_error = float(np.mean(np.abs(np.hypot(x - cx, y - cy) - radius)))
+    if not all(np.isfinite(value) for value in (cx, cy, radius, mean_error)):
+        return None
+
+    return float(cx), float(cy), float(radius), mean_error
+
+
+def _angular_coverage(points, cx, cy):
+    """Fraction of a full circle spanned by an ordered contour region."""
+    if len(points) < 2:
+        return 0.0
+
+    angles = np.arctan2(points[:, 1] - cy, points[:, 0] - cx)
+    return float(np.clip(np.ptp(np.unwrap(angles)) / (2.0 * np.pi), 0.0, 1.0))
+
+
+def _candidate_window_lengths(point_count, min_region_points):
+    min_region_points = max(3, min(min_region_points, point_count))
+    lengths = {min_region_points, point_count}
+
+    length = min_region_points
+    while length < point_count:
+        lengths.add(length)
+        length = min(point_count, max(length + 1, int(round(length * 1.45))))
+
+    return sorted(lengths)
+
+
+def _evaluate_region(
+    extended_points,
+    contour_point_count,
+    start,
+    length,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+):
+    if length < 3 or length > contour_point_count:
+        return None
+
+    start %= contour_point_count
+    region = extended_points[start : start + length]
+    fitted = _fit_circle(region)
+    if fitted is None:
+        return None
+
+    cx, cy, radius, mean_error = fitted
+    if radius < min_radius or radius > max_radius:
+        return None
+
+    relative_error = mean_error / radius
+    if relative_error > max_relative_error:
+        return None
+
+    coverage = _angular_coverage(region, cx, cy)
+    if coverage < min_coverage:
+        return None
+
+    support_fraction = length / contour_point_count
+    score = (
+        coverage**1.5
+        * math.sqrt(float(length))
+        * (0.75 + 0.25 * math.sqrt(support_fraction))
+        / (relative_error + 0.002)
+    )
+
+    return {
+        "center": (cx, cy),
+        "radius": radius,
+        "relative_error": relative_error,
+        "coverage": coverage,
+        "points": region.copy(),
+        "region_start": start,
+        "region_length": length,
+        "score": score,
+    }
+
+
+def _refine_region(
+    candidate,
+    extended_points,
+    contour_point_count,
+    min_region_points,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+):
+    best = candidate
+    moves = ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0))
+
+    for _ in range(40):
+        improved = False
+        start = best["region_start"]
+        length = best["region_length"]
+
+        for start_delta, length_delta in moves:
+            new_length = length + length_delta
+            if not min_region_points <= new_length <= contour_point_count:
+                continue
+
+            trial = _evaluate_region(
+                extended_points,
+                contour_point_count,
+                start + start_delta,
+                new_length,
+                min_radius,
+                max_radius,
+                max_relative_error,
+                min_coverage,
+            )
+            if trial is not None and trial["score"] > best["score"] * (1.0 + 1e-9):
+                best = trial
+                improved = True
+
+        if not improved:
+            break
+
+    return best
+
+
+def _same_circle(a, b, center_fraction=0.12, radius_fraction=0.12):
     ax, ay = a["center"]
     bx, by = b["center"]
     ar = a["radius"]
@@ -39,30 +198,29 @@ def _same_circle_geometry(a, b, center_fraction=0.12, radius_fraction=0.12):
     )
 
 
-def find_circular_regions(
+def _find_regions(
     points,
     min_radius,
     max_radius,
     max_relative_error,
     min_coverage,
     min_region_points=12,
-    max_regions=4,
 ):
-    """Return several geometrically distinct circular arcs from one contour."""
+    """Find distinct circular arcs that may share one composite contour."""
     points = np.asarray(points, dtype=np.float64)
     point_count = len(points)
     if point_count < max(3, min_region_points):
         return []
 
     min_region_points = min(min_region_points, point_count)
-    extended_points = np.vstack((points, points))
-    coarse_candidates = []
+    extended = np.vstack((points, points))
+    coarse = []
 
     for length in _candidate_window_lengths(point_count, min_region_points):
         step = max(1, length // 5)
         for start in range(0, point_count, step):
-            candidate = _evaluate_circular_region(
-                extended_points,
+            candidate = _evaluate_region(
+                extended,
                 point_count,
                 start,
                 length,
@@ -72,26 +230,27 @@ def find_circular_regions(
                 min_coverage,
             )
             if candidate is not None:
-                coarse_candidates.append(candidate)
+                coarse.append(candidate)
 
-    if not coarse_candidates:
+    if not coarse:
         return []
 
-    coarse_candidates.sort(key=lambda item: item["score"], reverse=True)
+    coarse.sort(key=lambda item: item["score"], reverse=True)
 
     seeds = []
-    for candidate in coarse_candidates:
-        if any(_same_circle_geometry(candidate, existing, 0.10, 0.10) for existing in seeds):
+    seed_limit = max(8, MAX_REGIONS_PER_CONTOUR * 4)
+    for candidate in coarse:
+        if any(_same_circle(candidate, existing, 0.10, 0.10) for existing in seeds):
             continue
         seeds.append(candidate)
-        if len(seeds) >= max(8, max_regions * 4):
+        if len(seeds) >= seed_limit:
             break
 
-    refined_candidates = []
+    refined = []
     for seed in seeds:
-        refined = _hill_climb_region(
+        candidate = _refine_region(
             seed,
-            extended_points,
+            extended,
             point_count,
             min_region_points,
             min_radius,
@@ -99,39 +258,42 @@ def find_circular_regions(
             max_relative_error,
             min_coverage,
         )
-        if any(_same_circle_geometry(refined, existing) for existing in refined_candidates):
-            continue
-        refined_candidates.append(refined)
+        if not any(_same_circle(candidate, existing) for existing in refined):
+            refined.append(candidate)
 
-    refined_candidates.sort(key=lambda item: item["score"], reverse=True)
-    return refined_candidates[:max_regions]
+    refined.sort(key=lambda item: item["score"], reverse=True)
+    return refined[:MAX_REGIONS_PER_CONTOUR]
 
 
-def find_circular_candidates(
+def _downsample_points(points, max_points):
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+
+    indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
+    return points[indices]
+
+
+def _find_candidates(
     binary,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+    max_contours,
+    max_search_points,
     min_contour_points=12,
-    min_radius=10.0,
-    max_radius=None,
-    max_relative_error=0.08,
-    min_coverage=0.12,
-    max_contours=100,
-    max_search_points=500,
 ):
-    height, width = binary.shape[:2]
-    if max_radius is None:
-        max_radius = float(max(width, height))
-
     contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     min_region_points = max(8, min_contour_points)
+    min_perimeter = max(12.0, min_radius * min_coverage * math.pi)
 
     usable = []
     for contour in contours:
         if len(contour) < min_region_points:
             continue
         perimeter = cv2.arcLength(contour, True)
-        if perimeter < max(12.0, min_radius * min_coverage * math.pi):
-            continue
-        usable.append((perimeter, contour))
+        if perimeter >= min_perimeter:
+            usable.append((perimeter, contour))
 
     usable.sort(key=lambda item: item[0], reverse=True)
     if max_contours > 0:
@@ -140,25 +302,25 @@ def find_circular_candidates(
     candidates = []
     for _, contour in usable:
         points = contour.reshape(-1, 2).astype(np.float64, copy=False)
-        points = _downsample_contour_points(points, max_search_points)
+        points = _downsample_points(points, max_search_points)
         candidates.extend(
-            find_circular_regions(
+            _find_regions(
                 points,
-                min_radius=min_radius,
-                max_radius=max_radius,
-                max_relative_error=max_relative_error,
-                min_coverage=min_coverage,
-                min_region_points=min_region_points,
-                max_regions=4,
+                min_radius,
+                max_radius,
+                max_relative_error,
+                min_coverage,
+                min_region_points,
             )
         )
 
-    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+    candidates.sort(key=lambda item: item["score"], reverse=True)
     return candidates
 
 
-def _interior_fraction(class_mask, candidate, excluded_circle=None):
-    height, width = class_mask.shape[:2]
+def _interior_match_fraction(class_mask, candidate, excluded_circle=None):
+    """Fraction of the candidate interior belonging to this threshold class."""
+    height, width = class_mask.shape
     cx, cy = candidate["center"]
     radius = candidate["radius"]
 
@@ -177,41 +339,41 @@ def _interior_fraction(class_mask, candidate, excluded_circle=None):
         er = excluded_circle["radius"]
         valid &= (xx - ex) ** 2 + (yy - ey) ** 2 > er * er
 
-    valid_count = int(np.count_nonzero(valid))
-    if valid_count == 0:
+    visible_pixels = int(np.count_nonzero(valid))
+    if visible_pixels == 0:
         return 0.0, 0
 
     roi = class_mask[y0:y1, x0:x1]
-    class_count = int(np.count_nonzero(roi[valid]))
-    return class_count / valid_count, valid_count
+    matching_pixels = int(np.count_nonzero(roi[valid]))
+    return matching_pixels / visible_pixels, visible_pixels
 
 
-def _choose_class_candidate(candidates, class_mask, label, excluded_circle=None):
+def _select_class_circle(candidates, class_mask, label, excluded_circle=None):
     best = None
-    best_class_score = -math.inf
+    best_score = -math.inf
 
-    for candidate in candidates[:30]:
-        fraction, visible_pixels = _interior_fraction(
+    for candidate in candidates[:MAX_CLASS_CANDIDATES]:
+        match_fraction, visible_pixels = _interior_match_fraction(
             class_mask,
             candidate,
-            excluded_circle=excluded_circle,
+            excluded_circle,
         )
-        if visible_pixels < 16 or fraction < MIN_INTERIOR_FRACTION:
+        if visible_pixels < 16 or match_fraction < MIN_INTERIOR_FRACTION:
             continue
 
-        class_score = candidate["score"] * (fraction**2)
-        if class_score > best_class_score:
+        score = candidate["score"] * match_fraction**2
+        if score > best_score:
             best = candidate.copy()
             best["class"] = label
-            best["interior_fraction"] = fraction
-            best_class_score = class_score
+            best["interior_fraction"] = match_fraction
+            best_score = score
 
     return best
 
 
-def detect_dark_bright_circles(
+def detect_circles(
     gray,
-    threshold_value,
+    threshold,
     min_radius,
     max_radius,
     max_relative_error,
@@ -220,76 +382,67 @@ def detect_dark_bright_circles(
     max_contours=100,
     max_search_points=500,
 ):
-    threshold_value = int(threshold_value)
+    """
+    Return at most two circles: one <= threshold and one > threshold.
 
-    _, dark_mask = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY_INV)
-    _, bright_mask = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
+    The <= threshold circle is selected first and owns geometric overlap.
+    """
+    threshold = int(threshold)
+    _, dark_mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+    _, bright_mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
 
-    dark_detection_mask = dark_mask
-    bright_detection_mask = bright_mask
     if morphology:
-        dark_detection_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, MORPH_KERNEL)
-        bright_detection_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, MORPH_KERNEL)
+        dark_detection = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, MORPH_KERNEL)
+        bright_detection = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, MORPH_KERNEL)
+    else:
+        dark_detection = dark_mask
+        bright_detection = bright_mask
 
-    common = dict(
-        min_contour_points=12,
-        min_radius=min_radius,
-        max_radius=max_radius,
-        max_relative_error=max_relative_error,
-        min_coverage=min_coverage,
-        max_contours=max_contours,
-        max_search_points=max_search_points,
+    candidate_args = (
+        min_radius,
+        max_radius,
+        max_relative_error,
+        min_coverage,
+        max_contours,
+        max_search_points,
     )
+    dark_candidates = _find_candidates(dark_detection, *candidate_args)
+    bright_candidates = _find_candidates(bright_detection, *candidate_args)
 
-    dark_candidates = find_circular_candidates(dark_detection_mask, **common)
-    bright_candidates = find_circular_candidates(bright_detection_mask, **common)
-
-    dark_circle = _choose_class_candidate(
-        dark_candidates,
-        dark_mask,
-        label="below threshold",
-    )
-    bright_circle = _choose_class_candidate(
+    dark_circle = _select_class_circle(dark_candidates, dark_mask, "below threshold")
+    bright_circle = _select_class_circle(
         bright_candidates,
         bright_mask,
-        label="above threshold",
+        "above threshold",
         excluded_circle=dark_circle,
     )
 
-    detections = []
-    if dark_circle is not None:
-        detections.append(dark_circle)
-    if bright_circle is not None:
-        detections.append(bright_circle)
-
+    detections = [circle for circle in (dark_circle, bright_circle) if circle is not None]
     return bright_mask, detections
 
 
 def process_image(
     image,
-    threshold_value,
-    min_radius=10.0,
-    max_radius=None,
-    max_relative_error=0.08,
-    min_coverage=0.12,
-    morphology=False,
-    max_contours=100,
-    max_search_points=500,
-    gray=None,
+    gray,
+    threshold,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+    morphology,
+    max_contours,
+    max_search_points,
 ):
-    if gray is None:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    binary, detections = detect_dark_bright_circles(
+    binary, detections = detect_circles(
         gray,
-        threshold_value,
-        min_radius=min_radius,
-        max_radius=max_radius,
-        max_relative_error=max_relative_error,
-        min_coverage=min_coverage,
-        morphology=morphology,
-        max_contours=max_contours,
-        max_search_points=max_search_points,
+        threshold,
+        min_radius,
+        max_radius,
+        max_relative_error,
+        min_coverage,
+        morphology,
+        max_contours,
+        max_search_points,
     )
 
     output = image.copy()
@@ -299,18 +452,17 @@ def process_image(
         center = (int(round(cx)), int(round(cy)))
         radius_int = int(round(radius))
 
-        support_points = np.rint(detection["points"]).astype(np.int32).reshape(-1, 1, 2)
-        if len(support_points) >= 2:
-            cv2.polylines(output, [support_points], False, (0, 255, 0), 2, cv2.LINE_AA)
+        support = np.rint(detection["points"]).astype(np.int32).reshape(-1, 1, 2)
+        if len(support) >= 2:
+            cv2.polylines(output, [support], False, (0, 255, 0), 2, cv2.LINE_AA)
 
         cv2.circle(output, center, radius_int, (0, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(output, center, 3, (0, 0, 255), -1)
 
-        coverage_degrees = detection["coverage"] * 360.0
-        short_class = "DARK <= T" if detection["class"] == "below threshold" else "BRIGHT > T"
+        class_label = "DARK <= T" if detection["class"] == "below threshold" else "BRIGHT > T"
         label = (
-            f"{short_class}  r={radius:.1f}  "
-            f"arc={coverage_degrees:.0f}deg  "
+            f"{class_label}  r={radius:.1f}  "
+            f"arc={detection['coverage'] * 360.0:.0f}deg  "
             f"err={detection['relative_error']:.3f}"
         )
         cv2.putText(
@@ -325,6 +477,69 @@ def process_image(
         )
 
     return binary, output, detections
+
+
+def build_threshold_palette(image, gray, max_colors=12, min_shade_gap=15):
+    """Dominant source colors separated by meaningful grayscale brightness."""
+    sample_limit = 200_000
+    stride = max(1, int(math.ceil(math.sqrt(gray.size / sample_limit))))
+    sample_gray = gray[::stride, ::stride].reshape(-1)
+    sample_bgr = image[::stride, ::stride].reshape(-1, 3)
+
+    hist = np.bincount(sample_gray, minlength=256).astype(np.float64)
+    smooth_radius = max(2, min_shade_gap // 3)
+    density = np.convolve(
+        hist,
+        np.ones(2 * smooth_radius + 1, dtype=np.float64),
+        mode="same",
+    )
+
+    shades = []
+    for shade in np.argsort(density)[::-1]:
+        shade = int(shade)
+        if density[shade] <= 0:
+            break
+        if any(abs(shade - existing) < min_shade_gap for existing in shades):
+            continue
+        shades.append(shade)
+        if len(shades) >= max_colors:
+            break
+
+    palette = []
+    sample_gray_i16 = sample_gray.astype(np.int16, copy=False)
+    color_radius = max(3, min_shade_gap // 3)
+
+    for shade in shades:
+        mask = np.abs(sample_gray_i16 - shade) <= color_radius
+        matching_gray = sample_gray[mask]
+        matching_bgr = sample_bgr[mask]
+
+        threshold = int(round(float(matching_gray.mean()))) if len(matching_gray) else shade
+        bgr = (
+            tuple(int(round(value)) for value in np.median(matching_bgr, axis=0))
+            if len(matching_bgr)
+            else (shade, shade, shade)
+        )
+        palette.append(
+            {
+                "threshold": int(np.clip(threshold, 0, 255)),
+                "bgr": bgr,
+                "strength": float(density[shade]),
+            }
+        )
+
+    palette.sort(key=lambda item: item["threshold"])
+    deduped = []
+    for item in palette:
+        if not deduped or item["threshold"] - deduped[-1]["threshold"] >= min_shade_gap:
+            deduped.append(item)
+        elif item["strength"] > deduped[-1]["strength"]:
+            deduped[-1] = item
+
+    for item in deduped:
+        del item["strength"]
+
+    return deduped
 
 
 def _point_in_rect(x, y, rect):
@@ -345,6 +560,7 @@ def _draw_button(bar, rect, label):
     x, y, w, h = rect
     cv2.rectangle(bar, (x, y), (x + w, y + h), (215, 215, 215), -1)
     cv2.rectangle(bar, (x, y), (x + w, y + h), (245, 245, 245), 1)
+
     text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0]
     cv2.putText(
         bar,
@@ -358,9 +574,9 @@ def _draw_button(bar, rect, label):
     )
 
 
-def _make_display(binary, result, palette, applied_settings, elapsed_ms):
-    threshold_preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    body = np.hstack((threshold_preview, result))
+def _make_display(binary, result, palette, applied, elapsed_ms):
+    preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    body = np.hstack((preview, result))
 
     scale = min(1.0, 1600 / body.shape[1], 820 / body.shape[0])
     if scale < 1.0:
@@ -383,19 +599,34 @@ def _make_display(binary, result, palette, applied_settings, elapsed_ms):
     _draw_button(bar, APPLY_RECT, "Apply")
     _draw_button(bar, SAVE_RECT, "Save")
 
-    threshold, min_radius, max_radius, max_error, min_coverage = applied_settings
+    threshold, min_radius, max_radius, max_error, min_coverage = applied
     status = (
         f"Applied: threshold={threshold}   radius={min_radius:.0f}-{max_radius:.0f}px   "
         f"max avg radial error={max_error:.0%}   min visible arc={min_coverage:.0%}   "
         f"{elapsed_ms:.1f} ms"
     )
-    cv2.putText(bar, status, (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 235, 235), 1, cv2.LINE_AA)
-
-    help_text = (
-        "Detection: <= threshold = dark-interior circle; > threshold = bright-interior circle; "
-        "dark circle owns overlap. Max 1 of each (2 total)."
+    cv2.putText(
+        bar,
+        status,
+        (10, 108),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
     )
-    cv2.putText(bar, help_text, (10, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.47, (205, 205, 205), 1, cv2.LINE_AA)
+
+    cv2.putText(
+        bar,
+        "Detection: <= threshold = dark circle; > threshold = bright circle; "
+        "dark circle owns overlap. Max 2 total.",
+        (10, 136),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.47,
+        (205, 205, 205),
+        1,
+        cv2.LINE_AA,
+    )
 
     cv2.putText(
         bar,
@@ -411,6 +642,7 @@ def _make_display(binary, result, palette, applied_settings, elapsed_ms):
     for index, item in enumerate(palette):
         x, y, w, h = _palette_rect(index)
         cv2.rectangle(bar, (x, y), (x + w, y + h), item["bgr"], -1)
+
         selected = item["threshold"] == threshold
         border = (255, 255, 255) if selected else (120, 120, 120)
         cv2.rectangle(bar, (x, y), (x + w, y + h), border, 2 if selected else 1)
@@ -449,20 +681,15 @@ def _print_detections(detections):
         )
 
 
-def main():
+def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Threshold an image and detect at most two inferred circles: one with "
-            "an interior at/below the threshold and one above it."
+            "Detect at most two inferred circles: one with an interior at/below "
+            "the threshold and one above it. The dark circle owns overlap."
         )
     )
     parser.add_argument("image", help="Path to the input image")
     parser.add_argument("--threshold", type=int, default=128, help="Initial threshold, 0-255")
-    parser.add_argument(
-        "--invert",
-        action="store_true",
-        help="Deprecated compatibility option; both threshold sides are now detected explicitly",
-    )
     parser.add_argument("--min-radius", type=float, default=10.0, help="Initial minimum circle radius")
     parser.add_argument(
         "--max-radius",
@@ -480,7 +707,7 @@ def main():
         "--min-coverage",
         type=float,
         default=0.12,
-        help="Initial minimum angular coverage of selected arc, 0..1",
+        help="Initial minimum visible circle fraction, 0..1",
     )
     parser.add_argument(
         "--morphology",
@@ -497,19 +724,19 @@ def main():
         "--max-search-points",
         type=int,
         default=500,
-        help="Maximum ordered points searched per contour; 0 means unlimited",
+        help="Maximum ordered contour points searched; 0 means unlimited",
     )
     parser.add_argument(
         "--palette-size",
         type=int,
         default=12,
-        help="Maximum number of threshold color choices (default: 12)",
+        help="Maximum threshold color choices (default: 12)",
     )
     parser.add_argument(
         "--palette-min-gap",
         type=int,
         default=15,
-        help="Minimum grayscale difference between color choices, 1-255 (default: 15)",
+        help="Minimum grayscale difference between color choices (default: 15)",
     )
     parser.add_argument(
         "--output",
@@ -535,17 +762,22 @@ def main():
     if not 1 <= args.palette_min_gap <= 255:
         parser.error("--palette-min-gap must be between 1 and 255")
 
+    return args
+
+
+def main():
+    args = _parse_args()
+
     image = cv2.imread(args.image)
     if image is None:
         raise RuntimeError(f"Could not load image: {args.image}")
 
-    if args.invert:
-        print("Note: --invert is no longer needed; both threshold classes are detected explicitly.")
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     image_max_dim = max(gray.shape)
-    initial_max_radius = args.max_radius if args.max_radius > 0 else float(image_max_dim)
-    initial_max_radius = max(initial_max_radius, args.min_radius)
+    initial_max_radius = max(
+        args.min_radius,
+        args.max_radius if args.max_radius > 0 else float(image_max_dim),
+    )
     radius_slider_limit = max(
         100,
         int(math.ceil(image_max_dim * 2.0)),
@@ -557,73 +789,64 @@ def main():
     palette = build_threshold_palette(
         image,
         gray,
-        max_colors=args.palette_size,
-        min_shade_gap=args.palette_min_gap,
+        args.palette_size,
+        args.palette_min_gap,
     )
 
     window_name = "Circle / Arc Detection"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
+    cv2.createTrackbar(TRACK_THRESHOLD, window_name, args.threshold, 255, lambda _: None)
     cv2.createTrackbar(
-        "Threshold brightness (0 black - 255 white)",
-        window_name,
-        args.threshold,
-        255,
-        lambda _value: None,
-    )
-    cv2.createTrackbar(
-        "Minimum fitted circle radius (px)",
+        TRACK_MIN_RADIUS,
         window_name,
         int(round(args.min_radius)),
         radius_slider_limit,
-        lambda _value: None,
+        lambda _: None,
     )
     cv2.createTrackbar(
-        "Maximum fitted circle radius (px)",
+        TRACK_MAX_RADIUS,
         window_name,
         int(round(initial_max_radius)),
         radius_slider_limit,
-        lambda _value: None,
+        lambda _: None,
     )
     cv2.createTrackbar(
-        "Maximum average radial error (%)",
+        TRACK_MAX_ERROR,
         window_name,
         max(1, int(round(args.max_error * 100.0))),
         error_slider_limit,
-        lambda _value: None,
+        lambda _: None,
     )
     cv2.createTrackbar(
-        "Minimum visible circle arc (%)",
+        TRACK_MIN_COVERAGE,
         window_name,
         int(round(args.min_coverage * 100.0)),
         100,
-        lambda _value: None,
+        lambda _: None,
     )
 
     state = {
         "apply_requested": True,
         "save_requested": False,
         "result": None,
-        "detections": [],
     }
 
     def on_mouse(event, x, y, _flags, _userdata):
         if event != cv2.EVENT_LBUTTONUP:
             return
+
         if _point_in_rect(x, y, APPLY_RECT):
             state["apply_requested"] = True
             return
+
         if _point_in_rect(x, y, SAVE_RECT):
             state["save_requested"] = True
             return
 
         for index, item in enumerate(palette):
             if _point_in_rect(x, y, _palette_rect(index)):
-                cv2.setTrackbarPos(
-                    "Threshold brightness (0 black - 255 white)",
-                    window_name,
-                    item["threshold"],
-                )
+                cv2.setTrackbarPos(TRACK_THRESHOLD, window_name, item["threshold"])
                 print(
                     f"Selected threshold {item['threshold']} from color palette; "
                     "click Apply to process."
@@ -636,65 +859,42 @@ def main():
         if state["apply_requested"]:
             state["apply_requested"] = False
 
-            threshold_value = cv2.getTrackbarPos(
-                "Threshold brightness (0 black - 255 white)",
-                window_name,
-            )
-            min_radius = max(
-                1.0,
-                float(cv2.getTrackbarPos("Minimum fitted circle radius (px)", window_name)),
-            )
-            max_radius = max(
-                1.0,
-                float(cv2.getTrackbarPos("Maximum fitted circle radius (px)", window_name)),
-            )
+            threshold = cv2.getTrackbarPos(TRACK_THRESHOLD, window_name)
+            min_radius = max(1.0, float(cv2.getTrackbarPos(TRACK_MIN_RADIUS, window_name)))
+            max_radius = max(1.0, float(cv2.getTrackbarPos(TRACK_MAX_RADIUS, window_name)))
             if max_radius < min_radius:
                 max_radius = min_radius
-                cv2.setTrackbarPos(
-                    "Maximum fitted circle radius (px)",
-                    window_name,
-                    int(round(max_radius)),
-                )
+                cv2.setTrackbarPos(TRACK_MAX_RADIUS, window_name, int(round(max_radius)))
 
-            max_relative_error = max(
+            max_error = max(
                 0.01,
-                cv2.getTrackbarPos("Maximum average radial error (%)", window_name) / 100.0,
+                cv2.getTrackbarPos(TRACK_MAX_ERROR, window_name) / 100.0,
             )
-            min_coverage = (
-                cv2.getTrackbarPos("Minimum visible circle arc (%)", window_name) / 100.0
-            )
+            min_coverage = cv2.getTrackbarPos(TRACK_MIN_COVERAGE, window_name) / 100.0
 
             started = time.perf_counter()
             binary, result, detections = process_image(
                 image,
-                threshold_value,
-                min_radius=min_radius,
-                max_radius=max_radius,
-                max_relative_error=max_relative_error,
-                min_coverage=min_coverage,
-                morphology=args.morphology,
-                max_contours=args.max_contours,
-                max_search_points=args.max_search_points,
-                gray=gray,
+                gray,
+                threshold,
+                min_radius,
+                max_radius,
+                max_error,
+                min_coverage,
+                args.morphology,
+                args.max_contours,
+                args.max_search_points,
             )
             elapsed_ms = (time.perf_counter() - started) * 1000.0
 
             state["result"] = result
-            state["detections"] = detections
-            applied_settings = (
-                threshold_value,
-                min_radius,
-                max_radius,
-                max_relative_error,
-                min_coverage,
-            )
-            display = _make_display(binary, result, palette, applied_settings, elapsed_ms)
-            cv2.imshow(window_name, display)
+            applied = (threshold, min_radius, max_radius, max_error, min_coverage)
+            cv2.imshow(window_name, _make_display(binary, result, palette, applied, elapsed_ms))
 
             print(
-                f"Applied: threshold={threshold_value}, "
+                f"Applied: threshold={threshold}, "
                 f"min_radius={min_radius:.0f}, max_radius={max_radius:.0f}, "
-                f"max_relative_error={max_relative_error:.3f}, "
+                f"max_relative_error={max_error:.3f}, "
                 f"min_coverage={min_coverage:.2f}: "
                 f"{len(detections)} circle(s), {elapsed_ms:.1f} ms"
             )
