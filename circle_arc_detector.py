@@ -6,9 +6,15 @@ import cv2
 import numpy as np
 
 
-CONTROL_BAR_HEIGHT = 52
+CONTROL_BAR_HEIGHT = 104
 APPLY_RECT = (10, 9, 120, 35)
 SAVE_RECT = (140, 9, 120, 35)
+PALETTE_LABEL_X = 10
+PALETTE_Y = 58
+PALETTE_START_X = 124
+SWATCH_WIDTH = 42
+SWATCH_HEIGHT = 30
+SWATCH_GAP = 8
 MORPH_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
 
@@ -58,7 +64,7 @@ def fit_circle_least_squares(points):
 
 
 def angular_coverage(points, cx, cy):
-    """Estimate angular coverage of a contiguous contour region without sorting."""
+    """Estimate angular coverage of an ordered contiguous contour region."""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 2:
         return 0.0
@@ -70,15 +76,13 @@ def angular_coverage(points, cx, cy):
 
 
 def _candidate_window_lengths(point_count, min_region_points):
-    """Generate coarse contiguous-region sizes from short arcs to full contour."""
     min_region_points = max(3, min(min_region_points, point_count))
     lengths = {min_region_points, point_count}
 
     length = min_region_points
     while length < point_count:
         lengths.add(length)
-        next_length = max(length + 1, int(round(length * 1.45)))
-        length = min(point_count, next_length)
+        length = min(point_count, max(length + 1, int(round(length * 1.45))))
 
     return sorted(lengths)
 
@@ -93,13 +97,11 @@ def _evaluate_circular_region(
     max_relative_error,
     min_coverage,
 ):
-    """Fit and score one contiguous section of a closed contour."""
     if length < 3 or length > contour_point_count:
         return None
 
     start %= contour_point_count
     region = extended_points[start : start + length]
-
     fitted = fit_circle_least_squares(region)
     if fitted is None:
         return None
@@ -116,13 +118,12 @@ def _evaluate_circular_region(
     if coverage < min_coverage:
         return None
 
-    error_floor = 0.002
     support_fraction = length / contour_point_count
     score = (
         (coverage**1.5)
         * math.sqrt(float(length))
         * (0.75 + 0.25 * math.sqrt(support_fraction))
-        / (relative_error + error_floor)
+        / (relative_error + 0.002)
     )
 
     return {
@@ -149,7 +150,6 @@ def _hill_climb_region(
     max_relative_error,
     min_coverage,
 ):
-    """Refine coarse arc boundaries locally."""
     best = candidate
     moves = ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0))
 
@@ -191,10 +191,8 @@ def find_best_circular_region(
     min_coverage,
     min_region_points=12,
 ):
-    """Find the contiguous part of a closed contour that best follows a circle."""
     points = np.asarray(points, dtype=np.float64)
     point_count = len(points)
-
     if point_count < max(3, min_region_points):
         return None
 
@@ -204,7 +202,6 @@ def find_best_circular_region(
 
     for length in _candidate_window_lengths(point_count, min_region_points):
         step = max(1, length // 5)
-
         for start in range(0, point_count, step):
             candidate = _evaluate_circular_region(
                 extended_points,
@@ -223,7 +220,6 @@ def find_best_circular_region(
         return None
 
     coarse_candidates.sort(key=lambda item: item["score"], reverse=True)
-
     best = None
     for seed in coarse_candidates[:4]:
         refined = _hill_climb_region(
@@ -243,17 +239,11 @@ def find_best_circular_region(
 
 
 def _downsample_contour_points(points, max_search_points):
-    """Keep ordered contour geometry while bounding circular-region search cost."""
     point_count = len(points)
     if max_search_points <= 0 or point_count <= max_search_points:
         return points
 
-    indices = np.linspace(
-        0,
-        point_count - 1,
-        max_search_points,
-        dtype=np.int32,
-    )
+    indices = np.linspace(0, point_count - 1, max_search_points, dtype=np.int32)
     return points[indices]
 
 
@@ -268,17 +258,11 @@ def detect_circular_objects(
     max_contours=100,
     max_search_points=500,
 ):
-    """Detect up to max_objects circles from circular regions of contours."""
     height, width = binary.shape[:2]
     if max_radius is None:
         max_radius = float(max(width, height))
 
-    contours, _ = cv2.findContours(
-        binary,
-        cv2.RETR_LIST,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-
+    contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     min_region_points = max(8, min_contour_points)
 
     usable = []
@@ -298,7 +282,6 @@ def detect_circular_objects(
     for _, contour in usable:
         points = contour.reshape(-1, 2).astype(np.float64, copy=False)
         points = _downsample_contour_points(points, max_search_points)
-
         candidate = find_best_circular_region(
             points,
             min_radius=min_radius,
@@ -317,12 +300,10 @@ def detect_circular_objects(
         cx, cy = candidate["center"]
         radius = candidate["radius"]
         duplicate = False
-
         for existing in selected:
             ex, ey = existing["center"]
             existing_radius = existing["radius"]
             scale = max(radius, existing_radius)
-
             if (
                 math.hypot(cx - ex, cy - ey) < 0.15 * scale
                 and abs(radius - existing_radius) < 0.15 * scale
@@ -332,7 +313,6 @@ def detect_circular_objects(
 
         if not duplicate:
             selected.append(candidate)
-
         if len(selected) >= max_objects:
             break
 
@@ -351,7 +331,6 @@ def process_image(
     max_search_points=500,
     gray=None,
 ):
-    """Threshold an image, find circular regions, and overlay inferred circles."""
     if gray is None:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -360,11 +339,7 @@ def process_image(
 
     binary_for_detection = binary
     if morphology:
-        binary_for_detection = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            MORPH_KERNEL,
-        )
+        binary_for_detection = cv2.morphologyEx(binary, cv2.MORPH_OPEN, MORPH_KERNEL)
 
     detections = detect_circular_objects(
         binary_for_detection,
@@ -378,7 +353,6 @@ def process_image(
     )
 
     output = image.copy()
-
     for index, detection in enumerate(detections, start=1):
         cx, cy = detection["center"]
         radius = detection["radius"]
@@ -387,14 +361,7 @@ def process_image(
 
         support_points = np.rint(detection["points"]).astype(np.int32).reshape(-1, 1, 2)
         if len(support_points) >= 2:
-            cv2.polylines(
-                output,
-                [support_points],
-                False,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+            cv2.polylines(output, [support_points], False, (0, 255, 0), 2, cv2.LINE_AA)
 
         cv2.circle(output, center, radius_int, (0, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(output, center, 3, (0, 0, 255), -1)
@@ -420,29 +387,113 @@ def process_image(
     return binary, binary_for_detection, output, detections
 
 
+def build_threshold_palette(image, gray, max_colors=10, min_shade_gap=18):
+    """Return dominant source colors whose grayscale shades are meaningfully distinct."""
+    if max_colors <= 0:
+        return []
+
+    pixel_count = gray.size
+    sample_limit = 200_000
+    stride = max(1, int(math.ceil(math.sqrt(pixel_count / sample_limit))))
+    sample_gray = gray[::stride, ::stride].reshape(-1)
+    sample_bgr = image[::stride, ::stride].reshape(-1, 3)
+
+    hist = np.bincount(sample_gray, minlength=256).astype(np.float64)
+    smooth_radius = max(2, min_shade_gap // 3)
+    kernel = np.ones(2 * smooth_radius + 1, dtype=np.float64)
+    density = np.convolve(hist, kernel, mode="same")
+
+    selected_shades = []
+    for shade in np.argsort(density)[::-1]:
+        shade = int(shade)
+        if density[shade] <= 0:
+            break
+        if any(abs(shade - existing) < min_shade_gap for existing in selected_shades):
+            continue
+        selected_shades.append(shade)
+        if len(selected_shades) >= max_colors:
+            break
+
+    palette = []
+    color_radius = max(3, min_shade_gap // 3)
+    sample_gray_i16 = sample_gray.astype(np.int16, copy=False)
+
+    for shade in selected_shades:
+        mask = np.abs(sample_gray_i16 - shade) <= color_radius
+        if np.any(mask):
+            matching_gray = sample_gray[mask]
+            matching_bgr = sample_bgr[mask]
+            threshold = int(round(float(np.average(matching_gray))))
+            bgr = tuple(int(round(value)) for value in np.median(matching_bgr, axis=0))
+        else:
+            threshold = shade
+            bgr = (shade, shade, shade)
+
+        palette.append({"threshold": int(np.clip(threshold, 0, 255)), "bgr": bgr})
+
+    palette.sort(key=lambda item: item["threshold"])
+
+    # Weighted representatives can move slightly from their seed shades, so
+    # enforce the requested minimum brightness separation once more.
+    deduped = []
+    for item in palette:
+        if not deduped or item["threshold"] - deduped[-1]["threshold"] >= min_shade_gap:
+            deduped.append(item)
+        elif hist[item["threshold"]] > hist[deduped[-1]["threshold"]]:
+            deduped[-1] = item
+
+    return deduped
+
+
 def _point_in_rect(x, y, rect):
     rx, ry, rw, rh = rect
     return rx <= x < rx + rw and ry <= y < ry + rh
 
 
-def _make_display(binary_for_detection, result, applied_threshold, elapsed_ms):
+def _palette_rect(index):
+    return (
+        PALETTE_START_X + index * (SWATCH_WIDTH + SWATCH_GAP),
+        PALETTE_Y,
+        SWATCH_WIDTH,
+        SWATCH_HEIGHT,
+    )
+
+
+def _draw_button(bar, rect, label):
+    x, y, w, h = rect
+    cv2.rectangle(bar, (x, y), (x + w, y + h), (215, 215, 215), -1)
+    cv2.rectangle(bar, (x, y), (x + w, y + h), (245, 245, 245), 1)
+    cv2.putText(
+        bar,
+        label,
+        (x + 28, y + 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (20, 20, 20),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _make_display(
+    binary_for_detection,
+    result,
+    applied_threshold,
+    elapsed_ms,
+    palette,
+):
     """Build a bounded-size preview; called only after Apply."""
     threshold_preview = cv2.cvtColor(binary_for_detection, cv2.COLOR_GRAY2BGR)
     body = np.hstack((threshold_preview, result))
 
+    palette_width = PALETTE_START_X + len(palette) * (SWATCH_WIDTH + SWATCH_GAP) + 10
+    min_width = max(660, palette_width)
     max_width = 1600
     max_body_height = 820
     scale = min(1.0, max_width / body.shape[1], max_body_height / body.shape[0])
     if scale < 1.0:
-        body = cv2.resize(
-            body,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_AREA,
-        )
+        body = cv2.resize(body, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-    min_width = 560
     if body.shape[1] < min_width:
         body = cv2.copyMakeBorder(
             body,
@@ -455,21 +506,8 @@ def _make_display(binary_for_detection, result, applied_threshold, elapsed_ms):
         )
 
     bar = np.full((CONTROL_BAR_HEIGHT, body.shape[1], 3), 42, dtype=np.uint8)
-
-    for rect, label in ((APPLY_RECT, "Apply"), (SAVE_RECT, "Save")):
-        x, y, w, h = rect
-        cv2.rectangle(bar, (x, y), (x + w, y + h), (215, 215, 215), -1)
-        cv2.rectangle(bar, (x, y), (x + w, y + h), (245, 245, 245), 1)
-        cv2.putText(
-            bar,
-            label,
-            (x + 28, y + 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (20, 20, 20),
-            1,
-            cv2.LINE_AA,
-        )
+    _draw_button(bar, APPLY_RECT, "Apply")
+    _draw_button(bar, SAVE_RECT, "Save")
 
     status = f"Applied threshold: {applied_threshold}   processing: {elapsed_ms:.1f} ms"
     cv2.putText(
@@ -483,6 +521,39 @@ def _make_display(binary_for_detection, result, applied_threshold, elapsed_ms):
         cv2.LINE_AA,
     )
 
+    cv2.putText(
+        bar,
+        "Pick color:",
+        (PALETTE_LABEL_X, PALETTE_Y + 21),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
+    )
+
+    for index, item in enumerate(palette):
+        x, y, w, h = _palette_rect(index)
+        color = item["bgr"]
+        cv2.rectangle(bar, (x, y), (x + w, y + h), color, -1)
+        border = (255, 255, 255) if item["threshold"] == applied_threshold else (120, 120, 120)
+        thickness = 2 if item["threshold"] == applied_threshold else 1
+        cv2.rectangle(bar, (x, y), (x + w, y + h), border, thickness)
+
+        text_color = (20, 20, 20) if item["threshold"] >= 150 else (245, 245, 245)
+        label = str(item["threshold"])
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
+        cv2.putText(
+            bar,
+            label,
+            (x + (w - text_size[0]) // 2, y + h - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            text_color,
+            1,
+            cv2.LINE_AA,
+        )
+
     return np.vstack((bar, body))
 
 
@@ -495,8 +566,7 @@ def _print_detections(detections):
             f"radius={detection['radius']:.2f}, "
             f"coverage={detection['coverage'] * 360.0:.1f} deg, "
             f"relative_error={detection['relative_error']:.4f}, "
-            f"support_points={detection['region_length']}/"
-            f"{detection['contour_points']}"
+            f"support_points={detection['region_length']}/{detection['contour_points']}"
         )
 
 
@@ -508,34 +578,20 @@ def main():
         )
     )
     parser.add_argument("image", help="Path to the input image")
-    parser.add_argument(
-        "--threshold",
-        type=int,
-        default=128,
-        help="Initial grayscale threshold, 0-255 (default: 128)",
-    )
-    parser.add_argument(
-        "--invert",
-        action="store_true",
-        help="Use inverted binary thresholding",
-    )
-    parser.add_argument(
-        "--min-radius",
-        type=float,
-        default=10.0,
-        help="Minimum fitted circle radius in pixels (default: 10)",
-    )
+    parser.add_argument("--threshold", type=int, default=128, help="Initial threshold, 0-255")
+    parser.add_argument("--invert", action="store_true", help="Use inverted binary thresholding")
+    parser.add_argument("--min-radius", type=float, default=10.0, help="Minimum circle radius")
     parser.add_argument(
         "--max-error",
         type=float,
         default=0.08,
-        help="Maximum mean radial error divided by radius (default: 0.08)",
+        help="Maximum mean radial error divided by radius",
     )
     parser.add_argument(
         "--min-coverage",
         type=float,
         default=0.12,
-        help="Minimum angular coverage of the selected circular region, 0..1 (default: 0.12)",
+        help="Minimum angular coverage of selected arc, 0..1",
     )
     parser.add_argument(
         "--morphology",
@@ -546,13 +602,25 @@ def main():
         "--max-contours",
         type=int,
         default=100,
-        help="Maximum largest contours searched; 0 means unlimited (default: 100)",
+        help="Maximum largest contours searched; 0 means unlimited",
     )
     parser.add_argument(
         "--max-search-points",
         type=int,
         default=500,
-        help="Maximum ordered points searched per contour; 0 means unlimited (default: 500)",
+        help="Maximum ordered points searched per contour; 0 means unlimited",
+    )
+    parser.add_argument(
+        "--palette-size",
+        type=int,
+        default=10,
+        help="Maximum number of threshold color choices (default: 10)",
+    )
+    parser.add_argument(
+        "--palette-min-gap",
+        type=int,
+        default=18,
+        help="Minimum grayscale difference between color choices, 1-255 (default: 18)",
     )
     parser.add_argument(
         "--output",
@@ -569,26 +637,28 @@ def main():
         parser.error("--max-error must be greater than zero")
     if not 0.0 <= args.min_coverage <= 1.0:
         parser.error("--min-coverage must be between 0 and 1")
-    if args.max_contours < 0:
-        parser.error("--max-contours must be zero or greater")
-    if args.max_search_points < 0:
-        parser.error("--max-search-points must be zero or greater")
+    if args.max_contours < 0 or args.max_search_points < 0:
+        parser.error("--max-contours and --max-search-points must be zero or greater")
+    if args.palette_size < 1:
+        parser.error("--palette-size must be at least 1")
+    if not 1 <= args.palette_min_gap <= 255:
+        parser.error("--palette-min-gap must be between 1 and 255")
 
     image = cv2.imread(args.image)
     if image is None:
         raise RuntimeError(f"Could not load image: {args.image}")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    palette = build_threshold_palette(
+        image,
+        gray,
+        max_colors=args.palette_size,
+        min_shade_gap=args.palette_min_gap,
+    )
 
     window_name = "Circle / Arc Detection"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-    cv2.createTrackbar(
-        "Threshold",
-        window_name,
-        args.threshold,
-        255,
-        lambda _value: None,
-    )
+    cv2.createTrackbar("Threshold", window_name, args.threshold, 255, lambda _value: None)
 
     state = {
         "apply_requested": True,
@@ -602,8 +672,19 @@ def main():
             return
         if _point_in_rect(x, y, APPLY_RECT):
             state["apply_requested"] = True
-        elif _point_in_rect(x, y, SAVE_RECT):
+            return
+        if _point_in_rect(x, y, SAVE_RECT):
             state["save_requested"] = True
+            return
+
+        for index, item in enumerate(palette):
+            if _point_in_rect(x, y, _palette_rect(index)):
+                cv2.setTrackbarPos("Threshold", window_name, item["threshold"])
+                print(
+                    f"Selected threshold {item['threshold']} from color palette; "
+                    "click Apply to process."
+                )
+                return
 
     cv2.setMouseCallback(window_name, on_mouse)
 
@@ -634,6 +715,7 @@ def main():
                 result,
                 threshold_value,
                 elapsed_ms,
+                palette,
             )
             cv2.imshow(window_name, display)
 
