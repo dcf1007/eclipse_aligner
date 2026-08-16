@@ -15,6 +15,7 @@ PALETTE_START_X = 124
 SWATCH_WIDTH = 42
 SWATCH_HEIGHT = 30
 SWATCH_GAP = 8
+ERROR_SCALE = 1000
 MORPH_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
 
@@ -28,7 +29,6 @@ def fit_circle_least_squares(points):
     y = points[:, 1]
     xm = float(x.mean())
     ym = float(y.mean())
-
     u = x - xm
     v = y - ym
     z = u * u + v * v
@@ -40,8 +40,7 @@ def fit_circle_least_squares(points):
     svz = float(np.dot(v, z))
 
     det = suu * svv - suv * suv
-    scale = suu * svv + 1.0
-    if abs(det) <= 1e-12 * scale:
+    if abs(det) <= 1e-12 * (suu * svv + 1.0):
         return None
 
     uc = 0.5 * (suz * svv - svz * suv) / det
@@ -56,7 +55,6 @@ def fit_circle_least_squares(points):
     radius = math.sqrt(radius_squared)
     distances = np.hypot(x - cx, y - cy)
     mean_error = float(np.mean(np.abs(distances - radius)))
-
     if not all(np.isfinite(value) for value in (cx, cy, radius, mean_error)):
         return None
 
@@ -71,15 +69,14 @@ def angular_coverage(points, cx, cy):
 
     angles = np.arctan2(points[:, 1] - cy, points[:, 0] - cx)
     unwrapped = np.unwrap(angles)
-    span = float(np.ptp(unwrapped))
-    return float(np.clip(span / (2.0 * np.pi), 0.0, 1.0))
+    return float(np.clip(np.ptp(unwrapped) / (2.0 * np.pi), 0.0, 1.0))
 
 
 def _candidate_window_lengths(point_count, min_region_points):
     min_region_points = max(3, min(min_region_points, point_count))
     lengths = {min_region_points, point_count}
-
     length = min_region_points
+
     while length < point_count:
         lengths.add(length)
         length = min(point_count, max(length + 1, int(round(length * 1.45))))
@@ -294,12 +291,13 @@ def detect_circular_objects(
             candidates.append(candidate)
 
     candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
-
     selected = []
+
     for candidate in candidates:
         cx, cy = candidate["center"]
         radius = candidate["radius"]
         duplicate = False
+
         for existing in selected:
             ex, ey = existing["center"]
             existing_radius = existing["radius"]
@@ -324,6 +322,7 @@ def process_image(
     threshold_value,
     invert=False,
     min_radius=10.0,
+    max_radius=None,
     max_relative_error=0.08,
     min_coverage=0.12,
     morphology=False,
@@ -346,6 +345,7 @@ def process_image(
         max_objects=2,
         min_contour_points=12,
         min_radius=min_radius,
+        max_radius=max_radius,
         max_relative_error=max_relative_error,
         min_coverage=min_coverage,
         max_contours=max_contours,
@@ -387,7 +387,7 @@ def process_image(
     return binary, binary_for_detection, output, detections
 
 
-def build_threshold_palette(image, gray, max_colors=10, min_shade_gap=18):
+def build_threshold_palette(image, gray, max_colors=12, min_shade_gap=15):
     """Return dominant source colors whose grayscale shades are meaningfully distinct."""
     if max_colors <= 0:
         return []
@@ -432,9 +432,6 @@ def build_threshold_palette(image, gray, max_colors=10, min_shade_gap=18):
         palette.append({"threshold": int(np.clip(threshold, 0, 255)), "bgr": bgr})
 
     palette.sort(key=lambda item: item["threshold"])
-
-    # Weighted representatives can move slightly from their seed shades, so
-    # enforce the requested minimum brightness separation once more.
     deduped = []
     for item in palette:
         if not deduped or item["threshold"] - deduped[-1]["threshold"] >= min_shade_gap:
@@ -481,13 +478,17 @@ def _make_display(
     applied_threshold,
     elapsed_ms,
     palette,
+    applied_min_radius,
+    applied_max_radius,
+    applied_max_error,
+    applied_min_coverage,
 ):
-    """Build a bounded-size preview; called only after Apply."""
+    """Build the preview only after Apply; pending slider changes do not redraw it."""
     threshold_preview = cv2.cvtColor(binary_for_detection, cv2.COLOR_GRAY2BGR)
     body = np.hstack((threshold_preview, result))
 
     palette_width = PALETTE_START_X + len(palette) * (SWATCH_WIDTH + SWATCH_GAP) + 10
-    min_width = max(660, palette_width)
+    min_width = max(760, palette_width)
     max_width = 1600
     max_body_height = 820
     scale = min(1.0, max_width / body.shape[1], max_body_height / body.shape[0])
@@ -509,13 +510,19 @@ def _make_display(
     _draw_button(bar, APPLY_RECT, "Apply")
     _draw_button(bar, SAVE_RECT, "Save")
 
-    status = f"Applied threshold: {applied_threshold}   processing: {elapsed_ms:.1f} ms"
+    status = (
+        f"Applied: T={applied_threshold}  "
+        f"R={applied_min_radius:.0f}-{applied_max_radius:.0f}  "
+        f"err={applied_max_error:.3f}  "
+        f"cov={applied_min_coverage:.0%}  "
+        f"{elapsed_ms:.1f} ms"
+    )
     cv2.putText(
         bar,
         status,
         (280, 32),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
+        0.48,
         (235, 235, 235),
         1,
         cv2.LINE_AA,
@@ -534,11 +541,10 @@ def _make_display(
 
     for index, item in enumerate(palette):
         x, y, w, h = _palette_rect(index)
-        color = item["bgr"]
-        cv2.rectangle(bar, (x, y), (x + w, y + h), color, -1)
-        border = (255, 255, 255) if item["threshold"] == applied_threshold else (120, 120, 120)
-        thickness = 2 if item["threshold"] == applied_threshold else 1
-        cv2.rectangle(bar, (x, y), (x + w, y + h), border, thickness)
+        cv2.rectangle(bar, (x, y), (x + w, y + h), item["bgr"], -1)
+        selected = item["threshold"] == applied_threshold
+        border = (255, 255, 255) if selected else (120, 120, 120)
+        cv2.rectangle(bar, (x, y), (x + w, y + h), border, 2 if selected else 1)
 
         text_color = (20, 20, 20) if item["threshold"] >= 150 else (245, 245, 245)
         label = str(item["threshold"])
@@ -580,18 +586,24 @@ def main():
     parser.add_argument("image", help="Path to the input image")
     parser.add_argument("--threshold", type=int, default=128, help="Initial threshold, 0-255")
     parser.add_argument("--invert", action="store_true", help="Use inverted binary thresholding")
-    parser.add_argument("--min-radius", type=float, default=10.0, help="Minimum circle radius")
+    parser.add_argument("--min-radius", type=float, default=10.0, help="Initial minimum circle radius")
+    parser.add_argument(
+        "--max-radius",
+        type=float,
+        default=0.0,
+        help="Initial maximum circle radius; 0 uses the largest image dimension",
+    )
     parser.add_argument(
         "--max-error",
         type=float,
         default=0.08,
-        help="Maximum mean radial error divided by radius",
+        help="Initial maximum mean radial error divided by radius",
     )
     parser.add_argument(
         "--min-coverage",
         type=float,
         default=0.12,
-        help="Minimum angular coverage of selected arc, 0..1",
+        help="Initial minimum angular coverage of selected arc, 0..1",
     )
     parser.add_argument(
         "--morphology",
@@ -613,14 +625,14 @@ def main():
     parser.add_argument(
         "--palette-size",
         type=int,
-        default=10,
-        help="Maximum number of threshold color choices (default: 10)",
+        default=12,
+        help="Maximum number of threshold color choices (default: 12)",
     )
     parser.add_argument(
         "--palette-min-gap",
         type=int,
-        default=18,
-        help="Minimum grayscale difference between color choices, 1-255 (default: 18)",
+        default=15,
+        help="Minimum grayscale difference between color choices, 1-255 (default: 15)",
     )
     parser.add_argument(
         "--output",
@@ -633,6 +645,8 @@ def main():
         parser.error("--threshold must be between 0 and 255")
     if args.min_radius <= 0:
         parser.error("--min-radius must be greater than zero")
+    if args.max_radius < 0:
+        parser.error("--max-radius must be zero or greater")
     if args.max_error <= 0:
         parser.error("--max-error must be greater than zero")
     if not 0.0 <= args.min_coverage <= 1.0:
@@ -649,6 +663,19 @@ def main():
         raise RuntimeError(f"Could not load image: {args.image}")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image_max_dim = max(gray.shape)
+    initial_max_radius = args.max_radius if args.max_radius > 0 else float(image_max_dim)
+    if initial_max_radius < args.min_radius:
+        initial_max_radius = args.min_radius
+
+    radius_slider_limit = max(
+        100,
+        int(math.ceil(image_max_dim * 2.0)),
+        int(math.ceil(args.min_radius)),
+        int(math.ceil(initial_max_radius)),
+    )
+    error_slider_limit = max(500, int(math.ceil(args.max_error * ERROR_SCALE)))
+
     palette = build_threshold_palette(
         image,
         gray,
@@ -658,7 +685,37 @@ def main():
 
     window_name = "Circle / Arc Detection"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+
+    # These trackbars only store pending values. No processing callback is attached.
     cv2.createTrackbar("Threshold", window_name, args.threshold, 255, lambda _value: None)
+    cv2.createTrackbar(
+        "Min radius",
+        window_name,
+        int(round(args.min_radius)),
+        radius_slider_limit,
+        lambda _value: None,
+    )
+    cv2.createTrackbar(
+        "Max radius",
+        window_name,
+        int(round(initial_max_radius)),
+        radius_slider_limit,
+        lambda _value: None,
+    )
+    cv2.createTrackbar(
+        "Max error x1000",
+        window_name,
+        max(1, int(round(args.max_error * ERROR_SCALE))),
+        error_slider_limit,
+        lambda _value: None,
+    )
+    cv2.createTrackbar(
+        "Min coverage %",
+        window_name,
+        int(round(args.min_coverage * 100.0)),
+        100,
+        lambda _value: None,
+    )
 
     state = {
         "apply_requested": True,
@@ -691,16 +748,29 @@ def main():
     while True:
         if state["apply_requested"]:
             state["apply_requested"] = False
+
             threshold_value = cv2.getTrackbarPos("Threshold", window_name)
+            min_radius = max(1.0, float(cv2.getTrackbarPos("Min radius", window_name)))
+            max_radius = max(1.0, float(cv2.getTrackbarPos("Max radius", window_name)))
+            if max_radius < min_radius:
+                max_radius = min_radius
+                cv2.setTrackbarPos("Max radius", window_name, int(round(max_radius)))
+
+            max_relative_error = max(
+                1.0 / ERROR_SCALE,
+                cv2.getTrackbarPos("Max error x1000", window_name) / ERROR_SCALE,
+            )
+            min_coverage = cv2.getTrackbarPos("Min coverage %", window_name) / 100.0
 
             started = time.perf_counter()
             _, binary_for_detection, result, detections = process_image(
                 image,
                 threshold_value,
                 invert=args.invert,
-                min_radius=args.min_radius,
-                max_relative_error=args.max_error,
-                min_coverage=args.min_coverage,
+                min_radius=min_radius,
+                max_radius=max_radius,
+                max_relative_error=max_relative_error,
+                min_coverage=min_coverage,
                 morphology=args.morphology,
                 max_contours=args.max_contours,
                 max_search_points=args.max_search_points,
@@ -716,11 +786,18 @@ def main():
                 threshold_value,
                 elapsed_ms,
                 palette,
+                min_radius,
+                max_radius,
+                max_relative_error,
+                min_coverage,
             )
             cv2.imshow(window_name, display)
 
             print(
-                f"Applied threshold {threshold_value}: "
+                f"Applied: threshold={threshold_value}, "
+                f"min_radius={min_radius:.0f}, max_radius={max_radius:.0f}, "
+                f"max_relative_error={max_relative_error:.3f}, "
+                f"min_coverage={min_coverage:.2f}: "
                 f"{len(detections)} object(s), {elapsed_ms:.1f} ms"
             )
             _print_detections(detections)
