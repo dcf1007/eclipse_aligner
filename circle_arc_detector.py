@@ -99,8 +99,9 @@ def eval_region(extended, n, start, length, min_radius, max_radius, max_error, m
     if ellipse is None:
         return None
 
-    equivalent_radius = ellipse["equivalent_radius"]
-    if not min_radius <= equivalent_radius <= max_radius:
+    major = ellipse["major"]
+    minor = ellipse["minor"]
+    if not (min_radius <= major <= max_radius and min_radius <= minor <= max_radius):
         return None
 
     relative_error, coverage = ellipse_error_and_coverage(region, ellipse)
@@ -136,6 +137,7 @@ def same_ellipse(a, b, center_fraction=0.12, axis_fraction=0.12, angle_tolerance
     if abs(a["minor"] - b["minor"]) >= axis_fraction * scale:
         return False
 
+    # Orientation is poorly defined for nearly circular ellipses, so ignore it there.
     a_eccentricity = (a["major"] - a["minor"]) / max(a["major"], 1.0)
     b_eccentricity = (b["major"] - b["minor"]) / max(b["major"], 1.0)
     if max(a_eccentricity, b_eccentricity) < 0.05:
@@ -415,8 +417,8 @@ class DetectorApp:
         radius_limit = max(1600, round(self.args.max_radius * 1.5))
         rows = [
             ("Brightness threshold (0=black, 255=white)", self.threshold, 0, 255, 1, lambda value: str(int(value))),
-            ("Minimum fitted equivalent radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
-            ("Maximum fitted equivalent radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
+            ("Minimum fitted semi-axis radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
+            ("Maximum fitted semi-axis radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
             ("Maximum average normalized ellipse error (%)", self.max_error, 0.5, 50, 0.1, lambda value: f"{float(value):.1f}%"),
             ("Minimum visible ellipse arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)"),
         ]
@@ -525,13 +527,13 @@ class DetectorApp:
         self.redraw()
 
         self.status.set(
-            f"Applied: T={threshold}; eq radius={min_radius:.0f}-{max_radius:.0f}px; "
+            f"Applied: T={threshold}; semi-axes={min_radius:.0f}-{max_radius:.0f}px; "
             f"error={max_error:.1%}; arc={min_coverage:.0%}; {len(ellipses)} ellipse(s); {elapsed:.1f} ms."
         )
         for ellipse in ellipses:
             print(
                 f"{ellipse['class']}: center=({ellipse['center'][0]:.2f}, {ellipse['center'][1]:.2f}), "
-                f"eq_radius={ellipse['equivalent_radius']:.2f}, a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, angle={ellipse['angle']:.1f}, arc={ellipse['coverage'] * 360:.1f}°, "
+                f"a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, angle={ellipse['angle']:.1f}, arc={ellipse['coverage'] * 360:.1f}°, "
                 f"error={ellipse['relative_error']:.4f}, interior={ellipse['interior_fraction']:.1%}"
             )
 
@@ -572,8 +574,8 @@ def main():
     parser = argparse.ArgumentParser(description="Detect up to two inferred ellipses from thresholded image arcs.")
     parser.add_argument("image")
     parser.add_argument("--threshold", type=int, default=8)
-    parser.add_argument("--min-radius", type=float, default=1000.0, help="Minimum equivalent ellipse radius")
-    parser.add_argument("--max-radius", type=float, default=1500.0, help="Maximum equivalent radius; 0 = largest image dimension")
+    parser.add_argument("--min-radius", type=float, default=1000.0, help="Minimum allowed value for each ellipse semi-axis")
+    parser.add_argument("--max-radius", type=float, default=1500.0, help="Maximum allowed value for each ellipse semi-axis; 0 = largest image dimension")
     parser.add_argument("--max-error", type=float, default=0.08)
     parser.add_argument("--min-coverage", type=float, default=0.12)
     parser.add_argument("--max-contours", type=int, default=100)
