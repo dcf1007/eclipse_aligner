@@ -12,42 +12,75 @@ MAX_CLASS_CANDIDATES = 30
 MAX_REGIONS_PER_CONTOUR = 4
 
 
-def fit_circle(points):
-    p = np.asarray(points, np.float64)
-    if len(p) < 3:
+def fit_ellipse(points):
+    """Direct least-squares fit of a general rotated ellipse."""
+    points = np.asarray(points, np.float32)
+    if len(points) < 5:
         return None
 
-    x, y = p[:, 0], p[:, 1]
-    xm, ym = float(x.mean()), float(y.mean())
-    u, v = x - xm, y - ym
-    z = u * u + v * v
-    suu, svv, suv = np.dot(u, u), np.dot(v, v), np.dot(u, v)
-    suz, svz = np.dot(u, z), np.dot(v, z)
-    det = suu * svv - suv * suv
-    if abs(det) <= 1e-12 * (suu * svv + 1.0):
+    try:
+        (cx, cy), (width, height), angle = cv2.fitEllipseDirect(points.reshape(-1, 1, 2))
+    except cv2.error:
         return None
 
-    uc = 0.5 * (suz * svv - svz * suv) / det
-    vc = 0.5 * (svz * suu - suz * suv) / det
-    cx, cy = xm + uc, ym + vc
-    r2 = float(z.mean()) + uc * uc + vc * vc
-    if r2 <= 0 or not np.isfinite(r2):
+    values = (cx, cy, width, height, angle)
+    if not np.all(np.isfinite(values)) or width <= 0 or height <= 0:
         return None
 
-    r = math.sqrt(r2)
-    err = float(np.mean(np.abs(np.hypot(x - cx, y - cy) - r)))
-    return (float(cx), float(cy), r, err) if np.all(np.isfinite((cx, cy, r, err))) else None
+    semi_x = width * 0.5
+    semi_y = height * 0.5
+    if semi_x >= semi_y:
+        major, minor = semi_x, semi_y
+        major_angle = angle
+    else:
+        major, minor = semi_y, semi_x
+        major_angle = angle + 90.0
+
+    major_angle %= 180.0
+    equivalent_radius = math.sqrt(major * minor)
+    if equivalent_radius <= 0 or not np.isfinite(equivalent_radius):
+        return None
+
+    return {
+        "center": (float(cx), float(cy)),
+        "major": float(major),
+        "minor": float(minor),
+        "angle": float(major_angle),
+        "equivalent_radius": float(equivalent_radius),
+    }
 
 
-def coverage(points, cx, cy):
+def ellipse_coordinates(points, ellipse):
+    """Return points in normalized coordinates of the fitted ellipse."""
+    points = np.asarray(points, np.float64)
+    cx, cy = ellipse["center"]
+    angle = math.radians(ellipse["angle"])
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    dx = points[:, 0] - cx
+    dy = points[:, 1] - cy
+    local_x = cos_a * dx + sin_a * dy
+    local_y = -sin_a * dx + cos_a * dy
+    return local_x / ellipse["major"], local_y / ellipse["minor"]
+
+
+def ellipse_error_and_coverage(points, ellipse):
+    """Mean normalized radial residual and visible parametric arc fraction."""
     if len(points) < 2:
-        return 0.0
-    angles = np.unwrap(np.arctan2(points[:, 1] - cy, points[:, 0] - cx))
-    return float(np.clip(np.ptp(angles) / (2 * np.pi), 0.0, 1.0))
+        return math.inf, 0.0
+
+    x_norm, y_norm = ellipse_coordinates(points, ellipse)
+    radial = np.hypot(x_norm, y_norm)
+    relative_error = float(np.mean(np.abs(radial - 1.0)))
+
+    parametric_angles = np.unwrap(np.arctan2(y_norm, x_norm))
+    coverage = float(np.clip(np.ptp(parametric_angles) / (2.0 * np.pi), 0.0, 1.0))
+    return relative_error, coverage
 
 
 def window_lengths(n, minimum):
-    minimum = max(3, min(minimum, n))
+    minimum = max(5, min(minimum, n))
     lengths = {minimum, n}
     length = minimum
     while length < n:
@@ -57,34 +90,29 @@ def window_lengths(n, minimum):
 
 
 def eval_region(extended, n, start, length, min_radius, max_radius, max_error, min_coverage):
-    if length < 3 or length > n:
+    if length < 5 or length > n:
         return None
 
     start %= n
     region = extended[start : start + length]
-    fit = fit_circle(region)
-    if fit is None:
+    ellipse = fit_ellipse(region)
+    if ellipse is None:
         return None
 
-    cx, cy, radius, error = fit
-    if not min_radius <= radius <= max_radius:
+    equivalent_radius = ellipse["equivalent_radius"]
+    if not min_radius <= equivalent_radius <= max_radius:
         return None
 
-    relative_error = error / radius
-    if relative_error > max_error:
-        return None
-
-    cov = coverage(region, cx, cy)
-    if cov < min_coverage:
+    relative_error, coverage = ellipse_error_and_coverage(region, ellipse)
+    if relative_error > max_error or coverage < min_coverage:
         return None
 
     support = length / n
-    score = cov**1.5 * math.sqrt(length) * (0.75 + 0.25 * math.sqrt(support)) / (relative_error + 0.002)
+    score = coverage**1.5 * math.sqrt(length) * (0.75 + 0.25 * math.sqrt(support)) / (relative_error + 0.002)
     return {
-        "center": (cx, cy),
-        "radius": radius,
+        **ellipse,
         "relative_error": relative_error,
-        "coverage": cov,
+        "coverage": coverage,
         "points": region.copy(),
         "start": start,
         "length": length,
@@ -92,14 +120,27 @@ def eval_region(extended, n, start, length, min_radius, max_radius, max_error, m
     }
 
 
-def same_circle(a, b, center_fraction=0.12, radius_fraction=0.12):
+def angle_difference_180(a, b):
+    difference = abs((a - b) % 180.0)
+    return min(difference, 180.0 - difference)
+
+
+def same_ellipse(a, b, center_fraction=0.12, axis_fraction=0.12, angle_tolerance=15.0):
     ax, ay = a["center"]
     bx, by = b["center"]
-    scale = max(a["radius"], b["radius"], 1.0)
-    return (
-        math.hypot(ax - bx, ay - by) < center_fraction * scale
-        and abs(a["radius"] - b["radius"]) < radius_fraction * scale
-    )
+    scale = max(a["equivalent_radius"], b["equivalent_radius"], 1.0)
+    if math.hypot(ax - bx, ay - by) >= center_fraction * scale:
+        return False
+    if abs(a["major"] - b["major"]) >= axis_fraction * scale:
+        return False
+    if abs(a["minor"] - b["minor"]) >= axis_fraction * scale:
+        return False
+
+    a_eccentricity = (a["major"] - a["minor"]) / max(a["major"], 1.0)
+    b_eccentricity = (b["major"] - b["minor"]) / max(b["major"], 1.0)
+    if max(a_eccentricity, b_eccentricity) < 0.05:
+        return True
+    return angle_difference_180(a["angle"], b["angle"]) < angle_tolerance
 
 
 def refine(candidate, extended, n, minimum, min_radius, max_radius, max_error, min_coverage):
@@ -128,13 +169,13 @@ def refine(candidate, extended, n, minimum, min_radius, max_radius, max_error, m
 
 
 def find_regions(points, min_radius, max_radius, max_error, min_coverage, minimum=12):
-    p = np.asarray(points, np.float64)
-    n = len(p)
-    if n < max(3, minimum):
+    points = np.asarray(points, np.float64)
+    n = len(points)
+    if n < max(5, minimum):
         return []
 
     minimum = min(minimum, n)
-    extended = np.vstack((p, p))
+    extended = np.vstack((points, points))
     coarse = []
     for length in window_lengths(n, minimum):
         step = max(1, length // 5)
@@ -146,7 +187,7 @@ def find_regions(points, min_radius, max_radius, max_error, min_coverage, minimu
     coarse.sort(key=lambda item: item["score"], reverse=True)
     seeds = []
     for candidate in coarse:
-        if any(same_circle(candidate, old, 0.10, 0.10) for old in seeds):
+        if any(same_ellipse(candidate, existing, 0.10, 0.10) for existing in seeds):
             continue
         seeds.append(candidate)
         if len(seeds) >= max(8, MAX_REGIONS_PER_CONTOUR * 4):
@@ -155,7 +196,7 @@ def find_regions(points, min_radius, max_radius, max_error, min_coverage, minimu
     result = []
     for seed in seeds:
         candidate = refine(seed, extended, n, minimum, min_radius, max_radius, max_error, min_coverage)
-        if not any(same_circle(candidate, old) for old in result):
+        if not any(same_ellipse(candidate, existing) for existing in result):
             result.append(candidate)
 
     result.sort(key=lambda item: item["score"], reverse=True)
@@ -185,23 +226,44 @@ def find_candidates(binary, min_radius, max_radius, max_error, min_coverage, max
     return candidates
 
 
+def ellipse_inside(xx, yy, ellipse):
+    cx, cy = ellipse["center"]
+    angle = math.radians(ellipse["angle"])
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    dx = xx - cx
+    dy = yy - cy
+    local_x = cos_a * dx + sin_a * dy
+    local_y = -sin_a * dx + cos_a * dy
+    return (local_x / ellipse["major"]) ** 2 + (local_y / ellipse["minor"]) ** 2 <= 1.0
+
+
+def ellipse_bounds(ellipse, width, height):
+    cx, cy = ellipse["center"]
+    major = ellipse["major"]
+    minor = ellipse["minor"]
+    angle = math.radians(ellipse["angle"])
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    extent_x = math.sqrt((major * cos_a) ** 2 + (minor * sin_a) ** 2)
+    extent_y = math.sqrt((major * sin_a) ** 2 + (minor * cos_a) ** 2)
+    x0 = max(0, int(math.floor(cx - extent_x)))
+    y0 = max(0, int(math.floor(cy - extent_y)))
+    x1 = min(width, int(math.ceil(cx + extent_x)) + 1)
+    y1 = min(height, int(math.ceil(cy + extent_y)) + 1)
+    return x0, y0, x1, y1
+
+
 def interior_fraction(mask, candidate, exclude=None):
     height, width = mask.shape
-    cx, cy = candidate["center"]
-    radius = candidate["radius"]
-
-    x0, y0 = max(0, int(cx - radius)), max(0, int(cy - radius))
-    x1 = min(width, int(math.ceil(cx + radius)) + 1)
-    y1 = min(height, int(math.ceil(cy + radius)) + 1)
+    x0, y0, x1, y1 = ellipse_bounds(candidate, width, height)
     if x0 >= x1 or y0 >= y1:
         return 0.0, 0
 
     yy, xx = np.ogrid[y0:y1, x0:x1]
-    valid = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+    valid = ellipse_inside(xx, yy, candidate)
     if exclude is not None:
-        ex, ey = exclude["center"]
-        er = exclude["radius"]
-        valid &= (xx - ex) ** 2 + (yy - ey) ** 2 > er * er
+        valid &= ~ellipse_inside(xx, yy, exclude)
 
     visible_pixels = int(np.count_nonzero(valid))
     if not visible_pixels:
@@ -211,7 +273,7 @@ def interior_fraction(mask, candidate, exclude=None):
     return matching_pixels / visible_pixels, visible_pixels
 
 
-def select_circle(candidates, mask, label, exclude=None):
+def select_ellipse(candidates, mask, label, exclude=None):
     best = None
     best_score = -math.inf
     for candidate in candidates[:MAX_CLASS_CANDIDATES]:
@@ -231,18 +293,18 @@ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage, max
     _, bright_mask = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY)
 
     candidate_args = (min_radius, max_radius, max_error, min_coverage, max_contours, max_points)
-    dark_circle = select_circle(find_candidates(dark_mask, *candidate_args), dark_mask, "below threshold")
-    bright_circle = select_circle(
+    dark_ellipse = select_ellipse(find_candidates(dark_mask, *candidate_args), dark_mask, "below threshold")
+    bright_ellipse = select_ellipse(
         find_candidates(bright_mask, *candidate_args),
         bright_mask,
         "above threshold",
-        dark_circle,
+        dark_ellipse,
     )
-    return bright_mask, [circle for circle in (dark_circle, bright_circle) if circle is not None]
+    return bright_mask, [ellipse for ellipse in (dark_ellipse, bright_ellipse) if ellipse is not None]
 
 
-def process_image(image, gray, threshold, min_radius, max_radius, max_error, min_coverage, max_contours, max_points):
-    binary, circles = detect(
+def process_image(gray, threshold, min_radius, max_radius, max_error, min_coverage, max_contours, max_points):
+    binary, ellipses = detect(
         gray,
         threshold,
         min_radius,
@@ -254,20 +316,23 @@ def process_image(image, gray, threshold, min_radius, max_radius, max_error, min
     )
 
     output = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    for circle in circles:
-        cx, cy = circle["center"]
+    for ellipse in ellipses:
+        cx, cy = ellipse["center"]
         center = (int(round(cx)), int(round(cy)))
-        radius = int(round(circle["radius"]))
+        axes = (max(1, int(round(ellipse["major"]))), max(1, int(round(ellipse["minor"]))))
 
-        support = np.rint(circle["points"]).astype(np.int32).reshape(-1, 1, 2)
+        support = np.rint(ellipse["points"]).astype(np.int32).reshape(-1, 1, 2)
         if len(support) >= 2:
             cv2.polylines(output, [support], False, (0, 255, 0), 2, cv2.LINE_AA)
 
-        cv2.circle(output, center, radius, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.ellipse(output, center, axes, ellipse["angle"], 0, 360, (0, 0, 255), 2, cv2.LINE_AA)
         cv2.circle(output, center, 3, (0, 0, 255), -1)
 
-        kind = "DARK <= T" if circle["class"] == "below threshold" else "BRIGHT > T"
-        text = f"{kind}  r={circle['radius']:.1f}  arc={circle['coverage'] * 360:.0f}deg  err={circle['relative_error']:.3f}"
+        kind = "DARK <= T" if ellipse["class"] == "below threshold" else "BRIGHT > T"
+        text = (
+            f"{kind}  a={ellipse['major']:.1f}  b={ellipse['minor']:.1f}  "
+            f"arc={ellipse['coverage'] * 360:.0f}deg  err={ellipse['relative_error']:.3f}"
+        )
         cv2.putText(
             output,
             text,
@@ -279,7 +344,7 @@ def process_image(image, gray, threshold, min_radius, max_radius, max_error, min
             cv2.LINE_AA,
         )
 
-    return binary, output, circles
+    return binary, output, ellipses
 
 
 def build_palette(gray, max_colors=20, min_gap=10):
@@ -312,9 +377,8 @@ def text_color(gray_value):
 
 
 class DetectorApp:
-    def __init__(self, root, image, gray, palette, args):
+    def __init__(self, root, gray, palette, args):
         self.root = root
-        self.image = image
         self.gray = gray
         self.palette = palette
         self.args = args
@@ -331,7 +395,7 @@ class DetectorApp:
         self.min_coverage = tk.IntVar(value=round(args.min_coverage * 100))
         self.status = tk.StringVar(value="Adjust settings, then click Apply.")
 
-        root.title("Circle / Arc Detector")
+        root.title("Ellipse / Arc Detector")
         root.minsize(980, 680)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
@@ -351,10 +415,10 @@ class DetectorApp:
         radius_limit = max(1600, round(self.args.max_radius * 1.5))
         rows = [
             ("Brightness threshold (0=black, 255=white)", self.threshold, 0, 255, 1, lambda value: str(int(value))),
-            ("Minimum fitted circle radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
-            ("Maximum fitted circle radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
-            ("Maximum average radial error (% of radius)", self.max_error, 0.5, 50, 0.1, lambda value: f"{float(value):.1f}%"),
-            ("Minimum visible circle arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f} deg)"),
+            ("Minimum fitted equivalent radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
+            ("Maximum fitted equivalent radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
+            ("Maximum average normalized ellipse error (%)", self.max_error, 0.5, 50, 0.1, lambda value: f"{float(value):.1f}%"),
+            ("Minimum visible ellipse arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)"),
         ]
         for row, spec in enumerate(rows):
             self.add_scale(frame, row, *spec)
@@ -373,22 +437,10 @@ class DetectorApp:
             ).grid(row=index // 10, column=index % 10, padx=2, pady=2)
 
         tk.Button(frame, text="Apply", width=12, command=self.apply).grid(row=6, column=0, sticky="w", pady=(2, 0))
-        tk.Label(frame, textvariable=self.status, anchor="w", justify="left", wraplength=1100).grid(
-            row=7,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            pady=(8, 0),
-        )
+        tk.Label(frame, textvariable=self.status, anchor="w", justify="left", wraplength=1100).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
     def add_scale(self, parent, row, text, variable, low, high, resolution, formatter):
-        tk.Label(parent, text=text, width=38, anchor="w").grid(
-            row=row,
-            column=0,
-            sticky="w",
-            padx=(0, 8),
-            pady=2,
-        )
+        tk.Label(parent, text=text, width=38, anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         tk.Scale(
             parent,
             from_=low,
@@ -419,7 +471,7 @@ class DetectorApp:
         frame.columnconfigure(1, weight=1, uniform="preview")
 
         tk.Label(frame, text="Threshold preview").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(frame, text="Detected circles on grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        tk.Label(frame, text="Detected ellipses on grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
 
         self.binary_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
         self.result_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
@@ -429,7 +481,7 @@ class DetectorApp:
         self.binary_canvas.bind("<Configure>", self.schedule_redraw)
         self.result_canvas.bind("<Configure>", self.schedule_redraw)
         self.placeholder(self.binary_canvas, "Threshold preview")
-        self.placeholder(self.result_canvas, "Detected circles")
+        self.placeholder(self.result_canvas, "Detected ellipses")
 
     def pick(self, value):
         self.threshold.set(value)
@@ -445,7 +497,6 @@ class DetectorApp:
         if max_radius < min_radius:
             max_radius = min_radius
             self.max_radius.set(round(max_radius))
-
         return (
             int(self.threshold.get()),
             min_radius,
@@ -457,8 +508,7 @@ class DetectorApp:
     def apply(self):
         threshold, min_radius, max_radius, max_error, min_coverage = self.settings()
         started = time.perf_counter()
-        binary, result, circles = process_image(
-            self.image,
+        binary, result, ellipses = process_image(
             self.gray,
             threshold,
             min_radius,
@@ -475,14 +525,14 @@ class DetectorApp:
         self.redraw()
 
         self.status.set(
-            f"Applied: T={threshold}; radius={min_radius:.0f}-{max_radius:.0f}px; "
-            f"error={max_error:.1%}; arc={min_coverage:.0%}; {len(circles)} circle(s); {elapsed:.1f} ms."
+            f"Applied: T={threshold}; eq radius={min_radius:.0f}-{max_radius:.0f}px; "
+            f"error={max_error:.1%}; arc={min_coverage:.0%}; {len(ellipses)} ellipse(s); {elapsed:.1f} ms."
         )
-        for circle in circles:
+        for ellipse in ellipses:
             print(
-                f"{circle['class']}: center=({circle['center'][0]:.2f}, {circle['center'][1]:.2f}), "
-                f"radius={circle['radius']:.2f}, arc={circle['coverage'] * 360:.1f} deg, "
-                f"error={circle['relative_error']:.4f}, interior={circle['interior_fraction']:.1%}"
+                f"{ellipse['class']}: center=({ellipse['center'][0]:.2f}, {ellipse['center'][1]:.2f}), "
+                f"eq_radius={ellipse['equivalent_radius']:.2f}, a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, angle={ellipse['angle']:.1f}, arc={ellipse['coverage'] * 360:.1f}°, "
+                f"error={ellipse['relative_error']:.4f}, interior={ellipse['interior_fraction']:.1%}"
             )
 
     def schedule_redraw(self, _event=None):
@@ -504,15 +554,10 @@ class DetectorApp:
         image_height, image_width = image.shape[:2]
         scale = max(min(canvas_width / image_width, canvas_height / image_height), 1e-6)
         fitted_size = (max(1, round(image_width * scale)), max(1, round(image_height * scale)))
-        fitted = cv2.resize(
-            image,
-            fitted_size,
-            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
-        )
+        fitted = cv2.resize(image, fitted_size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
         ok, encoded = cv2.imencode(".png", fitted)
         if not ok:
             return None
-
         photo = tk.PhotoImage(data=base64.b64encode(encoded).decode("ascii"), format="png")
         canvas.delete("all")
         canvas.create_image(canvas_width // 2 + 1, canvas_height // 2 + 1, image=photo, anchor="center")
@@ -520,21 +565,15 @@ class DetectorApp:
 
     @staticmethod
     def placeholder(canvas, text):
-        canvas.create_text(
-            160,
-            120,
-            text=text + "\nClick Apply",
-            fill="#cccccc",
-            justify="center",
-        )
+        canvas.create_text(160, 120, text=text + "\nClick Apply", fill="#cccccc", justify="center")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect up to two inferred circles from thresholded image arcs.")
+    parser = argparse.ArgumentParser(description="Detect up to two inferred ellipses from thresholded image arcs.")
     parser.add_argument("image")
     parser.add_argument("--threshold", type=int, default=8)
-    parser.add_argument("--min-radius", type=float, default=1000.0)
-    parser.add_argument("--max-radius", type=float, default=1500.0, help="0 = largest image dimension")
+    parser.add_argument("--min-radius", type=float, default=1000.0, help="Minimum equivalent ellipse radius")
+    parser.add_argument("--max-radius", type=float, default=1500.0, help="Maximum equivalent radius; 0 = largest image dimension")
     parser.add_argument("--max-error", type=float, default=0.08)
     parser.add_argument("--min-coverage", type=float, default=0.12)
     parser.add_argument("--max-contours", type=int, default=100)
@@ -569,7 +608,7 @@ def main():
 
     palette = build_palette(gray, args.palette_size, args.palette_min_gap)
     root = tk.Tk()
-    DetectorApp(root, image, gray, palette, args)
+    DetectorApp(root, gray, palette, args)
     root.mainloop()
 
 
