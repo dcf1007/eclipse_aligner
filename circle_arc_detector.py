@@ -1,4 +1,5 @@
 import argparse
+import base64
 import math
 import time
 import tkinter as tk
@@ -235,7 +236,16 @@ def _downsample_points(points, max_points):
     return points[indices]
 
 
-def _find_candidates(binary, min_radius, max_radius, max_relative_error, min_coverage, max_contours, max_search_points, min_contour_points=12):
+def _find_candidates(
+    binary,
+    min_radius,
+    max_radius,
+    max_relative_error,
+    min_coverage,
+    max_contours,
+    max_search_points,
+    min_contour_points=12,
+):
     contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     min_region_points = max(8, min_contour_points)
     min_perimeter = max(12.0, min_radius * min_coverage * math.pi)
@@ -511,6 +521,9 @@ class DetectorApp:
         self.last_threshold_preview = None
         self.last_result_image = None
         self.last_detections = []
+        self.threshold_photo = None
+        self.result_photo = None
+        self.resize_job = None
 
         self.threshold_var = tk.IntVar(value=args.threshold)
         self.min_radius_var = tk.IntVar(value=int(round(args.min_radius)))
@@ -521,71 +534,86 @@ class DetectorApp:
         self.status_var = tk.StringVar(value="Adjust settings, then click Apply.")
         self.save_path_var = tk.StringVar(value=self.current_output_path)
 
-        self.root.title("Circle / Arc Detector Controls")
-        self.root.columnconfigure(1, weight=1)
+        self.root.title("Circle / Arc Detector")
+        self.root.minsize(980, 680)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self._build_ui()
-        self._init_opencv_windows()
+        self._build_controls()
+        self._build_previews()
+        self._draw_placeholder(self.threshold_canvas, "Threshold preview")
+        self._draw_placeholder(self.result_canvas, "Detected circles")
 
         self.root.bind("<Return>", lambda _event: self.apply())
         self.root.bind("<Control-s>", lambda _event: self.save_result())
         self.root.bind("<Escape>", lambda _event: self.on_close())
-        self.root.after(30, self._pump_opencv)
 
-    def _build_ui(self):
-        row = 0
+    def _build_controls(self):
+        controls = tk.Frame(self.root, padx=10, pady=8)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+
         max_slider_radius = max(100, int(round(self.args.max_radius * 2)))
-        self._add_scale_row(row, "Brightness threshold (0=black, 255=white)", self.threshold_var, 0, 255, 1, lambda v: f"{int(v)}")
-        row += 1
-        self._add_scale_row(row, "Minimum fitted circle radius (px)", self.min_radius_var, 1, max_slider_radius, 1, lambda v: f"{int(v)} px")
-        row += 1
-        self._add_scale_row(row, "Maximum fitted circle radius (px)", self.max_radius_var, 1, max_slider_radius, 1, lambda v: f"{int(v)} px")
-        row += 1
-        self._add_scale_row(row, "Maximum average radial error (% of radius)", self.max_error_var, 0.5, 50.0, 0.1, lambda v: f"{float(v):.1f}%")
-        row += 1
-        self._add_scale_row(row, "Minimum visible circle arc (%)", self.min_coverage_var, 0, 100, 1, lambda v: f"{int(v)}% (~{int(v) * 3.6:.0f}°)")
-        row += 1
+        rows = [
+            ("Brightness threshold (0=black, 255=white)", self.threshold_var, 0, 255, 1, lambda v: f"{int(v)}"),
+            ("Minimum fitted circle radius (px)", self.min_radius_var, 1, max_slider_radius, 1, lambda v: f"{int(v)} px"),
+            ("Maximum fitted circle radius (px)", self.max_radius_var, 1, max_slider_radius, 1, lambda v: f"{int(v)} px"),
+            ("Maximum average radial error (% of radius)", self.max_error_var, 0.5, 50.0, 0.1, lambda v: f"{float(v):.1f}%"),
+            ("Minimum visible circle arc (%)", self.min_coverage_var, 0, 100, 1, lambda v: f"{int(v)}% (~{int(v) * 3.6:.0f}°)"),
+        ]
+        for row, values in enumerate(rows):
+            self._add_scale_row(controls, row, *values)
 
         morphology = tk.Checkbutton(
-            self.root,
+            controls,
             text="Use 3x3 morphology cleanup before contour detection",
             variable=self.morphology_var,
             anchor="w",
         )
-        morphology.grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 8))
+        morphology.grid(row=5, column=0, columnspan=3, sticky="w", pady=(2, 8))
         self.morphology_var.trace_add("write", self._mark_pending)
-        row += 1
 
-        tk.Label(self.root, text="Pick threshold from image colors:").grid(row=row, column=0, sticky="nw", padx=10)
-        palette_frame = tk.Frame(self.root)
-        palette_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 8))
+        tk.Label(controls, text="Pick threshold from image colors:").grid(row=6, column=0, sticky="nw")
+        palette_frame = tk.Frame(controls)
+        palette_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=(0, 8))
         self._build_palette(palette_frame)
-        row += 1
 
-        buttons = tk.Frame(self.root)
-        buttons.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=(2, 0))
+        buttons = tk.Frame(controls)
+        buttons.grid(row=7, column=0, columnspan=3, sticky="ew")
         buttons.columnconfigure(4, weight=1)
         tk.Button(buttons, text="Apply", width=12, command=self.apply).grid(row=0, column=0, padx=(0, 8))
         tk.Button(buttons, text="Save", width=12, command=self.save_result).grid(row=0, column=1, padx=(0, 8))
         tk.Button(buttons, text="Save As...", width=12, command=self.choose_save_path).grid(row=0, column=2, padx=(0, 8))
         tk.Label(buttons, text="Output file:").grid(row=0, column=3, sticky="e")
         tk.Entry(buttons, textvariable=self.save_path_var).grid(row=0, column=4, sticky="ew", padx=(6, 0))
-        row += 1
 
-        tk.Label(self.root, textvariable=self.status_var, anchor="w", justify="left", wraplength=900).grid(
-            row=row,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            padx=10,
-            pady=(8, 10),
+        tk.Label(controls, textvariable=self.status_var, anchor="w", justify="left", wraplength=1100).grid(
+            row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0)
         )
 
-    def _add_scale_row(self, row, label_text, variable, minimum, maximum, resolution, formatter):
-        tk.Label(self.root, text=label_text, width=38, anchor="w").grid(row=row, column=0, sticky="w", padx=(10, 8), pady=2)
+    def _build_previews(self):
+        previews = tk.Frame(self.root, padx=10, pady=(0, 10))
+        previews.grid(row=1, column=0, sticky="nsew")
+        previews.rowconfigure(1, weight=1)
+        previews.columnconfigure(0, weight=1, uniform="preview")
+        previews.columnconfigure(1, weight=1, uniform="preview")
+
+        tk.Label(previews, text="Threshold preview").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        tk.Label(previews, text="Detected circles").grid(row=0, column=1, sticky="w", pady=(0, 4))
+
+        self.threshold_canvas = tk.Canvas(previews, bg="#202020", highlightthickness=1, highlightbackground="#808080")
+        self.result_canvas = tk.Canvas(previews, bg="#202020", highlightthickness=1, highlightbackground="#808080")
+        self.threshold_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        self.result_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+
+        self.threshold_canvas.bind("<Configure>", self._schedule_preview_redraw)
+        self.result_canvas.bind("<Configure>", self._schedule_preview_redraw)
+
+    def _add_scale_row(self, parent, row, label_text, variable, minimum, maximum, resolution, formatter):
+        tk.Label(parent, text=label_text, width=38, anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         scale = tk.Scale(
-            self.root,
+            parent,
             from_=minimum,
             to=maximum,
             orient=tk.HORIZONTAL,
@@ -596,8 +624,8 @@ class DetectorApp:
             highlightthickness=0,
         )
         scale.grid(row=row, column=1, sticky="ew", pady=2)
-        value_label = tk.Label(self.root, anchor="e", width=18)
-        value_label.grid(row=row, column=2, sticky="e", padx=(8, 10), pady=2)
+        value_label = tk.Label(parent, anchor="e", width=18)
+        value_label.grid(row=row, column=2, sticky="e", pady=2)
 
         def refresh_value(*_args):
             value_label.config(text=formatter(variable.get()))
@@ -608,26 +636,14 @@ class DetectorApp:
 
     def _build_palette(self, parent):
         for index, item in enumerate(self.palette):
-            button = tk.Button(
+            tk.Button(
                 parent,
                 text=str(item["threshold"]),
                 width=4,
                 background=_bgr_to_hex(item["bgr"]),
                 foreground=_contrasting_text_color(item["bgr"]),
                 command=lambda value=item["threshold"]: self._set_threshold_from_palette(value),
-            )
-            button.grid(row=index // 8, column=index % 8, padx=2, pady=2)
-
-    def _init_opencv_windows(self):
-        cv2.namedWindow("Threshold preview", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-        cv2.namedWindow("Detected circles", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-        self._show_placeholder()
-
-    def _show_placeholder(self):
-        placeholder = np.zeros((240, 320, 3), dtype=np.uint8)
-        cv2.putText(placeholder, "Click Apply", (70, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
-        cv2.imshow("Threshold preview", placeholder)
-        cv2.imshow("Detected circles", placeholder)
+            ).grid(row=index // 8, column=index % 8, padx=2, pady=2)
 
     def _set_threshold_from_palette(self, threshold):
         self.threshold_var.set(int(threshold))
@@ -668,23 +684,61 @@ class DetectorApp:
         self.last_threshold_preview = threshold_preview
         self.last_result_image = result_image
         self.last_detections = detections
-
-        cv2.imshow("Threshold preview", threshold_preview)
-        cv2.imshow("Detected circles", result_image)
-        cv2.waitKey(1)
+        self._redraw_previews()
 
         self.status_var.set(
             f"Applied: threshold={threshold}; radius={min_radius:.0f}-{max_radius:.0f}px; "
             f"max avg radial error={max_relative_error:.1%}; minimum visible arc={min_coverage:.0%}; "
             f"morphology={'on' if self.morphology_var.get() else 'off'}; {len(detections)} circle(s); {elapsed_ms:.1f} ms."
         )
-
         print(
             f"Applied: threshold={threshold}, min_radius={min_radius:.0f}, max_radius={max_radius:.0f}, "
             f"max_relative_error={max_relative_error:.3f}, min_coverage={min_coverage:.2f}, "
             f"morphology={self.morphology_var.get()}: {len(detections)} circle(s), {elapsed_ms:.1f} ms"
         )
         _print_detections(detections)
+
+    def _schedule_preview_redraw(self, _event=None):
+        if self.resize_job is not None:
+            self.root.after_cancel(self.resize_job)
+        self.resize_job = self.root.after(60, self._redraw_previews)
+
+    def _redraw_previews(self):
+        self.resize_job = None
+        if self.last_threshold_preview is not None:
+            self.threshold_photo = self._show_image(self.threshold_canvas, self.last_threshold_preview)
+        if self.last_result_image is not None:
+            self.result_photo = self._show_image(self.result_canvas, self.last_result_image)
+
+    def _show_image(self, canvas, image):
+        canvas_width = max(2, canvas.winfo_width() - 2)
+        canvas_height = max(2, canvas.winfo_height() - 2)
+        image_height, image_width = image.shape[:2]
+        scale = min(canvas_width / image_width, canvas_height / image_height)
+        scale = max(scale, 1e-6)
+        target_width = max(1, int(round(image_width * scale)))
+        target_height = max(1, int(round(image_height * scale)))
+
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        fitted = cv2.resize(image, (target_width, target_height), interpolation=interpolation)
+        ok, encoded = cv2.imencode(".png", fitted)
+        if not ok:
+            return None
+
+        photo = tk.PhotoImage(data=base64.b64encode(encoded).decode("ascii"), format="png")
+        canvas.delete("all")
+        canvas.create_image(canvas_width // 2 + 1, canvas_height // 2 + 1, image=photo, anchor="center")
+        return photo
+
+    def _draw_placeholder(self, canvas, text):
+        canvas.delete("all")
+        canvas.create_text(
+            max(1, canvas.winfo_width()) // 2,
+            max(1, canvas.winfo_height()) // 2,
+            text=text + "\nClick Apply",
+            fill="#cccccc",
+            justify="center",
+        )
 
     def choose_save_path(self):
         filename = filedialog.asksaveasfilename(
@@ -720,25 +774,8 @@ class DetectorApp:
         self.status_var.set(f"Saved current result to: {output_path}")
         print(f"Saved: {output_path}")
 
-    def _pump_opencv(self):
-        try:
-            key = cv2.waitKey(1) & 0xFF
-        except cv2.error:
-            key = -1
-
-        if key in (27, ord("q")):
-            self.on_close()
-            return
-
-        if self.root.winfo_exists():
-            self.root.after(30, self._pump_opencv)
-
     def on_close(self):
-        try:
-            cv2.destroyAllWindows()
-        finally:
-            if self.root.winfo_exists():
-                self.root.destroy()
+        self.root.destroy()
 
 
 def main():
