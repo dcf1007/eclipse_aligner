@@ -21,7 +21,6 @@ def fit_circle(points):
     xm, ym = float(x.mean()), float(y.mean())
     u, v = x - xm, y - ym
     z = u * u + v * v
-
     suu, svv, suv = np.dot(u, u), np.dot(v, v), np.dot(u, v)
     suz, svz = np.dot(u, z), np.dot(v, z)
     det = suu * svv - suv * suv
@@ -31,70 +30,61 @@ def fit_circle(points):
     uc = 0.5 * (suz * svv - svz * suv) / det
     vc = 0.5 * (svz * suu - suz * suv) / det
     cx, cy = xm + uc, ym + vc
-
     r2 = float(z.mean()) + uc * uc + vc * vc
     if r2 <= 0 or not np.isfinite(r2):
         return None
 
-    radius = math.sqrt(r2)
-    mean_error = float(np.mean(np.abs(np.hypot(x - cx, y - cy) - radius)))
-    values = (cx, cy, radius, mean_error)
-    if not np.all(np.isfinite(values)):
-        return None
-    return float(cx), float(cy), radius, mean_error
+    r = math.sqrt(r2)
+    err = float(np.mean(np.abs(np.hypot(x - cx, y - cy) - r)))
+    return (float(cx), float(cy), r, err) if np.all(np.isfinite((cx, cy, r, err))) else None
 
 
 def coverage(points, cx, cy):
     if len(points) < 2:
         return 0.0
     angles = np.unwrap(np.arctan2(points[:, 1] - cy, points[:, 0] - cx))
-    return float(np.clip(np.ptp(angles) / (2 * np.pi), 0, 1))
+    return float(np.clip(np.ptp(angles) / (2 * np.pi), 0.0, 1.0))
 
 
-def window_lengths(point_count, minimum):
-    minimum = max(3, min(minimum, point_count))
-    values = {minimum, point_count}
+def window_lengths(n, minimum):
+    minimum = max(3, min(minimum, n))
+    lengths = {minimum, n}
     length = minimum
-    while length < point_count:
-        values.add(length)
-        length = min(point_count, max(length + 1, int(round(length * 1.45))))
-    return sorted(values)
+    while length < n:
+        lengths.add(length)
+        length = min(n, max(length + 1, int(round(length * 1.45))))
+    return sorted(lengths)
 
 
-def eval_region(extended, point_count, start, length, min_radius, max_radius, max_error, min_coverage):
-    if length < 3 or length > point_count:
+def eval_region(extended, n, start, length, min_radius, max_radius, max_error, min_coverage):
+    if length < 3 or length > n:
         return None
 
-    start %= point_count
+    start %= n
     region = extended[start : start + length]
-    fitted = fit_circle(region)
-    if fitted is None:
+    fit = fit_circle(region)
+    if fit is None:
         return None
 
-    cx, cy, radius, mean_error = fitted
+    cx, cy, radius, error = fit
     if not min_radius <= radius <= max_radius:
         return None
 
-    relative_error = mean_error / radius
+    relative_error = error / radius
     if relative_error > max_error:
         return None
 
-    arc_coverage = coverage(region, cx, cy)
-    if arc_coverage < min_coverage:
+    cov = coverage(region, cx, cy)
+    if cov < min_coverage:
         return None
 
-    support_fraction = length / point_count
-    score = (
-        arc_coverage**1.5
-        * math.sqrt(length)
-        * (0.75 + 0.25 * math.sqrt(support_fraction))
-        / (relative_error + 0.002)
-    )
+    support = length / n
+    score = cov**1.5 * math.sqrt(length) * (0.75 + 0.25 * math.sqrt(support)) / (relative_error + 0.002)
     return {
         "center": (cx, cy),
         "radius": radius,
         "relative_error": relative_error,
-        "coverage": arc_coverage,
+        "coverage": cov,
         "points": region.copy(),
         "start": start,
         "length": length,
@@ -112,64 +102,48 @@ def same_circle(a, b, center_fraction=0.12, radius_fraction=0.12):
     )
 
 
-def refine(candidate, extended, point_count, minimum, min_radius, max_radius, max_error, min_coverage):
+def refine(candidate, extended, n, minimum, min_radius, max_radius, max_error, min_coverage):
     best = candidate
-    moves = ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0))
-
     for _ in range(40):
         improved = False
-        for start_delta, length_delta in moves:
-            length = best["length"] + length_delta
-            if not minimum <= length <= point_count:
+        for ds, dl in ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0)):
+            new_length = best["length"] + dl
+            if not minimum <= new_length <= n:
                 continue
-
             trial = eval_region(
                 extended,
-                point_count,
-                best["start"] + start_delta,
-                length,
+                n,
+                best["start"] + ds,
+                new_length,
                 min_radius,
                 max_radius,
                 max_error,
                 min_coverage,
             )
             if trial is not None and trial["score"] > best["score"] * (1 + 1e-9):
-                best = trial
-                improved = True
-
+                best, improved = trial, True
         if not improved:
             break
-
     return best
 
 
 def find_regions(points, min_radius, max_radius, max_error, min_coverage, minimum=12):
-    points = np.asarray(points, np.float64)
-    point_count = len(points)
-    if point_count < max(3, minimum):
+    p = np.asarray(points, np.float64)
+    n = len(p)
+    if n < max(3, minimum):
         return []
 
-    minimum = min(minimum, point_count)
-    extended = np.vstack((points, points))
+    minimum = min(minimum, n)
+    extended = np.vstack((p, p))
     coarse = []
-
-    for length in window_lengths(point_count, minimum):
-        for start in range(0, point_count, max(1, length // 5)):
-            candidate = eval_region(
-                extended,
-                point_count,
-                start,
-                length,
-                min_radius,
-                max_radius,
-                max_error,
-                min_coverage,
-            )
+    for length in window_lengths(n, minimum):
+        step = max(1, length // 5)
+        for start in range(0, n, step):
+            candidate = eval_region(extended, n, start, length, min_radius, max_radius, max_error, min_coverage)
             if candidate is not None:
                 coarse.append(candidate)
 
     coarse.sort(key=lambda item: item["score"], reverse=True)
-
     seeds = []
     for candidate in coarse:
         if any(same_circle(candidate, old, 0.10, 0.10) for old in seeds):
@@ -180,16 +154,7 @@ def find_regions(points, min_radius, max_radius, max_error, min_coverage, minimu
 
     result = []
     for seed in seeds:
-        candidate = refine(
-            seed,
-            extended,
-            point_count,
-            minimum,
-            min_radius,
-            max_radius,
-            max_error,
-            min_coverage,
-        )
+        candidate = refine(seed, extended, n, minimum, min_radius, max_radius, max_error, min_coverage)
         if not any(same_circle(candidate, old) for old in result):
             result.append(candidate)
 
@@ -233,7 +198,6 @@ def interior_fraction(mask, candidate, exclude=None):
 
     yy, xx = np.ogrid[y0:y1, x0:x1]
     valid = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
-
     if exclude is not None:
         ex, ey = exclude["center"]
         er = exclude["radius"]
@@ -250,18 +214,15 @@ def interior_fraction(mask, candidate, exclude=None):
 def select_circle(candidates, mask, label, exclude=None):
     best = None
     best_score = -math.inf
-
     for candidate in candidates[:MAX_CLASS_CANDIDATES]:
         fraction, visible_pixels = interior_fraction(mask, candidate, exclude)
         if visible_pixels < 16 or fraction < MIN_INTERIOR_FRACTION:
             continue
-
         score = candidate["score"] * fraction**2
         if score > best_score:
             best = candidate.copy()
             best.update({"class": label, "interior_fraction": fraction})
             best_score = score
-
     return best
 
 
@@ -277,7 +238,6 @@ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage, max
         "above threshold",
         dark_circle,
     )
-
     return bright_mask, [circle for circle in (dark_circle, bright_circle) if circle is not None]
 
 
@@ -293,7 +253,7 @@ def process_image(image, gray, threshold, min_radius, max_radius, max_error, min
         max_points,
     )
 
-    output = image.copy()
+    output = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for circle in circles:
         cx, cy = circle["center"]
         center = (int(round(cx)), int(round(cy)))
@@ -307,11 +267,7 @@ def process_image(image, gray, threshold, min_radius, max_radius, max_error, min
         cv2.circle(output, center, 3, (0, 0, 255), -1)
 
         kind = "DARK <= T" if circle["class"] == "below threshold" else "BRIGHT > T"
-        text = (
-            f"{kind}  r={circle['radius']:.1f}  "
-            f"arc={circle['coverage'] * 360:.0f}deg  "
-            f"err={circle['relative_error']:.3f}"
-        )
+        text = f"{kind}  r={circle['radius']:.1f}  arc={circle['coverage'] * 360:.0f}deg  err={circle['relative_error']:.3f}"
         cv2.putText(
             output,
             text,
@@ -326,12 +282,9 @@ def process_image(image, gray, threshold, min_radius, max_radius, max_error, min
     return binary, output, circles
 
 
-def build_palette(image, gray, max_colors=12, min_gap=15):
-    stride = max(1, int(math.ceil(math.sqrt(gray.size / 200_000))))
-    sample_gray = gray[::stride, ::stride].reshape(-1)
-    sample_bgr = image[::stride, ::stride].reshape(-1, 3)
-
-    hist = np.bincount(sample_gray, minlength=256).astype(float)
+def build_palette(gray, max_colors=20, min_gap=10):
+    grayscale_values = gray.reshape(-1)
+    hist = np.bincount(grayscale_values, minlength=256).astype(float)
     smooth_radius = max(2, min_gap // 3)
     density = np.convolve(hist, np.ones(2 * smooth_radius + 1), mode="same")
 
@@ -346,31 +299,16 @@ def build_palette(image, gray, max_colors=12, min_gap=15):
         if len(shades) >= max_colors:
             break
 
-    result = []
-    sample_gray_i16 = sample_gray.astype(np.int16, copy=False)
-    color_radius = max(3, min_gap // 3)
-    for shade in shades:
-        mask = np.abs(sample_gray_i16 - shade) <= color_radius
-        if np.any(mask):
-            threshold = int(round(float(np.average(sample_gray[mask]))))
-            bgr = tuple(int(round(value)) for value in np.median(sample_bgr[mask], axis=0))
-        else:
-            threshold = shade
-            bgr = (shade,) * 3
-        result.append({"threshold": int(np.clip(threshold, 0, 255)), "bgr": bgr})
-
-    result.sort(key=lambda item: item["threshold"])
-    return result
+    return [int(shade) for shade in sorted(shades)]
 
 
-def bgr_hex(bgr):
-    b, g, r = bgr
-    return f"#{r:02x}{g:02x}{b:02x}"
+def gray_hex(value):
+    value = int(np.clip(value, 0, 255))
+    return f"#{value:02x}{value:02x}{value:02x}"
 
 
-def text_color(bgr):
-    b, g, r = bgr
-    return "#111111" if 0.114 * b + 0.587 * g + 0.299 * r >= 150 else "#f7f7f7"
+def text_color(gray_value):
+    return "#111111" if gray_value >= 150 else "#f7f7f7"
 
 
 class DetectorApp:
@@ -380,7 +318,6 @@ class DetectorApp:
         self.gray = gray
         self.palette = palette
         self.args = args
-
         self.last_binary = None
         self.last_result = None
         self.binary_photo = None
@@ -411,44 +348,38 @@ class DetectorApp:
         frame.grid(row=0, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
 
-        radius_limit = max(100, round(self.args.max_radius * 2))
+        radius_limit = max(1600, round(self.args.max_radius * 1.5))
         rows = [
             ("Brightness threshold (0=black, 255=white)", self.threshold, 0, 255, 1, lambda value: str(int(value))),
             ("Minimum fitted circle radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
             ("Maximum fitted circle radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
             ("Maximum average radial error (% of radius)", self.max_error, 0.5, 50, 0.1, lambda value: f"{float(value):.1f}%"),
-            ("Minimum visible circle arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)"),
+            ("Minimum visible circle arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f} deg)"),
         ]
         for row, spec in enumerate(rows):
             self.add_scale(frame, row, *spec)
 
-        tk.Label(frame, text="Pick threshold from image colors:").grid(row=5, column=0, sticky="nw")
+        tk.Label(frame, text="Pick threshold from grayscale tones:").grid(row=5, column=0, sticky="nw")
         palette_frame = tk.Frame(frame)
         palette_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=(0, 8))
-        for index, item in enumerate(self.palette):
+        for index, shade in enumerate(self.palette):
             tk.Button(
                 palette_frame,
-                text=str(item["threshold"]),
+                text=str(shade),
                 width=4,
-                bg=bgr_hex(item["bgr"]),
-                fg=text_color(item["bgr"]),
-                command=lambda value=item["threshold"]: self.pick(value),
-            ).grid(row=index // 8, column=index % 8, padx=2, pady=2)
+                bg=gray_hex(shade),
+                fg=text_color(shade),
+                command=lambda value=shade: self.pick(value),
+            ).grid(row=index // 10, column=index % 10, padx=2, pady=2)
 
-        tk.Button(frame, text="Apply", width=12, command=self.apply).grid(
-            row=6,
+        tk.Button(frame, text="Apply", width=12, command=self.apply).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        tk.Label(frame, textvariable=self.status, anchor="w", justify="left", wraplength=1100).grid(
+            row=7,
             column=0,
-            sticky="w",
-            pady=(2, 0),
+            columnspan=3,
+            sticky="ew",
+            pady=(8, 0),
         )
-
-        tk.Label(
-            frame,
-            textvariable=self.status,
-            anchor="w",
-            justify="left",
-            wraplength=1100,
-        ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
     def add_scale(self, parent, row, text, variable, low, high, resolution, formatter):
         tk.Label(parent, text=text, width=38, anchor="w").grid(
@@ -488,7 +419,7 @@ class DetectorApp:
         frame.columnconfigure(1, weight=1, uniform="preview")
 
         tk.Label(frame, text="Threshold preview").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(frame, text="Detected circles").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        tk.Label(frame, text="Detected circles on grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
 
         self.binary_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
         self.result_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
@@ -537,25 +468,21 @@ class DetectorApp:
             self.args.max_contours,
             self.args.max_search_points,
         )
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        elapsed = (time.perf_counter() - started) * 1000
 
         self.last_binary = binary
         self.last_result = result
         self.redraw()
+
         self.status.set(
             f"Applied: T={threshold}; radius={min_radius:.0f}-{max_radius:.0f}px; "
-            f"error={max_error:.1%}; arc={min_coverage:.0%}; "
-            f"{len(circles)} circle(s); {elapsed_ms:.1f} ms."
+            f"error={max_error:.1%}; arc={min_coverage:.0%}; {len(circles)} circle(s); {elapsed:.1f} ms."
         )
-
         for circle in circles:
             print(
-                f"{circle['class']}: "
-                f"center=({circle['center'][0]:.2f}, {circle['center'][1]:.2f}), "
-                f"radius={circle['radius']:.2f}, "
-                f"arc={circle['coverage'] * 360:.1f}°, "
-                f"error={circle['relative_error']:.4f}, "
-                f"interior={circle['interior_fraction']:.1%}"
+                f"{circle['class']}: center=({circle['center'][0]:.2f}, {circle['center'][1]:.2f}), "
+                f"radius={circle['radius']:.2f}, arc={circle['coverage'] * 360:.1f} deg, "
+                f"error={circle['relative_error']:.4f}, interior={circle['interior_fraction']:.1%}"
             )
 
     def schedule_redraw(self, _event=None):
@@ -575,30 +502,20 @@ class DetectorApp:
         canvas_width = max(2, canvas.winfo_width() - 2)
         canvas_height = max(2, canvas.winfo_height() - 2)
         image_height, image_width = image.shape[:2]
-
         scale = max(min(canvas_width / image_width, canvas_height / image_height), 1e-6)
-        target_size = (
-            max(1, round(image_width * scale)),
-            max(1, round(image_height * scale)),
-        )
+        fitted_size = (max(1, round(image_width * scale)), max(1, round(image_height * scale)))
         fitted = cv2.resize(
             image,
-            target_size,
+            fitted_size,
             interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
         )
-
         ok, encoded = cv2.imencode(".png", fitted)
         if not ok:
             return None
 
         photo = tk.PhotoImage(data=base64.b64encode(encoded).decode("ascii"), format="png")
         canvas.delete("all")
-        canvas.create_image(
-            canvas_width // 2 + 1,
-            canvas_height // 2 + 1,
-            image=photo,
-            anchor="center",
-        )
+        canvas.create_image(canvas_width // 2 + 1, canvas_height // 2 + 1, image=photo, anchor="center")
         return photo
 
     @staticmethod
@@ -622,8 +539,8 @@ def main():
     parser.add_argument("--min-coverage", type=float, default=0.12)
     parser.add_argument("--max-contours", type=int, default=100)
     parser.add_argument("--max-search-points", type=int, default=500)
-    parser.add_argument("--palette-size", type=int, default=12)
-    parser.add_argument("--palette-min-gap", type=int, default=15)
+    parser.add_argument("--palette-size", type=int, default=20)
+    parser.add_argument("--palette-min-gap", type=int, default=10)
     args = parser.parse_args()
 
     if not 0 <= args.threshold <= 255:
@@ -650,7 +567,7 @@ def main():
         args.max_radius = float(max(gray.shape))
     args.max_radius = max(args.max_radius, args.min_radius)
 
-    palette = build_palette(image, gray, args.palette_size, args.palette_min_gap)
+    palette = build_palette(gray, args.palette_size, args.palette_min_gap)
     root = tk.Tk()
     DetectorApp(root, image, gray, palette, args)
     root.mainloop()
