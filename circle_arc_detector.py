@@ -69,8 +69,9 @@ DARK_DOMINANT_COVERAGE = 0.55
 INTERMEDIATE_MIN_FACTOR = 0.65
 INTERMEDIATE_MAX_FACTOR = 1.35
 
-# Reduced-resolution working sizes.  Auto-threshold selection uses an even
-# smaller image because it may evaluate several candidate thresholds.
+# Reduced-resolution working sizes.  Automatic threshold initialization uses a
+# very small image because it needs only brightness/color statistics; it never
+# runs contour, ellipse, arc, or horizon detection.
 PREVIEW_MAX_DIM = 2400
 AUTO_THRESHOLD_MAX_DIM = 600
 
@@ -1949,287 +1950,33 @@ def build_threshold_candidates(gray, bgr=None, max_colors=20, fallback=8):
     return sorted(set(int(v) for v in selected))[:max_colors]
 
 
-def score_detection_for_threshold(ellipses, horizon, solar_hint=None, expected_radius=None):
-    """Heuristic used only to choose an initial threshold on a small preview."""
-    if not ellipses:
-        return -1e9
-    score = 0.0
-    classes = {ellipse.get("class") for ellipse in ellipses}
-    if "above threshold" in classes:
-        score += 2.0
-    if "below threshold" in classes:
-        score += 1.0
-    # When a threshold can recover both physical limbs, strongly prefer it over a
-    # single-class threshold with merely a somewhat longer arc.
-    if len(ellipses) == 2:
-        score += 5.0
+def auto_select_threshold(color_image, fallback_threshold):
+    """Return a quick orientative per-image threshold estimate.
 
-    for ellipse in ellipses:
-        score += 5.0 * ellipse.get("coverage", 0.0)
-        score += 1.2 * ellipse.get("boundary_polarity", 0.0)
-        score += 0.5 * ellipse.get("supported_fraction", 1.0)
-        score -= 3.0 * ellipse.get("relative_error", 1.0)
+    Automatic initialization is deliberately cheap.  It downsizes the image,
+    derives warm/bright solar evidence plus local grayscale/Otsu hints, and uses
+    the lowest credible adaptive hint as a conservative starting threshold.
 
-    # Color-aware location is used only during initialization.  It prevents a
-    # large skyline/background edge from winning simply because it fits an ellipse
-    # somewhere far from the warm bright Sun.
-    if solar_hint is not None and solar_hint.get("center") is not None:
-        light = next(
-            (e for e in ellipses if e.get("class") == "above threshold"),
-            None,
-        )
-        if light is not None:
-            radius = max(float(expected_radius or light["equivalent_radius"]), 1.0)
-            distance = math.hypot(
-                light["center"][0] - solar_hint["center"][0],
-                light["center"][1] - solar_hint["center"][1],
-            ) / radius
-            score += max(-10.0, 5.0 - 6.0 * distance)
-        else:
-            score -= 1.5
-
-    if horizon is not None:
-        score += 0.4 * min(1.0, horizon.get("score", 0.0))
-    return score
-
-def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radius,
-                          max_error, min_coverage, max_contours, max_points,
-                          palette_size=20):
-    """Choose a fast, robust per-image starting threshold.
-
-    Use the lowest credible adaptive brightness/color hint first.  That
-    conservative value handles the normal partial-eclipse, totality and full-Sun
-    cases cheaply.  Extra work is reserved for difficult frames: non-dominant
-    dark-only, weak single-ellipse, or no-ellipse results.
-
-    Difficult frames verify the narrow neighborhood around the legacy fallback
-    (normally T=6..10 around T=8) at normal preview resolution.  Late-sunset
-    frames can change result after a one-level threshold move, so this
-    neighborhood is intentionally contiguous.  Only if it fails are the
-    strongest remaining adaptive hints preview-verified.
+    This function performs no contour search, ellipse fitting, arc recovery,
+    horizon detection, morphology, or multi-threshold detector scoring.  The
+    normal Refresh Preview pass is the first real detector run; the threshold is
+    then explicitly stored per image and remains available for manual fine tuning.
     """
-    working, auto_scale = resize_for_detection(
-        color_image,
-        AUTO_THRESHOLD_MAX_DIM,
-    )
-    solar_hint = adaptive_solar_hint(working)
+    fallback = int(np.clip(fallback_threshold, 0, 255))
+    if color_image is None or color_image.size == 0:
+        return fallback
 
+    working, _ = resize_for_detection(color_image, AUTO_THRESHOLD_MAX_DIM)
+    solar_hint = adaptive_solar_hint(working)
     hints = sorted({
         int(np.clip(value, 0, 255))
         for value in solar_hint.get("threshold_hints", [])
         if 0 < int(value) < 255
     })
-    primary = int(min(hints)) if hints else int(fallback_threshold)
 
-    auto_min = max(1.0, min_radius * auto_scale)
-    auto_max = max(auto_min, max_radius * auto_scale)
-    auto_expected_radius = 0.5 * (auto_min + auto_max)
-    test_contours = min(max_contours, 12) if max_contours > 0 else 12
-    test_points = min(max_points, 120) if max_points > 0 else 120
-
-    def run_detection(image, threshold, scale, hint, contours, points):
-        work_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        scaled_min = max(1.0, min_radius * scale)
-        scaled_max = max(scaled_min, max_radius * scale)
-        try:
-            _, ellipses, horizon = detect(
-                work_gray,
-                int(threshold),
-                scaled_min,
-                scaled_max,
-                max_error,
-                min_coverage,
-                contours,
-                points,
-                morphology=False,
-                outer_limb_assistance=False,
-                color_image=image,
-            )
-        except (cv2.error, np.linalg.LinAlgError, ValueError):
-            return [], None, -1e18
-
-        expected_radius = 0.5 * (scaled_min + scaled_max)
-        score = score_detection_for_threshold(
-            ellipses,
-            horizon,
-            solar_hint=hint,
-            expected_radius=expected_radius,
-        )
-        score -= 0.0005 * abs(
-            int(threshold) - int(fallback_threshold)
-        )
-        return ellipses, horizon, score
-
-    def light_near_hint(ellipses, hint, expected_radius):
-        center = hint.get("center") if hint is not None else None
-        if center is None:
-            return True
-        light = next(
-            (
-                ellipse
-                for ellipse in ellipses
-                if ellipse.get("class") == "above threshold"
-            ),
-            None,
-        )
-        if light is None:
-            return False
-        return (
-            math.hypot(
-                light["center"][0] - center[0],
-                light["center"][1] - center[1],
-            )
-            <= 1.2 * max(expected_radius, 1.0)
-        )
-
-    def result_kind(ellipses, expected_radius, hint):
-        dark = next(
-            (
-                ellipse
-                for ellipse in ellipses
-                if ellipse.get("class") == "below threshold"
-            ),
-            None,
-        )
-        light = next(
-            (
-                ellipse
-                for ellipse in ellipses
-                if ellipse.get("class") == "above threshold"
-            ),
-            None,
-        )
-        if dark is not None and light is not None:
-            return (
-                "both"
-                if light_near_hint(ellipses, hint, expected_radius)
-                else "weak"
-            )
-        if dark is not None:
-            return (
-                "dominant_dark"
-                if dark.get("coverage", 0.0) >= DARK_DOMINANT_COVERAGE
-                else "weak"
-            )
-        if light is not None:
-            if (
-                light.get("coverage", 0.0) >= max(0.20, min_coverage)
-                and light_near_hint(ellipses, hint, expected_radius)
-            ):
-                return "light"
-            return "weak"
-        return "none"
-
-    primary_ellipses, _, primary_score = run_detection(
-        working,
-        primary,
-        auto_scale,
-        solar_hint,
-        test_contours,
-        test_points,
-    )
-    primary_kind = result_kind(
-        primary_ellipses,
-        auto_expected_radius,
-        solar_hint,
-    )
-    if primary_kind in ("both", "dominant_dark", "light"):
-        return int(primary)
-
-    # Difficult-case verification uses the same working resolution as Refresh
-    # Preview.  This prevents the automatic choice from depending on a 600-pixel
-    # proxy when the useful threshold window is only one or two grayscale levels.
-    preview_image, preview_scale = resize_for_detection(
-        color_image,
-        PREVIEW_MAX_DIM,
-    )
-    preview_hint = adaptive_solar_hint(preview_image)
-    preview_min = max(1.0, min_radius * preview_scale)
-    preview_max = max(preview_min, max_radius * preview_scale)
-    preview_expected_radius = 0.5 * (preview_min + preview_max)
-
-    fallback = int(np.clip(fallback_threshold, 0, 255))
-    low_order = []
-    for value in (
-        fallback - 1,
-        fallback,
-        fallback - 2,
-        fallback + 1,
-        fallback + 2,
-    ):
-        value = int(np.clip(value, 0, 255))
-        if value not in low_order:
-            low_order.append(value)
-
-    best_threshold = int(primary)
-    best_score = float(primary_score)
-
-    # Normal search caps are intentional here.  Reduced contour/point caps were
-    # observed to miss legitimate T=6/T=7 sunset limbs.
-    for threshold in low_order:
-        ellipses, _, score = run_detection(
-            preview_image,
-            threshold,
-            preview_scale,
-            preview_hint,
-            max_contours,
-            max_points,
-        )
-        kind = result_kind(
-            ellipses,
-            preview_expected_radius,
-            preview_hint,
-        )
-        if score > best_score:
-            best_threshold = int(threshold)
-            best_score = score
-        if kind == "both":
-            return int(threshold)
-
-    adaptive_pool = set(hints)
-    for hint in list(hints):
-        adaptive_pool.update(
-            value
-            for value in (hint - 1, hint + 1)
-            if 0 <= value <= 255
-        )
-    adaptive_pool.difference_update(low_order)
-    adaptive_pool.discard(primary)
-
-    ranked = []
-    for threshold in sorted(adaptive_pool):
-        _, _, score = run_detection(
-            working,
-            threshold,
-            auto_scale,
-            solar_hint,
-            test_contours,
-            test_points,
-        )
-        ranked.append((score, int(threshold)))
-    ranked.sort(reverse=True)
-
-    for _, threshold in ranked[:2]:
-        ellipses, _, score = run_detection(
-            preview_image,
-            threshold,
-            preview_scale,
-            preview_hint,
-            max_contours,
-            max_points,
-        )
-        kind = result_kind(
-            ellipses,
-            preview_expected_radius,
-            preview_hint,
-        )
-        if score > best_score:
-            best_threshold = int(threshold)
-            best_score = score
-        if kind == "both":
-            return int(threshold)
-
-    return int(best_threshold)
+    # The lowest credible adaptive hint is intentionally conservative.  It is an
+    # orientation only, not an attempt to optimize detection automatically.
+    return int(hints[0]) if hints else fallback
 
 
 # ---------------------------------------------------------------------------
@@ -2398,18 +2145,11 @@ class DetectorApp:
             return
 
         defaults = self.effective_default_settings()
-        self.status.set("Analyzing image to choose an initial threshold...")
+        self.status.set("Estimating a quick initial threshold...")
         self.root.update_idletasks()
         threshold = auto_select_threshold(
             self.color_image,
             defaults["threshold"],
-            defaults["min_radius"],
-            defaults["max_radius"],
-            defaults["max_error"],
-            defaults["min_coverage"],
-            self.args.max_contours,
-            self.args.max_search_points,
-            palette_size=self.args.palette_size,
         )
         self.image_overrides[self.current_path] = {"threshold": int(threshold)}
 
@@ -2876,8 +2616,7 @@ def build_parser():
         nargs="*",
         help="Optional ordered input image list; more images can be loaded in the GUI",
     )
-    # This remains the emergency fallback used only when automatic threshold
-    # selection cannot find a stronger initial candidate.
+    # This remains the fallback if the quick adaptive threshold hint is unavailable.
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument("--min-radius", type=float, default=1000.0)
     parser.add_argument("--max-radius", type=float, default=1500.0)
