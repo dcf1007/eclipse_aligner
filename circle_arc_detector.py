@@ -1,3 +1,31 @@
+"""Interactive eclipse limb detector based on thresholded ellipse arcs.
+
+The script is intentionally self-contained.  It performs three jobs:
+
+1. Convert the input image to grayscale and threshold it into two complementary
+   masks:
+      * dark mask  -> grayscale <= threshold
+      * light mask -> grayscale > threshold
+   Equality therefore belongs to the dark class by design.
+
+2. Search contour fragments in each mask for a plausible rotated ellipse.  The
+   search is deliberately tolerant of short and partially obscured eclipse
+   limbs.  It tries several OpenCV ellipse fits plus a circle-shaped stabilizing
+   prior, checks local boundary polarity, refines promising contour windows,
+   and then attempts to grow each accepted arc along the predicted ellipse.
+
+3. Present the result in a single Tkinter window.  The threshold preview shows
+   the detected support arc in magenta, the dark ellipse in blue, and the light
+   ellipse in golden yellow.  The second preview remains plain grayscale.
+
+Detection is limited to at most two ellipses: one dark-class ellipse and one
+light-class ellipse.  All final fitted semi-axes must independently stay inside
+user-selected minimum/maximum radius limits.
+
+Dependencies:
+    pip install opencv-python numpy
+"""
+
 import argparse
 import base64
 import math
@@ -7,30 +35,97 @@ import tkinter as tk
 import cv2
 import numpy as np
 
+
+# ---------------------------------------------------------------------------
+# Detection tuning constants
+# ---------------------------------------------------------------------------
+# Fraction of sampled boundary points that must show the expected transition
+# from inside the selected mask to outside it.  This rejects unrelated contour
+# fragments even when their geometry happens to resemble an ellipse.
 MIN_BOUNDARY_POLARITY = 0.42
+
+# Only the strongest candidates are worth the comparatively expensive arc-
+# growth stage.  Keeping the cap also bounds UI recomputation time.
 MAX_CLASS_CANDIDATES = 30
+
+# Each source contour may contribute several geometrically distinct ellipse
+# hypotheses, but not an unbounded number of near-duplicates.
 MAX_REGIONS_PER_CONTOUR = 4
+
+# Arc growth searches along each ellipse normal within +/- 15% of the smaller
+# semi-axis.  There is intentionally NO pixel cap; for a 1200 px semi-axis this
+# is an approximately +/-180 px search envelope.
 EDGE_SEARCH_FRACTION = 0.15
+
+# Number of parametric samples around a full ellipse during arc growth.
+# 720 samples corresponds to 0.5 degree angular spacing.
 ARC_GROW_SAMPLES = 720
+
+# A dark candidate covering most of the circumference is treated as the
+# totality/near-totality case.  In that situation bright corona structure can
+# easily create a spurious second ellipse, so the dark ellipse is returned by
+# itself.
 DARK_DOMINANT_COVERAGE = 0.55
 
+# Refinement changes the cyclic contour window by one point at a time.  These
+# moves expand either end, shrink either end, or slide the window while keeping
+# its length unchanged.
+REFINE_MOVES = (
+    (-1, 1),
+    (0, 1),
+    (1, -1),
+    (0, -1),
+    (-1, 0),
+    (1, 0),
+)
 
+# Preview colors use OpenCV BGR order.
+ARC_COLOR = (255, 0, 255)          # magenta
+DARK_ELLIPSE_COLOR = (255, 0, 0)  # blue
+LIGHT_ELLIPSE_COLOR = (0, 190, 255)  # golden/orange yellow
+ELLIPSE_LINE_THICKNESS = 3
+ARC_LINE_THICKNESS = 2
+
+
+# ---------------------------------------------------------------------------
+# Ellipse fitting and geometry helpers
+# ---------------------------------------------------------------------------
 def normalize_ellipse(raw):
+    """Convert an OpenCV ellipse tuple to the detector's canonical format.
+
+    OpenCV returns ``((cx, cy), (width, height), angle)``.  The detector stores
+    semi-axis lengths instead of full diameters and always names the larger
+    semi-axis ``major``.  When the OpenCV width/height order has to be swapped,
+    the orientation is rotated by 90 degrees so the geometry remains identical.
+
+    ``equivalent_radius = sqrt(major * minor)`` is not an acceptance radius; it
+    is only a convenient scale for duplicate and compatibility comparisons.
+    """
     try:
         (cx, cy), (width, height), angle = raw
-    except Exception:
+    except (TypeError, ValueError):
         return None
-    if not np.all(np.isfinite((cx, cy, width, height, angle))) or width <= 0 or height <= 0:
+
+    values = (cx, cy, width, height, angle)
+    if not np.all(np.isfinite(values)) or width <= 0 or height <= 0:
         return None
-    semi_x, semi_y = width * 0.5, height * 0.5
+
+    semi_x = width * 0.5
+    semi_y = height * 0.5
     if semi_x >= semi_y:
-        major, minor, major_angle = semi_x, semi_y, angle
+        major = semi_x
+        minor = semi_y
+        major_angle = angle
     else:
-        major, minor, major_angle = semi_y, semi_x, angle + 90.0
+        major = semi_y
+        minor = semi_x
+        major_angle = angle + 90.0
+
     major_angle %= 180.0
     equivalent_radius = math.sqrt(major * minor)
     if equivalent_radius <= 0 or not np.isfinite(equivalent_radius):
         return None
+
     return {
         "center": (float(cx), float(cy)),
         "major": float(major),
@@ -40,25 +135,53 @@ def normalize_ellipse(raw):
     }
 
 
+def axes_in_range(ellipse, min_radius, max_radius):
+    """Return True only when BOTH fitted semi-axes satisfy the user limits."""
+    return (
+        min_radius <= ellipse["major"] <= max_radius
+        and min_radius <= ellipse["minor"] <= max_radius
+    )
+
+
 def fit_circle_prior(points):
+    """Fit a circle and expose it as a zero-eccentricity ellipse candidate.
+
+    Short arcs do not constrain all five parameters of a general ellipse very
+    strongly.  A circle fit is therefore useful as a stabilizing hypothesis.  It
+    does not force the final result to be circular: the same arc is also tested
+    with the three general OpenCV ellipse fitters below.
+    """
     points = np.asarray(points, np.float64)
     if len(points) < 3:
         return None
-    x, y = points[:, 0], points[:, 1]
-    xm, ym = float(x.mean()), float(y.mean())
-    u, v = x - xm, y - ym
-    z = u * u + v * v
-    suu, svv, suv = np.dot(u, u), np.dot(v, v), np.dot(u, v)
-    suz, svz = np.dot(u, z), np.dot(v, z)
-    det = suu * svv - suv * suv
-    if abs(det) <= 1e-12 * (suu * svv + 1.0):
+
+    x = points[:, 0]
+    y = points[:, 1]
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    u = x - x_mean
+    v = y - y_mean
+    squared_distance = u * u + v * v
+
+    suu = np.dot(u, u)
+    svv = np.dot(v, v)
+    suv = np.dot(u, v)
+    suz = np.dot(u, squared_distance)
+    svz = np.dot(v, squared_distance)
+
+    determinant = suu * svv - suv * suv
+    if abs(determinant) <= 1e-12 * (suu * svv + 1.0):
         return None
-    uc = 0.5 * (suz * svv - svz * suv) / det
-    vc = 0.5 * (svz * suu - suz * suv) / det
-    cx, cy = xm + uc, ym + vc
-    radius_sq = float(z.mean()) + uc * uc + vc * vc
+
+    u_center = 0.5 * (suz * svv - svz * suv) / determinant
+    v_center = 0.5 * (svz * suu - suz * suv) / determinant
+    cx = x_mean + u_center
+    cy = y_mean + v_center
+
+    radius_sq = float(squared_distance.mean()) + u_center * u_center + v_center * v_center
     if radius_sq <= 0 or not np.isfinite(radius_sq):
         return None
+
     radius = math.sqrt(radius_sq)
     return {
         "center": (float(cx), float(cy)),
@@ -66,115 +189,203 @@ def fit_circle_prior(points):
         "minor": radius,
         "angle": 0.0,
         "equivalent_radius": radius,
-        "fit_kind": "circle-prior",
     }
 
 
 def fit_ellipse_options(points):
+    """Generate several ellipse hypotheses for the same arc points.
+
+    OpenCV exposes multiple fitting algorithms with different numerical
+    behavior on short/noisy arcs.  Trying Direct, AMS, and the standard method,
+    then adding a circle prior, is more robust than relying on one fitter alone.
+    Invalid fits are quietly discarded.
+    """
     points = np.asarray(points, np.float32)
     if len(points) < 5:
         return []
+
     shaped = points.reshape(-1, 1, 2)
     options = []
-    for name, fitter in (
-        ("direct", cv2.fitEllipseDirect),
-        ("ams", cv2.fitEllipseAMS),
-        ("standard", cv2.fitEllipse),
-    ):
+    for fitter in (cv2.fitEllipseDirect, cv2.fitEllipseAMS, cv2.fitEllipse):
         try:
             ellipse = normalize_ellipse(fitter(shaped))
         except cv2.error:
             ellipse = None
         if ellipse is not None:
-            ellipse["fit_kind"] = name
             options.append(ellipse)
+
     circle = fit_circle_prior(points)
     if circle is not None:
         options.append(circle)
+
     return options
 
 
 def ellipse_coordinates(points, ellipse):
+    """Transform image points into normalized coordinates of an ellipse.
+
+    On an exact ellipse the transformed points satisfy ``x^2 + y^2 == 1``.
+    These normalized coordinates are used for both residual measurement and
+    parametric arc-angle measurement.
+    """
     points = np.asarray(points, np.float64)
     cx, cy = ellipse["center"]
     angle = math.radians(ellipse["angle"])
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
-    dx, dy = points[:, 0] - cx, points[:, 1] - cy
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    dx = points[:, 0] - cx
+    dy = points[:, 1] - cy
     local_x = cos_a * dx + sin_a * dy
     local_y = -sin_a * dx + cos_a * dy
+
     return local_x / ellipse["major"], local_y / ellipse["minor"]
 
 
 def ellipse_error_and_coverage(points, ellipse):
+    """Measure normalized fit residual and represented arc fraction.
+
+    Residual:
+        For normalized point radius ``rho = hypot(x, y)``, an exact ellipse has
+        rho == 1.  The returned error is ``mean(abs(rho - 1))``.
+
+    Coverage:
+        Points are converted to ellipse parametric angles.  Their unwrapped
+        angular span is divided by 2*pi, giving the visible fraction of the full
+        fitted ellipse.
+    """
     if len(points) < 2:
         return math.inf, 0.0
+
     x_norm, y_norm = ellipse_coordinates(points, ellipse)
     relative_error = float(np.mean(np.abs(np.hypot(x_norm, y_norm) - 1.0)))
+
     angles = np.unwrap(np.arctan2(y_norm, x_norm))
     coverage = float(np.clip(np.ptp(angles) / (2.0 * np.pi), 0.0, 1.0))
     return relative_error, coverage
 
 
 def boundary_polarity(mask, ellipse):
+    """Check that fitted arc points cross from mask-inside to mask-outside.
+
+    Whole-ellipse interior brightness is not a reliable classifier during an
+    eclipse: the Moon can make most of the Sun's projected disk dark.  Instead,
+    classification is based locally at the fitted boundary.
+
+    For every support point we sample slightly inward and outward along the
+    ellipse's normalized radial direction.  A correct boundary for the supplied
+    binary mask should be True just inside and False just outside.
+
+    Returns ``(polarity_fraction, inside_fraction, valid_sample_count)``.
+    """
     points = np.asarray(ellipse["points"], np.float64)
     if len(points) < 5:
-        return 0.0, 0.0, 0.0, 0
+        return 0.0, 0.0, 0
+
     x_norm, y_norm = ellipse_coordinates(points, ellipse)
     theta = np.arctan2(y_norm, x_norm)
+
+    # Sample about 0.8% of the ellipse scale away from the boundary, with a
+    # three-pixel floor so very small test images still get separated samples.
     radius = ellipse["equivalent_radius"]
     sample_distance = max(3.0, radius * 0.008)
-    delta = sample_distance / max(radius, 1.0)
+    scale_delta = sample_distance / max(radius, 1.0)
+
     angle = math.radians(ellipse["angle"])
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
     cx, cy = ellipse["center"]
 
-    def sample(scale):
+    def sample_at_scale(scale):
         local_x = ellipse["major"] * scale * np.cos(theta)
         local_y = ellipse["minor"] * scale * np.sin(theta)
         x = np.rint(cx + cos_a * local_x - sin_a * local_y).astype(np.int32)
         y = np.rint(cy + sin_a * local_x + cos_a * local_y).astype(np.int32)
         return x, y
 
-    xi, yi = sample(1.0 - delta)
-    xo, yo = sample(1.0 + delta)
+    inside_x, inside_y = sample_at_scale(1.0 - scale_delta)
+    outside_x, outside_y = sample_at_scale(1.0 + scale_delta)
+
     height, width = mask.shape
     valid = (
-        (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-        & (xo >= 0) & (xo < width) & (yo >= 0) & (yo < height)
+        (inside_x >= 0)
+        & (inside_x < width)
+        & (inside_y >= 0)
+        & (inside_y < height)
+        & (outside_x >= 0)
+        & (outside_x < width)
+        & (outside_y >= 0)
+        & (outside_y < height)
     )
-    if not np.any(valid):
-        return 0.0, 0.0, 0.0, 0
-    inside = mask[yi[valid], xi[valid]] != 0
-    outside = mask[yo[valid], xo[valid]] != 0
-    polarity = float(np.mean(inside & ~outside))
-    return polarity, float(np.mean(inside)), float(np.mean(outside)), int(np.count_nonzero(valid))
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count == 0:
+        return 0.0, 0.0, 0
+
+    inside_values = mask[inside_y[valid], inside_x[valid]] != 0
+    outside_values = mask[outside_y[valid], outside_x[valid]] != 0
+
+    polarity = float(np.mean(inside_values & ~outside_values))
+    inside_fraction = float(np.mean(inside_values))
+    return polarity, inside_fraction, valid_count
 
 
-def window_lengths(n, minimum):
-    minimum = max(5, min(minimum, n))
-    lengths = {minimum, n}
+# ---------------------------------------------------------------------------
+# Contour-window search and refinement
+# ---------------------------------------------------------------------------
+def window_lengths(point_count, minimum):
+    """Return coarse contour-window lengths from ``minimum`` to full contour.
+
+    Geometric growth (x1.45) examines short, medium, and long arcs without
+    testing every possible length during the expensive coarse search.
+    """
+    minimum = max(5, min(minimum, point_count))
+    lengths = {minimum, point_count}
+
     length = minimum
-    while length < n:
+    while length < point_count:
         lengths.add(length)
-        length = min(n, max(length + 1, int(round(length * 1.45))))
+        length = min(
+            point_count,
+            max(length + 1, int(round(length * 1.45))),
+        )
+
     return sorted(lengths)
 
 
-def eval_region(extended, n, start, length, mask, min_radius, max_radius, max_error, min_coverage):
-    if length < 5 or length > n:
+def evaluate_region(
+    extended_points,
+    point_count,
+    start,
+    length,
+    mask,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+):
+    """Fit and score one cyclic contour window; return its best hypothesis.
+
+    ``extended_points`` contains the contour twice, allowing a slice to pass
+    through the original array boundary without special wraparound code.
+    """
+    if length < 5 or length > point_count:
         return None
-    start %= n
-    region = extended[start : start + length]
+
+    start %= point_count
+    region = extended_points[start : start + length]
     best = None
+
     for ellipse in fit_ellipse_options(region):
-        if not (
-            min_radius <= ellipse["major"] <= max_radius
-            and min_radius <= ellipse["minor"] <= max_radius
-        ):
+        # The user requires BOTH final semi-axes to satisfy the selected range.
+        # The current search also enforces that same range for its hypotheses so
+        # behavior remains identical to the established detector.
+        if not axes_in_range(ellipse, min_radius, max_radius):
             continue
+
         relative_error, coverage = ellipse_error_and_coverage(region, ellipse)
         if relative_error > max_error or coverage < min_coverage:
             continue
+
         candidate = {
             **ellipse,
             "relative_error": relative_error,
@@ -183,65 +394,108 @@ def eval_region(extended, n, start, length, mask, min_radius, max_radius, max_er
             "start": start,
             "length": length,
         }
-        polarity, inside, outside, samples = boundary_polarity(mask, candidate)
-        if samples < 5 or polarity < MIN_BOUNDARY_POLARITY or inside < 0.5:
+
+        polarity, inside_fraction, sample_count = boundary_polarity(mask, candidate)
+        if (
+            sample_count < 5
+            or polarity < MIN_BOUNDARY_POLARITY
+            or inside_fraction < 0.5
+        ):
             continue
-        support = length / n
+
+        # Geometry score rewards longer meaningful arcs and more contour support,
+        # while penalizing residual error and extreme ellipse aspect ratios.
+        contour_support = length / point_count
         axis_ratio = candidate["major"] / max(candidate["minor"], 1.0)
         shape_penalty = 1.0 + 0.06 * max(0.0, axis_ratio - 1.0)
         geometry_score = (
             coverage**1.5
             * math.sqrt(length)
-            * (0.75 + 0.25 * math.sqrt(support))
+            * (0.75 + 0.25 * math.sqrt(contour_support))
             / ((relative_error + 0.002) * shape_penalty)
         )
-        candidate.update(
-            {
-                "boundary_polarity": polarity,
-                "interior_fraction": inside,
-                "outside_fraction": outside,
-                "score": geometry_score * polarity**2,
-            }
-        )
+
+        candidate["boundary_polarity"] = polarity
+        candidate["interior_fraction"] = inside_fraction
+        candidate["score"] = geometry_score * polarity**2
+
         if best is None or candidate["score"] > best["score"]:
             best = candidate
+
     return best
 
 
 def angle_difference_180(a, b):
+    """Smallest orientation difference for ellipses, modulo 180 degrees."""
     difference = abs((a - b) % 180.0)
     return min(difference, 180.0 - difference)
 
 
-def same_ellipse(a, b, center_fraction=0.12, axis_fraction=0.12, angle_tolerance=15.0):
-    ax, ay = a["center"]
-    bx, by = b["center"]
-    scale = max(a["equivalent_radius"], b["equivalent_radius"], 1.0)
-    if math.hypot(ax - bx, ay - by) >= center_fraction * scale:
+def same_ellipse(
+    first,
+    second,
+    center_fraction=0.12,
+    axis_fraction=0.12,
+    angle_tolerance=15.0,
+):
+    """Return True when two candidates represent the same physical ellipse.
+
+    Tolerances scale with ellipse size.  Orientation is ignored for nearly
+    circular fits because a circle's major-axis angle is numerically arbitrary.
+    """
+    first_x, first_y = first["center"]
+    second_x, second_y = second["center"]
+    scale = max(
+        first["equivalent_radius"],
+        second["equivalent_radius"],
+        1.0,
+    )
+
+    if math.hypot(first_x - second_x, first_y - second_y) >= center_fraction * scale:
         return False
-    if abs(a["major"] - b["major"]) >= axis_fraction * scale:
+    if abs(first["major"] - second["major"]) >= axis_fraction * scale:
         return False
-    if abs(a["minor"] - b["minor"]) >= axis_fraction * scale:
+    if abs(first["minor"] - second["minor"]) >= axis_fraction * scale:
         return False
-    a_eccentricity = (a["major"] - a["minor"]) / max(a["major"], 1.0)
-    b_eccentricity = (b["major"] - b["minor"]) / max(b["major"], 1.0)
-    if max(a_eccentricity, b_eccentricity) < 0.05:
+
+    first_eccentricity = (
+        (first["major"] - first["minor"]) / max(first["major"], 1.0)
+    )
+    second_eccentricity = (
+        (second["major"] - second["minor"]) / max(second["major"], 1.0)
+    )
+    if max(first_eccentricity, second_eccentricity) < 0.05:
         return True
-    return angle_difference_180(a["angle"], b["angle"]) < angle_tolerance
+
+    return angle_difference_180(first["angle"], second["angle"]) < angle_tolerance
 
 
-def refine(candidate, extended, n, minimum, mask, min_radius, max_radius, max_error, min_coverage):
+def refine_region(
+    candidate,
+    extended_points,
+    point_count,
+    minimum_length,
+    mask,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+):
+    """Hill-climb around a coarse contour window to improve its score."""
     best = candidate
+
     for _ in range(40):
         improved = False
-        for ds, dl in ((-1, 1), (0, 1), (1, -1), (0, -1), (-1, 0), (1, 0)):
-            new_length = best["length"] + dl
-            if not minimum <= new_length <= n:
+
+        for start_delta, length_delta in REFINE_MOVES:
+            new_length = best["length"] + length_delta
+            if not minimum_length <= new_length <= point_count:
                 continue
-            trial = eval_region(
-                extended,
-                n,
-                best["start"] + ds,
+
+            trial = evaluate_region(
+                extended_points,
+                point_count,
+                best["start"] + start_delta,
                 new_length,
                 mask,
                 min_radius,
@@ -250,88 +504,187 @@ def refine(candidate, extended, n, minimum, mask, min_radius, max_radius, max_er
                 min_coverage,
             )
             if trial is not None and trial["score"] > best["score"] * (1.0 + 1e-9):
-                best, improved = trial, True
+                best = trial
+                improved = True
+
         if not improved:
             break
+
     return best
 
 
-def find_regions(points, mask, min_radius, max_radius, max_error, min_coverage, minimum=12):
+def find_regions(
+    points,
+    mask,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+    minimum=12,
+):
+    """Find a few distinct ellipse hypotheses within one ordered contour."""
     points = np.asarray(points, np.float64)
-    n = len(points)
-    if n < max(5, minimum):
+    point_count = len(points)
+    if point_count < max(5, minimum):
         return []
-    minimum = min(minimum, n)
-    extended = np.vstack((points, points))
+
+    minimum = min(minimum, point_count)
+    extended_points = np.vstack((points, points))
+
+    # Coarse phase: sample many cyclic windows at geometrically spaced lengths.
     coarse = []
-    for length in window_lengths(n, minimum):
+    for length in window_lengths(point_count, minimum):
         step = max(1, length // 5)
-        for start in range(0, n, step):
-            candidate = eval_region(
-                extended, n, start, length, mask,
-                min_radius, max_radius, max_error, min_coverage,
+        for start in range(0, point_count, step):
+            candidate = evaluate_region(
+                extended_points,
+                point_count,
+                start,
+                length,
+                mask,
+                min_radius,
+                max_radius,
+                max_error,
+                min_coverage,
             )
             if candidate is not None:
                 coarse.append(candidate)
+
     coarse.sort(key=lambda item: item["score"], reverse=True)
+
+    # Keep only strong, geometrically different seeds before local refinement.
     seeds = []
+    seed_limit = max(10, MAX_REGIONS_PER_CONTOUR * 5)
     for candidate in coarse:
         if any(same_ellipse(candidate, existing, 0.10, 0.10) for existing in seeds):
             continue
         seeds.append(candidate)
-        if len(seeds) >= max(10, MAX_REGIONS_PER_CONTOUR * 5):
+        if len(seeds) >= seed_limit:
             break
-    result = []
+
+    # Refine each seed and de-duplicate once more at the tighter final stage.
+    refined = []
     for seed in seeds:
-        candidate = refine(
-            seed, extended, n, minimum, mask,
-            min_radius, max_radius, max_error, min_coverage,
+        candidate = refine_region(
+            seed,
+            extended_points,
+            point_count,
+            minimum,
+            mask,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
         )
-        if not any(same_ellipse(candidate, existing) for existing in result):
-            result.append(candidate)
-    result.sort(key=lambda item: item["score"], reverse=True)
-    return result[:MAX_REGIONS_PER_CONTOUR]
+        if not any(same_ellipse(candidate, existing) for existing in refined):
+            refined.append(candidate)
+
+    refined.sort(key=lambda item: item["score"], reverse=True)
+    return refined[:MAX_REGIONS_PER_CONTOUR]
 
 
-def find_candidates(mask, min_radius, max_radius, max_error, min_coverage, max_contours, max_points):
-    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    minimum = 12
+def find_candidates(
+    mask,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+    max_contours,
+    max_points,
+):
+    """Extract contours from one mask and collect all ellipse hypotheses."""
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    minimum_points = 12
+
+    # Very short contours cannot represent the requested minimum visible arc.
+    # This perimeter gate is intentionally loose because the visible arc may be
+    # distorted and because ellipse perimeter is not simply 2*pi*radius.
     min_perimeter = max(12.0, min_radius * min_coverage * math.pi)
-    usable = [(cv2.arcLength(contour, True), contour) for contour in contours if len(contour) >= minimum]
-    usable = [(perimeter, contour) for perimeter, contour in usable if perimeter >= min_perimeter]
+
+    usable = []
+    for contour in contours:
+        if len(contour) < minimum_points:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter >= min_perimeter:
+            usable.append((perimeter, contour))
+
+    # Search longer contours first; they are more likely to contain meaningful
+    # limb geometry.  max_contours == 0 intentionally means "no cap".
     usable.sort(key=lambda item: item[0], reverse=True)
     if max_contours > 0:
         usable = usable[:max_contours]
+
     candidates = []
     for _, contour in usable:
         points = contour.reshape(-1, 2).astype(np.float64, copy=False)
+
+        # Downsample only the search representation, not the source image.  This
+        # keeps long high-resolution contours computationally manageable.
         if max_points > 0 and len(points) > max_points:
-            indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
+            indices = np.linspace(
+                0,
+                len(points) - 1,
+                max_points,
+                dtype=np.int32,
+            )
             points = points[indices]
+
         candidates.extend(
-            find_regions(points, mask, min_radius, max_radius, max_error, min_coverage, minimum)
+            find_regions(
+                points,
+                mask,
+                min_radius,
+                max_radius,
+                max_error,
+                min_coverage,
+                minimum_points,
+            )
         )
+
     candidates.sort(key=lambda item: item["score"], reverse=True)
     return candidates
 
 
-def ellipse_inside(xx, yy, ellipse):
+# ---------------------------------------------------------------------------
+# Ellipse interior checks used when selecting dark/light classes
+# ---------------------------------------------------------------------------
+def ellipse_inside(x_coordinates, y_coordinates, ellipse):
+    """Vectorized point-in-rotated-ellipse test."""
     cx, cy = ellipse["center"]
     angle = math.radians(ellipse["angle"])
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
-    dx, dy = xx - cx, yy - cy
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    dx = x_coordinates - cx
+    dy = y_coordinates - cy
     local_x = cos_a * dx + sin_a * dy
     local_y = -sin_a * dx + cos_a * dy
-    return (local_x / ellipse["major"]) ** 2 + (local_y / ellipse["minor"]) ** 2 <= 1.0
+
+    return (
+        (local_x / ellipse["major"]) ** 2
+        + (local_y / ellipse["minor"]) ** 2
+        <= 1.0
+    )
 
 
 def ellipse_bounds(ellipse, width, height):
+    """Return the clipped image-space bounding box of a rotated ellipse."""
     cx, cy = ellipse["center"]
-    major, minor = ellipse["major"], ellipse["minor"]
+    major = ellipse["major"]
+    minor = ellipse["minor"]
     angle = math.radians(ellipse["angle"])
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
     extent_x = math.sqrt((major * cos_a) ** 2 + (minor * sin_a) ** 2)
     extent_y = math.sqrt((major * sin_a) ** 2 + (minor * cos_a) ** 2)
+
     return (
         max(0, int(math.floor(cx - extent_x))),
         max(0, int(math.floor(cy - extent_y))),
@@ -341,76 +694,132 @@ def ellipse_bounds(ellipse, width, height):
 
 
 def visible_fraction(mask, candidate, exclude=None):
+    """Measure mask occupancy inside a candidate, optionally excluding another.
+
+    This is only used to reject an implausible light ellipse after a dark ellipse
+    has already been selected.  Pixels geometrically owned by the dark ellipse
+    are removed before evaluating how much of the remaining light candidate is
+    actually bright.
+    """
     height, width = mask.shape
     x0, y0, x1, y1 = ellipse_bounds(candidate, width, height)
     if x0 >= x1 or y0 >= y1:
         return 0.0, 0
+
     yy, xx = np.ogrid[y0:y1, x0:x1]
     valid = ellipse_inside(xx, yy, candidate)
     if exclude is not None:
         valid &= ~ellipse_inside(xx, yy, exclude)
-    visible = int(np.count_nonzero(valid))
-    if not visible:
+
+    visible_pixels = int(np.count_nonzero(valid))
+    if visible_pixels == 0:
         return 0.0, 0
-    matching = int(np.count_nonzero(mask[y0:y1, x0:x1][valid]))
-    return matching / visible, visible
+
+    matching_pixels = int(np.count_nonzero(mask[y0:y1, x0:x1][valid]))
+    return matching_pixels / visible_pixels, visible_pixels
 
 
+# ---------------------------------------------------------------------------
+# Arc-growth stage
+# ---------------------------------------------------------------------------
 def ellipse_points_and_normals(ellipse, theta):
+    """Return ellipse points and unit outward normals for parametric angles."""
     cx, cy = ellipse["center"]
     angle = math.radians(ellipse["angle"])
-    cos_a, sin_a = math.cos(angle), math.sin(angle)
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
     local_x = ellipse["major"] * cos_t
     local_y = ellipse["minor"] * sin_t
     x = cx + cos_a * local_x - sin_a * local_y
     y = cy + sin_a * local_x + cos_a * local_y
+
+    # Gradient of x^2/a^2 + y^2/b^2 = 1 gives the local ellipse normal.
     normal_x_local = cos_t / max(ellipse["major"], 1e-9)
     normal_y_local = sin_t / max(ellipse["minor"], 1e-9)
     normal_x = cos_a * normal_x_local - sin_a * normal_y_local
     normal_y = sin_a * normal_x_local + cos_a * normal_y_local
+
     norm = np.hypot(normal_x, normal_y)
     return x, y, normal_x / norm, normal_y / norm
 
 
 def circular_components(mask):
-    n = len(mask)
-    if n == 0 or not np.any(mask):
+    """Return contiguous True-index runs on a circular boolean array."""
+    count = len(mask)
+    if count == 0 or not np.any(mask):
         return []
     if np.all(mask):
-        return [np.arange(n)]
-    start = (int(np.flatnonzero(~mask)[0]) + 1) % n
-    order = (start + np.arange(n)) % n
+        return [np.arange(count)]
+
+    # Start immediately after a False element so a wrapped True run becomes one
+    # ordinary linear run rather than two fragments at indices 0 and n-1.
+    start = (int(np.flatnonzero(~mask)[0]) + 1) % count
+    order = (start + np.arange(count)) % count
     values = mask[order]
+
     components = []
-    i = 0
-    while i < n:
-        if not values[i]:
-            i += 1
+    index = 0
+    while index < count:
+        if not values[index]:
+            index += 1
             continue
-        j = i
-        while j < n and values[j]:
-            j += 1
-        components.append(order[i:j])
-        i = j
+
+        end = index
+        while end < count and values[end]:
+            end += 1
+        components.append(order[index:end])
+        index = end
+
     return components
 
 
 def bridge_small_gaps(supported, max_gap):
+    """Join tiny missing runs between nearby supported angular samples."""
     if max_gap <= 0 or not np.any(supported):
         return supported
-    result = supported.copy()
+
+    bridged = supported.copy()
     for shift in range(1, max_gap + 1):
         left = np.roll(supported, shift)
         right = np.roll(supported, -shift)
-        result |= left & right
-    return result
+        bridged |= left & right
+
+    return bridged
 
 
 def grow_arc_support(mask, ellipse):
-    theta = np.linspace(0.0, 2.0 * np.pi, ARC_GROW_SAMPLES, endpoint=False)
-    x0, y0, nx, ny = ellipse_points_and_normals(ellipse, theta)
-    edge_search_distance = EDGE_SEARCH_FRACTION * min(ellipse["major"], ellipse["minor"])
+    """Search around a fitted ellipse and recover the largest connected arc.
+
+    At each of 720 ellipse angles, search along the local normal for the nearest
+    inside->outside transition in the supplied mask.  The allowed normal search
+    distance is 15% of the smaller semi-axis with no fixed pixel cap.
+
+    The connected component overlapping the original seed arc is chosen so the
+    growth phase expands the same physical boundary rather than jumping to an
+    unrelated edge elsewhere in the search envelope.
+    """
+    theta = np.linspace(
+        0.0,
+        2.0 * np.pi,
+        ARC_GROW_SAMPLES,
+        endpoint=False,
+    )
+    predicted_x, predicted_y, normal_x, normal_y = ellipse_points_and_normals(
+        ellipse,
+        theta,
+    )
+
+    edge_search_distance = EDGE_SEARCH_FRACTION * min(
+        ellipse["major"],
+        ellipse["minor"],
+    )
+
+    # Use at most roughly 180 normal-direction intervals across the full search
+    # band.  On small ellipses the one-pixel floor avoids redundant subpixel
+    # samples that would round to the same image coordinates.
     step = max(1.0, edge_search_distance / 90.0)
     offsets = np.arange(
         -edge_search_distance,
@@ -418,131 +827,216 @@ def grow_arc_support(mask, ellipse):
         step,
         dtype=np.float32,
     )
-    xs = np.rint(x0[:, None] + nx[:, None] * offsets[None, :]).astype(np.int32)
-    ys = np.rint(y0[:, None] + ny[:, None] * offsets[None, :]).astype(np.int32)
+
+    sample_x = np.rint(
+        predicted_x[:, None] + normal_x[:, None] * offsets[None, :]
+    ).astype(np.int32)
+    sample_y = np.rint(
+        predicted_y[:, None] + normal_y[:, None] * offsets[None, :]
+    ).astype(np.int32)
+
     height, width = mask.shape
-    valid = (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
-    values = np.zeros(xs.shape, np.uint8)
-    values[valid] = (mask[ys[valid], xs[valid]] != 0).astype(np.uint8)
+    valid = (
+        (sample_x >= 0)
+        & (sample_x < width)
+        & (sample_y >= 0)
+        & (sample_y < height)
+    )
+
+    # Out-of-image samples remain zero and are excluded by the valid mask when
+    # transitions are computed.
+    values = np.zeros(sample_x.shape, np.uint8)
+    values[valid] = (mask[sample_y[valid], sample_x[valid]] != 0).astype(np.uint8)
+
+    # Look specifically for an inside (1) -> outside (0) mask transition as we
+    # travel along the outward ellipse normal.
     transitions = (
         (values[:, :-1] == 1)
         & (values[:, 1:] == 0)
         & valid[:, :-1]
         & valid[:, 1:]
     )
+
     midpoint_offsets = 0.5 * (offsets[:-1] + offsets[1:])
-    costs = np.where(transitions, np.abs(midpoint_offsets)[None, :], np.inf)
+    costs = np.where(
+        transitions,
+        np.abs(midpoint_offsets)[None, :],
+        np.inf,
+    )
+
+    # For each ellipse angle choose the valid transition nearest the predicted
+    # ellipse.  Angles with no transition remain unsupported.
     best_index = np.argmin(costs, axis=1)
-    supported = np.isfinite(costs[np.arange(ARC_GROW_SAMPLES), best_index])
+    best_cost = costs[np.arange(ARC_GROW_SAMPLES), best_index]
+    supported = np.isfinite(best_cost)
     if not np.any(supported):
         return None
-    found_offset = midpoint_offsets[best_index]
-    found_x = x0 + nx * found_offset
-    found_y = y0 + ny * found_offset
 
+    found_offset = midpoint_offsets[best_index]
+    found_x = predicted_x + normal_x * found_offset
+    found_y = predicted_y + normal_y * found_offset
+
+    # Convert original seed points to the same 720-bin angle representation.
     seed_x, seed_y = ellipse_coordinates(ellipse["points"], ellipse)
     seed_theta = np.mod(np.arctan2(seed_y, seed_x), 2.0 * np.pi)
     seed_bins = set(
         np.mod(
-            np.rint(seed_theta / (2.0 * np.pi) * ARC_GROW_SAMPLES).astype(np.int32),
+            np.rint(
+                seed_theta / (2.0 * np.pi) * ARC_GROW_SAMPLES
+            ).astype(np.int32),
             ARC_GROW_SAMPLES,
         ).tolist()
     )
-    connected = bridge_small_gaps(supported, max(1, round(ARC_GROW_SAMPLES * 0.008)))
+
+    # Bridge only very small interruptions (about 0.8% of a circumference), then
+    # identify connected angular components on the circular sample array.
+    max_gap = max(1, round(ARC_GROW_SAMPLES * 0.008))
+    connected = bridge_small_gaps(supported, max_gap)
     components = circular_components(connected)
     if not components:
         return None
 
     def component_key(component):
-        overlap = sum(int(index) in seed_bins for index in component)
+        seed_overlap = sum(int(index) in seed_bins for index in component)
         actual_support = int(np.count_nonzero(supported[component]))
-        return overlap, actual_support, len(component)
+        return seed_overlap, actual_support, len(component)
 
     component = max(components, key=component_key)
     if component_key(component)[0] == 0:
         return None
+
     actual_indices = component[supported[component]]
     if len(actual_indices) < 5:
         return None
+
     return {
-        "points": np.column_stack((found_x[actual_indices], found_y[actual_indices])).astype(np.float64),
+        "points": np.column_stack(
+            (found_x[actual_indices], found_y[actual_indices])
+        ).astype(np.float64),
         "coverage": len(component) / ARC_GROW_SAMPLES,
         "supported_fraction": len(actual_indices) / len(component),
         "support_count": int(len(actual_indices)),
-        "edge_search_distance": float(edge_search_distance),
     }
 
 
 def growth_compatible(seed, grown):
+    """Reject a grown/refitted ellipse that drifted too far from its seed."""
     scale = max(seed["equivalent_radius"], 1.0)
-    sx, sy = seed["center"]
-    gx, gy = grown["center"]
-    if math.hypot(sx - gx, sy - gy) > 0.18 * scale:
+    seed_x, seed_y = seed["center"]
+    grown_x, grown_y = grown["center"]
+
+    if math.hypot(seed_x - grown_x, seed_y - grown_y) > 0.18 * scale:
         return False
     if abs(seed["major"] - grown["major"]) > 0.20 * scale:
         return False
     if abs(seed["minor"] - grown["minor"]) > 0.20 * scale:
         return False
+
     return True
 
 
-def grow_candidate(mask, seed, min_radius, max_radius, max_error, min_coverage):
+def grow_candidate(
+    mask,
+    seed,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+):
+    """Expand a seed arc, refit its geometry, and keep the best larger result."""
     support = grow_arc_support(mask, seed)
     if support is None or support["coverage"] <= seed["coverage"]:
         return seed
+
     best = None
     for ellipse in fit_ellipse_options(support["points"]):
-        if not (
-            min_radius <= ellipse["major"] <= max_radius
-            and min_radius <= ellipse["minor"] <= max_radius
-        ):
+        if not axes_in_range(ellipse, min_radius, max_radius):
             continue
-        relative_error, _ = ellipse_error_and_coverage(support["points"], ellipse)
+
+        relative_error, _ = ellipse_error_and_coverage(
+            support["points"],
+            ellipse,
+        )
         if relative_error > max_error:
             continue
+
         candidate = {
             **ellipse,
             **support,
             "relative_error": relative_error,
+            # Preserve contour-window metadata expected by downstream logic.
             "start": seed["start"],
             "length": support["support_count"],
         }
+
         if not growth_compatible(seed, candidate):
             continue
-        polarity, inside, outside, samples = boundary_polarity(mask, candidate)
-        if samples < 5 or polarity < MIN_BOUNDARY_POLARITY:
+
+        polarity, inside_fraction, sample_count = boundary_polarity(mask, candidate)
+        if sample_count < 5 or polarity < MIN_BOUNDARY_POLARITY:
             continue
-        candidate.update(
-            {
-                "boundary_polarity": polarity,
-                "interior_fraction": inside,
-                "outside_fraction": outside,
-            }
-        )
+
+        candidate["boundary_polarity"] = polarity
+        candidate["interior_fraction"] = inside_fraction
+
+        # At this stage coverage is deliberately the dominant signal.  Support
+        # density, polarity, and residual only refine the choice among arcs of
+        # similar angular extent.
         candidate["score"] = (
             candidate["coverage"]
             * (0.65 + 0.35 * candidate["supported_fraction"])
             * (0.65 + 0.35 * polarity)
             / (1.0 + 4.0 * relative_error)
         )
+
         if candidate["coverage"] < min_coverage:
             continue
+
         if best is None or (
-            candidate["coverage"], candidate["score"], candidate["support_count"]
+            candidate["coverage"],
+            candidate["score"],
+            candidate["support_count"],
         ) > (
-            best["coverage"], best["score"], best["support_count"]
+            best["coverage"],
+            best["score"],
+            best["support_count"],
         ):
             best = candidate
+
     return best if best is not None else seed
 
 
-def prepare_candidates(mask, candidates, min_radius, max_radius, max_error, min_coverage):
+def prepare_candidates(
+    mask,
+    candidates,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+):
+    """Grow, de-duplicate, and rank the strongest candidates for one class."""
     prepared = []
+
     for seed in candidates[:MAX_CLASS_CANDIDATES]:
-        candidate = grow_candidate(mask, seed, min_radius, max_radius, max_error, min_coverage)
-        if any(same_ellipse(candidate, existing, 0.08, 0.08, 12.0) for existing in prepared):
+        candidate = grow_candidate(
+            mask,
+            seed,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+        )
+
+        if any(
+            same_ellipse(candidate, existing, 0.08, 0.08, 12.0)
+            for existing in prepared
+        ):
             continue
+
         prepared.append(candidate)
+
+    # Coverage comes first by design: when multiple plausible fits exist, prefer
+    # the candidate that explains the largest coherent observed limb.
     prepared.sort(
         key=lambda item: (
             item["coverage"],
@@ -556,43 +1050,128 @@ def prepare_candidates(mask, candidates, min_radius, max_radius, max_error, min_
     return prepared
 
 
-def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage, max_contours, max_points):
-    _, dark_mask = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY_INV)
-    _, light_mask = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY)
-    args = (min_radius, max_radius, max_error, min_coverage, max_contours, max_points)
+# ---------------------------------------------------------------------------
+# Dark/light detection orchestration
+# ---------------------------------------------------------------------------
+def detect(
+    gray,
+    threshold,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+    max_contours,
+    max_points,
+):
+    """Detect at most one dark ellipse and one light ellipse.
+
+    Threshold semantics are intentionally asymmetric at equality:
+        dark mask  = gray <= threshold
+        light mask = gray > threshold
+
+    The dark class is selected first.  Its geometric interior is excluded when
+    validating the light class so overlap is owned by the dark ellipse.
+    """
+    _, dark_mask = cv2.threshold(
+        gray,
+        int(threshold),
+        255,
+        cv2.THRESH_BINARY_INV,
+    )
+    _, light_mask = cv2.threshold(
+        gray,
+        int(threshold),
+        255,
+        cv2.THRESH_BINARY,
+    )
+
+    dark_candidates = find_candidates(
+        dark_mask,
+        min_radius,
+        max_radius,
+        max_error,
+        min_coverage,
+        max_contours,
+        max_points,
+    )
     dark_candidates = prepare_candidates(
         dark_mask,
-        find_candidates(dark_mask, *args),
-        min_radius, max_radius, max_error, min_coverage,
+        dark_candidates,
+        min_radius,
+        max_radius,
+        max_error,
+        min_coverage,
+    )
+
+    light_candidates = find_candidates(
+        light_mask,
+        min_radius,
+        max_radius,
+        max_error,
+        min_coverage,
+        max_contours,
+        max_points,
     )
     light_candidates = prepare_candidates(
         light_mask,
-        find_candidates(light_mask, *args),
-        min_radius, max_radius, max_error, min_coverage,
+        light_candidates,
+        min_radius,
+        max_radius,
+        max_error,
+        min_coverage,
     )
 
+    # The prepared list is already ordered primarily by recovered arc coverage.
     dark = dark_candidates[0].copy() if dark_candidates else None
     if dark is not None:
         dark["class"] = "below threshold"
 
+    # During totality a dominant dark limb is the expected physical result; a
+    # second bright ellipse is more likely to be corona/ring structure.
     if dark is not None and dark["coverage"] >= DARK_DOMINANT_COVERAGE:
         return light_mask, [dark]
 
     light = None
     for candidate in light_candidates:
+        # Never return the same geometry once as dark and again as light.
         if dark is not None and same_ellipse(candidate, dark, 0.08, 0.08, 12.0):
             continue
+
         if dark is not None:
-            fraction, visible = visible_fraction(light_mask, candidate, dark)
-            if visible < 32 or fraction < 0.40:
+            light_fraction, visible_pixels = visible_fraction(
+                light_mask,
+                candidate,
+                dark,
+            )
+            if visible_pixels < 32 or light_fraction < 0.40:
                 continue
+
         light = candidate.copy()
         light["class"] = "above threshold"
         break
-    return light_mask, [ellipse for ellipse in (dark, light) if ellipse is not None]
+
+    ellipses = [
+        ellipse
+        for ellipse in (dark, light)
+        if ellipse is not None
+    ]
+    return light_mask, ellipses
 
 
-def process_image(gray, threshold, min_radius, max_radius, max_error, min_coverage, max_contours, max_points):
+# ---------------------------------------------------------------------------
+# Rendering and grayscale threshold palette
+# ---------------------------------------------------------------------------
+def process_image(
+    gray,
+    threshold,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+    max_contours,
+    max_points,
+):
+    """Run detection and build the two images displayed by the Tkinter UI."""
     binary, ellipses = detect(
         gray,
         threshold,
@@ -604,29 +1183,61 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
         max_points,
     )
 
+    # The left pane is a color version of the threshold mask so annotations can
+    # be drawn without altering threshold semantics.  The right pane is kept as
+    # a strictly grayscale visual reference.
     threshold_preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
     grayscale_preview = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    arc_color = (255, 0, 255)
-    dark_ellipse_color = (255, 0, 0)
-    light_ellipse_color = (0, 190, 255)
 
     for ellipse in ellipses:
         cx, cy = ellipse["center"]
         center = (int(round(cx)), int(round(cy)))
-        axes = (max(1, int(round(ellipse["major"]))), max(1, int(round(ellipse["minor"]))))
-        ellipse_color = dark_ellipse_color if ellipse["class"] == "below threshold" else light_ellipse_color
+        axes = (
+            max(1, int(round(ellipse["major"]))),
+            max(1, int(round(ellipse["minor"]))),
+        )
 
+        ellipse_color = (
+            DARK_ELLIPSE_COLOR
+            if ellipse["class"] == "below threshold"
+            else LIGHT_ELLIPSE_COLOR
+        )
+
+        # Magenta marks the actual contour/grown support used by the fitted
+        # candidate.  The complete inferred ellipse is drawn in class color.
         support = np.rint(ellipse["points"]).astype(np.int32).reshape(-1, 1, 2)
         if len(support) >= 2:
-            cv2.polylines(threshold_preview, [support], False, arc_color, 2, cv2.LINE_AA)
+            cv2.polylines(
+                threshold_preview,
+                [support],
+                False,
+                ARC_COLOR,
+                ARC_LINE_THICKNESS,
+                cv2.LINE_AA,
+            )
 
-        cv2.ellipse(threshold_preview, center, axes, ellipse["angle"], 0, 360, ellipse_color, 3, cv2.LINE_AA)
+        cv2.ellipse(
+            threshold_preview,
+            center,
+            axes,
+            ellipse["angle"],
+            0,
+            360,
+            ellipse_color,
+            ELLIPSE_LINE_THICKNESS,
+            cv2.LINE_AA,
+        )
         cv2.circle(threshold_preview, center, 3, ellipse_color, -1)
 
-        kind = "DARK <= T" if ellipse["class"] == "below threshold" else "BRIGHT > T"
+        kind = (
+            "DARK <= T"
+            if ellipse["class"] == "below threshold"
+            else "BRIGHT > T"
+        )
         text = (
             f"{kind}  a={ellipse['major']:.1f}  b={ellipse['minor']:.1f}  "
-            f"arc={ellipse['coverage'] * 360:.0f}deg  err={ellipse['relative_error']:.3f}"
+            f"arc={ellipse['coverage'] * 360:.0f}deg  "
+            f"err={ellipse['relative_error']:.3f}"
         )
         cv2.putText(
             threshold_preview,
@@ -643,29 +1254,45 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
 
 
 def build_palette(gray, max_colors=20, min_gap=10):
-    grayscale_values = gray.reshape(-1)
-    hist = np.bincount(grayscale_values, minlength=256).astype(float)
+    """Choose useful grayscale threshold buttons from ALL image pixels.
+
+    The first five entries are the most frequent exact grayscale levels, with no
+    spacing restriction.  Remaining slots favor other dense histogram regions
+    while requiring at least ``min_gap`` grayscale levels from every previously
+    selected threshold.  The returned buttons are sorted numerically.
+    """
+    histogram = np.bincount(gray.reshape(-1), minlength=256).astype(float)
 
     dominant_seed_count = min(5, max_colors)
     shades = []
-    for shade in np.argsort(hist)[::-1]:
+
+    # Seed with the most common exact tones before applying spacing.
+    for shade in np.argsort(histogram)[::-1]:
         shade = int(shade)
-        if hist[shade] <= 0:
+        if histogram[shade] <= 0:
             break
         shades.append(shade)
         if len(shades) >= dominant_seed_count:
             break
 
+    # Smoothed histogram density is more stable than ranking individual bins for
+    # the remaining suggestions.
     smooth_radius = max(2, min_gap // 3)
-    density = np.convolve(hist, np.ones(2 * smooth_radius + 1), mode="same")
+    density = np.convolve(
+        histogram,
+        np.ones(2 * smooth_radius + 1),
+        mode="same",
+    )
+
     for shade in np.argsort(density)[::-1]:
         shade = int(shade)
         if density[shade] <= 0:
             break
         if shade in shades:
             continue
-        if any(abs(shade - old) < min_gap for old in shades):
+        if any(abs(shade - selected) < min_gap for selected in shades):
             continue
+
         shades.append(shade)
         if len(shades) >= max_colors:
             break
@@ -674,26 +1301,38 @@ def build_palette(gray, max_colors=20, min_gap=10):
 
 
 def gray_hex(value):
+    """Convert an integer grayscale value to a Tk-compatible #RRGGBB string."""
     value = int(np.clip(value, 0, 255))
     return f"#{value:02x}{value:02x}{value:02x}"
 
 
 def text_color(gray_value):
+    """Choose readable text for grayscale threshold-picker buttons."""
     return "#111111" if gray_value >= 150 else "#f7f7f7"
 
 
+# ---------------------------------------------------------------------------
+# Tkinter interface
+# ---------------------------------------------------------------------------
 class DetectorApp:
+    """Single-window controls plus threshold/grayscale preview panes."""
+
     def __init__(self, root, gray, palette, args):
         self.root = root
         self.gray = gray
         self.palette = palette
         self.args = args
+
+        # Cached rendered images.  Slider changes only mark settings as pending;
+        # expensive detection runs exclusively when Apply/Enter is used.
         self.last_threshold_preview = None
-        self.last_result = None
-        self.binary_photo = None
-        self.result_photo = None
+        self.last_grayscale_preview = None
+        self.threshold_photo = None
+        self.grayscale_photo = None
         self.resize_job = None
 
+        # Tk variables mirror CLI defaults so command-line overrides also become
+        # the initial GUI values.
         self.threshold = tk.IntVar(value=args.threshold)
         self.min_radius = tk.IntVar(value=round(args.min_radius))
         self.max_radius = tk.IntVar(value=round(args.max_radius))
@@ -714,24 +1353,72 @@ class DetectorApp:
         root.bind("<Escape>", lambda _event: root.destroy())
 
     def build_controls(self):
+        """Create sliders, grayscale threshold buttons, Apply, and status text."""
         frame = tk.Frame(self.root, padx=10, pady=8)
         frame.grid(row=0, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
 
         radius_limit = max(1600, round(self.args.max_radius * 1.5))
         rows = [
-            ("Brightness threshold (0=black, 255=white)", self.threshold, 0, 255, 1, lambda value: str(int(value))),
-            ("Minimum fitted semi-axis radius (px)", self.min_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
-            ("Maximum fitted semi-axis radius (px)", self.max_radius, 1, radius_limit, 1, lambda value: f"{int(value)} px"),
-            ("Maximum average normalized ellipse error (%)", self.max_error, 0.5, 50, 0.1, lambda value: f"{float(value):.1f}%"),
-            ("Minimum visible ellipse arc (%)", self.min_coverage, 0, 100, 1, lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)"),
+            (
+                "Brightness threshold (0=black, 255=white)",
+                self.threshold,
+                0,
+                255,
+                1,
+                lambda value: str(int(value)),
+            ),
+            (
+                "Minimum fitted semi-axis radius (px)",
+                self.min_radius,
+                1,
+                radius_limit,
+                1,
+                lambda value: f"{int(value)} px",
+            ),
+            (
+                "Maximum fitted semi-axis radius (px)",
+                self.max_radius,
+                1,
+                radius_limit,
+                1,
+                lambda value: f"{int(value)} px",
+            ),
+            (
+                "Maximum average normalized ellipse error (%)",
+                self.max_error,
+                0.5,
+                50,
+                0.1,
+                lambda value: f"{float(value):.1f}%",
+            ),
+            (
+                "Minimum visible ellipse arc (%)",
+                self.min_coverage,
+                0,
+                100,
+                1,
+                lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)",
+            ),
         ]
+
         for row, spec in enumerate(rows):
             self.add_scale(frame, row, *spec)
 
-        tk.Label(frame, text="Pick threshold from grayscale tones:").grid(row=5, column=0, sticky="nw")
+        tk.Label(
+            frame,
+            text="Pick threshold from grayscale tones:",
+        ).grid(row=5, column=0, sticky="nw")
+
         palette_frame = tk.Frame(frame)
-        palette_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=(0, 8))
+        palette_frame.grid(
+            row=5,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 8),
+        )
+
         for index, shade in enumerate(self.palette):
             tk.Button(
                 palette_frame,
@@ -740,13 +1427,59 @@ class DetectorApp:
                 bg=gray_hex(shade),
                 fg=text_color(shade),
                 command=lambda value=shade: self.pick(value),
-            ).grid(row=index // 10, column=index % 10, padx=2, pady=2)
+            ).grid(
+                row=index // 10,
+                column=index % 10,
+                padx=2,
+                pady=2,
+            )
 
-        tk.Button(frame, text="Apply", width=12, command=self.apply).grid(row=6, column=0, sticky="w", pady=(2, 0))
-        tk.Label(frame, textvariable=self.status, anchor="w", justify="left", wraplength=1100).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        tk.Button(
+            frame,
+            text="Apply",
+            width=12,
+            command=self.apply,
+        ).grid(row=6, column=0, sticky="w", pady=(2, 0))
 
-    def add_scale(self, parent, row, text, variable, low, high, resolution, formatter):
-        tk.Label(parent, text=text, width=38, anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        tk.Label(
+            frame,
+            textvariable=self.status,
+            anchor="w",
+            justify="left",
+            wraplength=1100,
+        ).grid(
+            row=7,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(8, 0),
+        )
+
+    def add_scale(
+        self,
+        parent,
+        row,
+        text,
+        variable,
+        low,
+        high,
+        resolution,
+        formatter,
+    ):
+        """Create one labeled slider and a separately formatted value label."""
+        tk.Label(
+            parent,
+            text=text,
+            width=38,
+            anchor="w",
+        ).grid(
+            row=row,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=2,
+        )
+
         tk.Scale(
             parent,
             from_=low,
@@ -759,50 +1492,86 @@ class DetectorApp:
             highlightthickness=0,
         ).grid(row=row, column=1, sticky="ew", pady=2)
 
-        value = tk.Label(parent, width=18, anchor="e")
-        value.grid(row=row, column=2, pady=2)
+        value_label = tk.Label(parent, width=18, anchor="e")
+        value_label.grid(row=row, column=2, pady=2)
 
-        def update(*_args):
-            value.config(text=formatter(variable.get()))
+        def update_value(*_args):
+            value_label.config(text=formatter(variable.get()))
             self.pending()
 
-        variable.trace_add("write", update)
-        update()
+        variable.trace_add("write", update_value)
+        update_value()
 
     def build_previews(self):
+        """Create the two aspect-preserving image preview canvases."""
         frame = tk.Frame(self.root, padx=10)
         frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1, uniform="preview")
         frame.columnconfigure(1, weight=1, uniform="preview")
 
-        tk.Label(frame, text="Threshold preview with detected arcs and ellipses").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(frame, text="Grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        tk.Label(
+            frame,
+            text="Threshold preview with detected arcs and ellipses",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
 
-        self.binary_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
-        self.result_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
-        self.binary_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-        self.result_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        tk.Label(
+            frame,
+            text="Grayscale image",
+        ).grid(row=0, column=1, sticky="w", pady=(0, 4))
 
-        self.binary_canvas.bind("<Configure>", self.schedule_redraw)
-        self.result_canvas.bind("<Configure>", self.schedule_redraw)
-        self.placeholder(self.binary_canvas, "Threshold preview")
-        self.placeholder(self.result_canvas, "Grayscale image")
+        self.threshold_canvas = tk.Canvas(
+            frame,
+            bg="#202020",
+            highlightthickness=1,
+            highlightbackground="#808080",
+        )
+        self.grayscale_canvas = tk.Canvas(
+            frame,
+            bg="#202020",
+            highlightthickness=1,
+            highlightbackground="#808080",
+        )
+
+        self.threshold_canvas.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=(0, 5),
+        )
+        self.grayscale_canvas.grid(
+            row=1,
+            column=1,
+            sticky="nsew",
+            padx=(5, 0),
+        )
+
+        # Canvas resizing only redraws cached images; it never reruns detection.
+        self.threshold_canvas.bind("<Configure>", self.schedule_redraw)
+        self.grayscale_canvas.bind("<Configure>", self.schedule_redraw)
+
+        self.placeholder(self.threshold_canvas, "Threshold preview")
+        self.placeholder(self.grayscale_canvas, "Grayscale image")
 
     def pick(self, value):
+        """Set a suggested grayscale threshold without recomputing detection."""
         self.threshold.set(value)
         self.status.set(f"Threshold set to {value}. Click Apply to recompute.")
 
     def pending(self, *_args):
-        if self.last_result is not None:
+        """Indicate that controls changed after the last completed Apply."""
+        if self.last_grayscale_preview is not None:
             self.status.set("Settings changed. Click Apply to recompute the result.")
 
     def settings(self):
+        """Read and sanitize the current user-facing detector settings."""
         min_radius = max(1.0, float(self.min_radius.get()))
         max_radius = max(1.0, float(self.max_radius.get()))
+
         if max_radius < min_radius:
             max_radius = min_radius
             self.max_radius.set(round(max_radius))
+
         return (
             int(self.threshold.get()),
             min_radius,
@@ -812,9 +1581,11 @@ class DetectorApp:
         )
 
     def apply(self):
+        """Run detection once using the currently displayed settings."""
         threshold, min_radius, max_radius, max_error, min_coverage = self.settings()
+
         started = time.perf_counter()
-        threshold_preview, result, ellipses = process_image(
+        threshold_preview, grayscale_preview, ellipses = process_image(
             self.gray,
             threshold,
             min_radius,
@@ -824,70 +1595,137 @@ class DetectorApp:
             self.args.max_contours,
             self.args.max_search_points,
         )
-        elapsed = (time.perf_counter() - started) * 1000
+        elapsed_ms = (time.perf_counter() - started) * 1000
 
         self.last_threshold_preview = threshold_preview
-        self.last_result = result
+        self.last_grayscale_preview = grayscale_preview
         self.redraw()
 
         self.status.set(
             f"Applied: T={threshold}; semi-axes={min_radius:.0f}-{max_radius:.0f}px; "
-            f"error={max_error:.1%}; arc={min_coverage:.0%}; {len(ellipses)} ellipse(s); {elapsed:.1f} ms."
+            f"error={max_error:.1%}; arc={min_coverage:.0%}; "
+            f"{len(ellipses)} ellipse(s); {elapsed_ms:.1f} ms."
         )
+
+        # Console diagnostics are intentionally retained because they are useful
+        # when tuning difficult eclipse frames without adding more GUI controls.
         for ellipse in ellipses:
             print(
-                f"{ellipse['class']}: center=({ellipse['center'][0]:.2f}, {ellipse['center'][1]:.2f}), "
-                f"a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, angle={ellipse['angle']:.1f}, arc={ellipse['coverage'] * 360:.1f}°, "
-                f"error={ellipse['relative_error']:.4f}, interior={ellipse['interior_fraction']:.1%}"
+                f"{ellipse['class']}: "
+                f"center=({ellipse['center'][0]:.2f}, {ellipse['center'][1]:.2f}), "
+                f"a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, "
+                f"angle={ellipse['angle']:.1f}, "
+                f"arc={ellipse['coverage'] * 360:.1f}°, "
+                f"error={ellipse['relative_error']:.4f}, "
+                f"interior={ellipse['interior_fraction']:.1%}"
             )
 
     def schedule_redraw(self, _event=None):
+        """Debounce resize events so canvas redraws do not thrash Tkinter."""
         if self.resize_job is not None:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(60, self.redraw)
 
     def redraw(self):
+        """Resize cached images to the current canvas sizes and display them."""
         self.resize_job = None
+
         if self.last_threshold_preview is not None:
-            self.binary_photo = self.show_image(self.binary_canvas, self.last_threshold_preview)
-        if self.last_result is not None:
-            self.result_photo = self.show_image(self.result_canvas, self.last_result)
+            self.threshold_photo = self.show_image(
+                self.threshold_canvas,
+                self.last_threshold_preview,
+            )
+
+        if self.last_grayscale_preview is not None:
+            self.grayscale_photo = self.show_image(
+                self.grayscale_canvas,
+                self.last_grayscale_preview,
+            )
 
     @staticmethod
     def show_image(canvas, image):
+        """Fit an OpenCV image inside a Tk canvas while preserving aspect ratio."""
         canvas_width = max(2, canvas.winfo_width() - 2)
         canvas_height = max(2, canvas.winfo_height() - 2)
         image_height, image_width = image.shape[:2]
-        scale = max(min(canvas_width / image_width, canvas_height / image_height), 1e-6)
-        fitted_size = (max(1, round(image_width * scale)), max(1, round(image_height * scale)))
-        fitted = cv2.resize(image, fitted_size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+        scale = max(
+            min(canvas_width / image_width, canvas_height / image_height),
+            1e-6,
+        )
+        fitted_size = (
+            max(1, round(image_width * scale)),
+            max(1, round(image_height * scale)),
+        )
+
+        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        fitted = cv2.resize(image, fitted_size, interpolation=interpolation)
+
+        # Tk PhotoImage accepts PNG data.  OpenCV handles both resize and PNG
+        # encoding, so Pillow is intentionally not required.
         ok, encoded = cv2.imencode(".png", fitted)
         if not ok:
             return None
-        photo = tk.PhotoImage(data=base64.b64encode(encoded).decode("ascii"), format="png")
+
+        photo = tk.PhotoImage(
+            data=base64.b64encode(encoded).decode("ascii"),
+            format="png",
+        )
+
         canvas.delete("all")
-        canvas.create_image(canvas_width // 2 + 1, canvas_height // 2 + 1, image=photo, anchor="center")
+        canvas.create_image(
+            canvas_width // 2 + 1,
+            canvas_height // 2 + 1,
+            image=photo,
+            anchor="center",
+        )
         return photo
 
     @staticmethod
     def placeholder(canvas, text):
-        canvas.create_text(160, 120, text=text + "\nClick Apply", fill="#cccccc", justify="center")
+        """Show initial guidance before the first Apply."""
+        canvas.create_text(
+            160,
+            120,
+            text=text + "\nClick Apply",
+            fill="#cccccc",
+            justify="center",
+        )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Detect up to two inferred ellipses from thresholded image arcs.")
+# ---------------------------------------------------------------------------
+# Command-line entry point
+# ---------------------------------------------------------------------------
+def build_parser():
+    """Create the command-line parser used to seed GUI defaults."""
+    parser = argparse.ArgumentParser(
+        description="Detect up to two inferred ellipses from thresholded image arcs."
+    )
     parser.add_argument("image")
     parser.add_argument("--threshold", type=int, default=8)
-    parser.add_argument("--min-radius", type=float, default=1000.0, help="Minimum allowed value for each ellipse semi-axis")
-    parser.add_argument("--max-radius", type=float, default=1500.0, help="Maximum allowed value for each ellipse semi-axis; 0 = largest image dimension")
+    parser.add_argument(
+        "--min-radius",
+        type=float,
+        default=1000.0,
+        help="Minimum allowed value for each ellipse semi-axis",
+    )
+    parser.add_argument(
+        "--max-radius",
+        type=float,
+        default=1500.0,
+        help="Maximum allowed value for each ellipse semi-axis; 0 = largest image dimension",
+    )
     parser.add_argument("--max-error", type=float, default=0.08)
     parser.add_argument("--min-coverage", type=float, default=0.08)
     parser.add_argument("--max-contours", type=int, default=100)
     parser.add_argument("--max-search-points", type=int, default=500)
     parser.add_argument("--palette-size", type=int, default=20)
     parser.add_argument("--palette-min-gap", type=int, default=10)
-    args = parser.parse_args()
+    return parser
 
+
+def validate_args(args, parser):
+    """Fail early on invalid CLI values before loading the image or opening Tk."""
     if not 0 <= args.threshold <= 255:
         parser.error("--threshold must be 0..255")
     if args.min_radius <= 0:
@@ -903,16 +1741,31 @@ def main():
     if args.palette_size < 1 or not 1 <= args.palette_min_gap <= 255:
         parser.error("invalid palette settings")
 
+
+def main():
+    """Load the image, build threshold suggestions, and start the Tk UI."""
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(args, parser)
+
     image = cv2.imread(args.image)
     if image is None:
         raise RuntimeError(f"Could not load image: {args.image}")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # A max radius of zero is the documented request for an image-sized upper
+    # bound.  Then ensure the maximum cannot be lower than the minimum.
     if args.max_radius == 0:
         args.max_radius = float(max(gray.shape))
     args.max_radius = max(args.max_radius, args.min_radius)
 
-    palette = build_palette(gray, args.palette_size, args.palette_min_gap)
+    palette = build_palette(
+        gray,
+        args.palette_size,
+        args.palette_min_gap,
+    )
+
     root = tk.Tk()
     DetectorApp(root, gray, palette, args)
     root.mainloop()
