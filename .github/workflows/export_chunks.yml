@@ -1,10 +1,10 @@
-name: Export detector chunks
+name: Apply quick threshold patch
 on:
   push:
     branches:
       - debug/preview-horizon-multiarc
 jobs:
-  export:
+  apply:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -13,14 +13,31 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: debug/preview-horizon-multiarc
-      - name: Export chunks
+      - name: Apply and verify
         run: |
-          rm -rf .export
-          mkdir .export
-          gzip -c circle_arc_detector.py | base64 -w 0 > /tmp/source.b64
-          split -b 2500 -d -a 2 /tmp/source.b64 .export/part
+          git apply .quick_threshold.patch
+          python -m py_compile circle_arc_detector.py
+          test "$(git hash-object circle_arc_detector.py)" = "e8fc41058ac4bce868eb02575228bc4df22fc757"
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          tree = ast.parse(Path('circle_arc_detector.py').read_text())
+          funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+          assert 'score_detection_for_threshold' not in funcs
+          auto = funcs['auto_select_threshold']
+          called = {
+              n.func.id for n in ast.walk(auto)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+          }
+          forbidden = {'detect', 'process_working_image', 'find_candidates', 'grow_candidate', 'prepare_candidates'}
+          assert not (called & forbidden), called & forbidden
+          print('quick threshold verification passed')
+          PY
+          rm -rf .export .github
+          rm -f .quick_threshold.patch .trigger_export_chunks .trigger_export_small_chunks .trigger_quick_threshold
+          rm -rf __pycache__
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A .export
-          git commit -m 'Export detector chunks' || exit 0
+          git add -A
+          git commit -m 'Make automatic threshold selection instantaneous'
           git push origin HEAD:debug/preview-horizon-multiarc
