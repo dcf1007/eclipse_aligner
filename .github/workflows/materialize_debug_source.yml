@@ -1,0 +1,179 @@
+name: Patch and materialize debug detector
+
+on:
+  push:
+    branches:
+      - debug/preview-horizon-multiarc
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch horizon-visible support
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('circle_arc_detector.py')
+          s=p.read_text()
+
+          def replace_function(text,name,next_anchor,new):
+              a=text.index(f'def {name}(')
+              b=text.index(next_anchor,a)
+              return text[:a]+new.rstrip()+'\n\n'+text[b:]
+
+          s=replace_function(s,'visible_fraction','# ---------------------------------------------------------------------------\n# Horizon detection and half-plane constraints',r'''def visible_fraction(mask, candidate, exclude=None, horizon=None):
+    """Measure mask occupancy only in the physically visible candidate area."""
+    height, width = mask.shape
+    x0, y0, x1, y1 = ellipse_bounds(candidate, width, height)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0, 0
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    valid = ellipse_inside(xx, yy, candidate)
+    if exclude is not None:
+        valid &= ~ellipse_inside(xx, yy, exclude)
+    if horizon is not None:
+        signed = xx*horizon["normal"][0] + yy*horizon["normal"][1] + horizon["c"]
+        margin = max(2.0, HORIZON_EXCLUSION_RADIUS*candidate["equivalent_radius"])
+        valid &= signed*horizon["visible_sign"] >= margin
+    count = int(np.count_nonzero(valid))
+    if count == 0:
+        return 0.0, 0
+    matching = int(np.count_nonzero(mask[y0:y1, x0:x1][valid]))
+    return matching/count, count
+''')
+
+          s=replace_function(s,'grow_arc_support','def growth_compatible(',r'''def grow_arc_support(mask, ellipse, horizon=None):
+    """Recover all real supported segments without counting bridged gaps."""
+    theta=np.linspace(0.0,2.0*np.pi,ARC_GROW_SAMPLES,endpoint=False)
+    px,py,nx,ny=ellipse_points_and_normals(ellipse,theta)
+    search_distance=EDGE_SEARCH_FRACTION*min(ellipse["major"],ellipse["minor"])
+    step=max(1.0,search_distance/90.0)
+    offsets=np.arange(-search_distance,search_distance+0.5*step,step,dtype=np.float32)
+    sx=np.rint(px[:,None]+nx[:,None]*offsets[None,:]).astype(np.int32)
+    sy=np.rint(py[:,None]+ny[:,None]*offsets[None,:]).astype(np.int32)
+    height,width=mask.shape
+    valid=(sx>=0)&(sx<width)&(sy>=0)&(sy<height)
+    values=np.zeros(sx.shape,np.uint8)
+    values[valid]=(mask[sy[valid],sx[valid]]!=0).astype(np.uint8)
+    transitions=(values[:,:-1]==1)&(values[:,1:]==0)&valid[:,:-1]&valid[:,1:]
+    midpoint=0.5*(offsets[:-1]+offsets[1:])
+    costs=np.where(transitions,np.abs(midpoint)[None,:],np.inf)
+    best_index=np.argmin(costs,axis=1)
+    supported=np.isfinite(costs[np.arange(ARC_GROW_SAMPLES),best_index])
+    if not np.any(supported):
+        return None
+    found_offset=midpoint[best_index]
+    found_x=px+nx*found_offset
+    found_y=py+ny*found_offset
+    if horizon is not None:
+        found=np.column_stack((found_x,found_y))
+        margin=max(2.0,HORIZON_EXCLUSION_RADIUS*ellipse["equivalent_radius"])
+        supported &= points_on_visible_side(found,horizon,margin)
+        if not np.any(supported):
+            return None
+
+    grouped=bridge_small_gaps(supported,max(1,round(ARC_GROW_SAMPLES*0.008)))
+    components=circular_components(grouped)
+    if not components:
+        return None
+
+    seed_points=np.asarray(ellipse["points"],np.float64)
+    if horizon is not None and len(seed_points):
+        seed_margin=max(2.0,HORIZON_EXCLUSION_RADIUS*ellipse["equivalent_radius"])
+        seed_points=seed_points[points_on_visible_side(seed_points,horizon,seed_margin)]
+    seed_bins=set()
+    if len(seed_points):
+        seed_x,seed_y=ellipse_coordinates(seed_points,ellipse)
+        seed_theta=np.mod(np.arctan2(seed_y,seed_x),2.0*np.pi)
+        seed_bins=set(np.mod(np.rint(seed_theta/(2.0*np.pi)*ARC_GROW_SAMPLES).astype(np.int32),ARC_GROW_SAMPLES).tolist())
+    require_seed_overlap = horizon is None or len(seed_points)>=5
+
+    retained=[]
+    seed_overlap_any=False
+    min_component_bins=max(3,round(ARC_GROW_SAMPLES*0.01))
+    for component in components:
+        actual=component[supported[component]]
+        if len(actual)<5:
+            continue
+        density=len(actual)/max(len(component),1)
+        if len(component)<min_component_bins and density<0.8:
+            continue
+        overlap=sum(int(i) in seed_bins for i in actual)
+        seed_overlap_any |= bool(overlap)
+        retained.append((component,actual))
+    if not retained or (require_seed_overlap and not seed_overlap_any):
+        return None
+
+    segments=[]
+    all_points=[]
+    supported_bins=0
+    grouped_bins=0
+    largest=0
+    for component,actual in retained:
+        points=np.column_stack((found_x[actual],found_y[actual])).astype(np.float64)
+        segments.append(points)
+        all_points.append(points)
+        n=len(actual)
+        supported_bins += n
+        grouped_bins += len(component)
+        largest=max(largest,n)
+    return {
+        "points":np.vstack(all_points),
+        "arc_segments":segments,
+        "coverage":supported_bins/ARC_GROW_SAMPLES,
+        "total_supported_coverage":supported_bins/ARC_GROW_SAMPLES,
+        "largest_segment_coverage":largest/ARC_GROW_SAMPLES,
+        "segment_count":len(segments),
+        "supported_fraction":supported_bins/max(grouped_bins,1),
+        "support_count":int(supported_bins),
+    }
+''')
+
+          # Horizon mode must never fall back to raw unfiltered seed support.
+          marker='''    fallback = None\n    if (\n        axes_in_range(seed, min_radius, max_radius)'''
+          replacement='''    fallback = None\n    if (\n        horizon is None\n        and axes_in_range(seed, min_radius, max_radius)'''
+          if marker in s:
+              s=s.replace(marker,replacement,1)
+          # Remove the now-unreachable old horizon fallback rejection block.
+          old='''        if horizon is not None:\n            margin = max(2.0, HORIZON_EXCLUSION_RADIUS * fallback["equivalent_radius"])\n            if not np.all(points_on_visible_side(fallback["points"], horizon, margin)):\n                fallback = None\n'''
+          s=s.replace(old,'',1)
+
+          old='            fraction, visible_pixels = visible_fraction(light_mask, candidate, dark)\n'
+          new='''            fraction, visible_pixels = visible_fraction(\n                light_mask, candidate, dark, horizon=horizon\n            )\n'''
+          if old in s:
+              s=s.replace(old,new,1)
+
+          p.write_text(s)
+          PY
+          python -m py_compile circle_arc_detector.py
+
+      - name: Materialize exact source
+        shell: bash
+        run: |
+          rm -rf .debug_parts
+          mkdir .debug_parts
+          python - <<'PY'
+          from pathlib import Path
+          import base64,gzip
+          enc=base64.b64encode(gzip.compress(Path('circle_arc_detector.py').read_bytes(),9)).decode()
+          size=4000
+          parts=[enc[i:i+size] for i in range(0,len(enc),size)]
+          for i,part in enumerate(parts):
+              Path(f'.debug_parts/part{i:03d}.txt').write_text(part)
+          Path('.debug_parts/count.txt').write_text(str(len(parts)))
+          PY
+          rm -rf __pycache__
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add circle_arc_detector.py .debug_parts
+          git rm -r --ignore-unmatch __pycache__
+          git commit -m 'Fix horizon-visible multi-arc support'
+          git push origin HEAD:debug/preview-horizon-multiarc
