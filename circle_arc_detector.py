@@ -1998,18 +1998,19 @@ def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radiu
     """Choose a fast, robust per-image starting threshold.
 
     Use the lowest credible adaptive brightness/color hint first.  That
-    conservative value handles the normal partial-eclipse, totality and
-    full-Sun cases cheaply.  Extra work is reserved for difficult frames:
-    non-dominant dark-only, weak single-ellipse, or no-ellipse results.
+    conservative value handles the normal partial-eclipse, totality and full-Sun
+    cases cheaply.  Extra work is reserved for difficult frames: non-dominant
+    dark-only, weak single-ellipse, or no-ellipse results.
 
-    Difficult frames verify the narrow neighborhood around the legacy
-    fallback (normally T=6..10 around T=8) at normal preview resolution.
-    Late-sunset frames can change result after a one-level threshold move,
-    so this neighborhood is intentionally contiguous.  Only if it fails
-    are the strongest remaining adaptive hints preview-verified.
+    Difficult frames verify the narrow neighborhood around the legacy fallback
+    (normally T=6..10 around T=8) at normal preview resolution.  Late-sunset
+    frames can change result after a one-level threshold move, so this
+    neighborhood is intentionally contiguous.  Only if it fails are the
+    strongest remaining adaptive hints preview-verified.
     """
     working, auto_scale = resize_for_detection(
-        color_image, AUTO_THRESHOLD_MAX_DIM
+        color_image,
+        AUTO_THRESHOLD_MAX_DIM,
     )
     solar_hint = adaptive_solar_hint(working)
 
@@ -2135,6 +2136,9 @@ def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radiu
     if primary_kind in ("both", "dominant_dark", "light"):
         return int(primary)
 
+    # Difficult-case verification uses the same working resolution as Refresh
+    # Preview.  This prevents the automatic choice from depending on a 600-pixel
+    # proxy when the useful threshold window is only one or two grayscale levels.
     preview_image, preview_scale = resize_for_detection(
         color_image,
         PREVIEW_MAX_DIM,
@@ -2160,8 +2164,8 @@ def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radiu
     best_threshold = int(primary)
     best_score = float(primary_score)
 
-    # Normal search caps are intentional here: reduced contour/point
-    # caps were observed to miss legitimate T=6/T=7 sunset limbs.
+    # Normal search caps are intentional here.  Reduced contour/point caps were
+    # observed to miss legitimate T=6/T=7 sunset limbs.
     for threshold in low_order:
         ellipses, _, score = run_detection(
             preview_image,
@@ -2194,7 +2198,7 @@ def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radiu
 
     ranked = []
     for threshold in sorted(adaptive_pool):
-        ellipses, horizon, score = run_detection(
+        _, _, score = run_detection(
             working,
             threshold,
             auto_scale,
