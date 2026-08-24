@@ -1,0 +1,26 @@
+name: Export detector chunks
+on:
+  push:
+    branches:
+      - debug/preview-horizon-multiarc
+jobs:
+  export:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: debug/preview-horizon-multiarc
+      - name: Export chunks
+        run: |
+          rm -rf .export
+          mkdir .export
+          gzip -c circle_arc_detector.py | base64 -w 0 > /tmp/source.b64
+          split -b 7000 -d -a 2 /tmp/source.b64 .export/part
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .export
+          git commit -m 'Export detector chunks' || exit 0
+          git push origin HEAD:debug/preview-horizon-multiarc
