@@ -18,6 +18,16 @@ The script is intentionally self-contained.  It performs three jobs:
    the detected support arc in magenta, the dark ellipse in blue, and the light
    ellipse in golden yellow.  The second preview remains plain grayscale.
 
+4. Manage an ordered list of input images.  Previous/Next arrow buttons load one
+   image at a time.  Settings that differ from the session defaults are kept in
+   an in-memory ``image_overrides`` dictionary keyed by absolute file path.  On
+   navigation, the defaults are restored first, then that image's overrides are
+   re-applied, and the normal Apply computation is run once automatically.
+
+Changing sliders or threshold buttons still does not recompute detection by
+probe/drag; it only updates the pending per-image settings.  Apply/Enter remains
+the manual recomputation path between image loads.
+
 Detection is limited to at most two ellipses: one dark-class ellipse and one
 light-class ellipse.  All final fitted semi-axes must independently stay inside
 user-selected minimum/maximum radius limits.
@@ -29,8 +39,10 @@ Dependencies:
 import argparse
 import base64
 import math
+import os
 import time
 import tkinter as tk
+from tkinter import filedialog
 
 import cv2
 import numpy as np
@@ -85,6 +97,24 @@ DARK_ELLIPSE_COLOR = (255, 0, 0)  # blue
 LIGHT_ELLIPSE_COLOR = (0, 190, 255)  # golden/orange yellow
 ELLIPSE_LINE_THICKNESS = 3
 ARC_LINE_THICKNESS = 2
+
+# These are exactly the controls whose values may vary per image.  Search caps
+# and threshold-palette generation parameters remain global/session options.
+SETTING_NAMES = (
+    "threshold",
+    "min_radius",
+    "max_radius",
+    "max_error",
+    "min_coverage",
+)
+
+# Tk's multi-file chooser returns the selected paths in one tuple.  OpenCV can
+# read these common formats; "All files" remains available for camera-specific
+# extensions that OpenCV may support on a particular installation.
+IMAGE_FILE_TYPES = (
+    ("Image files", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"),
+    ("All files", "*.*"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1312,55 +1342,398 @@ def text_color(gray_value):
 
 
 # ---------------------------------------------------------------------------
-# Tkinter interface
+# Tkinter interface: image-list navigation + per-image override dictionary
 # ---------------------------------------------------------------------------
 class DetectorApp:
-    """Single-window controls plus threshold/grayscale preview panes."""
+    """Single-window detector UI with an ordered image list and navigation.
 
-    def __init__(self, root, gray, palette, args):
+    The detector settings have two layers:
+
+    * ``effective_default_settings()`` returns the session defaults for the
+      currently loaded image.  Normally these are the CLI defaults.  The legacy
+      ``--max-radius 0`` shorthand is resolved per image to that image's largest
+      dimension, so multi-image use does not weaken the old behavior.
+    * ``image_overrides`` contains ONLY values that differ from those defaults,
+      keyed by absolute image path.  An all-default image has no dictionary
+      entry at all.
+
+    When an image is loaded, defaults are restored first, saved overrides are
+    overlaid second, then ``apply()`` is invoked exactly once.  Subsequent slider
+    edits stay pending until Apply/Enter or another image load occurs.
+    """
+
+    def __init__(self, root, image_paths, args):
         self.root = root
-        self.gray = gray
-        self.palette = palette
         self.args = args
 
-        # Cached rendered images.  Slider changes only mark settings as pending;
-        # expensive detection runs exclusively when Apply/Enter is used.
+        # Normalize paths once.  This ensures the same physical file uses the
+        # same dictionary key whether it arrived from a relative CLI argument or
+        # from Tk's absolute-path file chooser.
+        self.image_paths = [os.path.abspath(path) for path in image_paths]
+        self.current_index = -1
+        self.current_path = None
+        self.gray = None
+        self.palette = []
+
+        # Per-image settings live only when they deviate from defaults, e.g.:
+        # {
+        #   "C:/eclipse/frame_0123.jpg": {"threshold": 11, "min_coverage": 0.10},
+        #   "C:/eclipse/frame_0124.jpg": {"max_error": 0.06},
+        # }
+        # Reverting every control to defaults removes that image's entry.
+        self.image_overrides = {}
+
+        # Variable traces fire even for programmatic Tk variable changes.  This
+        # guard prevents restoring saved settings from being mistaken for a user
+        # edit and immediately re-writing the override dictionary.
+        self.restoring_settings = False
+
+        # Cached previews.  Resizing the Tk window redraws these cached arrays;
+        # it does not rerun the expensive detector.
         self.last_threshold_preview = None
         self.last_grayscale_preview = None
         self.threshold_photo = None
         self.grayscale_photo = None
         self.resize_job = None
 
-        # Tk variables mirror CLI defaults so command-line overrides also become
-        # the initial GUI values.
-        self.threshold = tk.IntVar(value=args.threshold)
-        self.min_radius = tk.IntVar(value=round(args.min_radius))
-        self.max_radius = tk.IntVar(value=round(args.max_radius))
-        self.max_error = tk.DoubleVar(value=args.max_error * 100)
-        self.min_coverage = tk.IntVar(value=round(args.min_coverage * 100))
-        self.status = tk.StringVar(value="Adjust settings, then click Apply.")
+        # Before an image is loaded, use a harmless placeholder max radius if
+        # --max-radius=0.  The exact per-image default is resolved after load.
+        initial_defaults = self.effective_default_settings()
+        self.threshold = tk.IntVar(value=initial_defaults["threshold"])
+        self.min_radius = tk.IntVar(value=round(initial_defaults["min_radius"]))
+        self.max_radius = tk.IntVar(value=round(initial_defaults["max_radius"]))
+        self.max_error = tk.DoubleVar(value=initial_defaults["max_error"] * 100)
+        self.min_coverage = tk.IntVar(
+            value=round(initial_defaults["min_coverage"] * 100)
+        )
+
+        self.status = tk.StringVar(
+            value="Load images or adjust settings, then click Apply."
+        )
+        self.image_info = tk.StringVar(value="No image loaded")
 
         root.title("Ellipse / Arc Detector")
-        root.minsize(980, 680)
+        root.minsize(980, 720)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
-        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.rowconfigure(2, weight=1)
+        root.protocol("WM_DELETE_WINDOW", self.close)
 
+        self.build_navigation()
         self.build_controls()
         self.build_previews()
 
+        # Enter deliberately reuses the same Apply path as the button.  Escape
+        # closes after capturing any current per-image overrides.  Plain Left/
+        # Right are NOT bound globally because those keys should remain usable
+        # for fine keyboard adjustment when a Tk Scale has focus.
         root.bind("<Return>", lambda _event: self.apply())
-        root.bind("<Escape>", lambda _event: root.destroy())
+        root.bind("<Escape>", lambda _event: self.close())
+
+        # A CLI list is treated exactly like a list chosen through the dialog:
+        # load its first frame, restore settings, and run Apply once.
+        if self.image_paths:
+            self.load_image_at(0)
+        else:
+            self.update_navigation_state()
+
+    # ------------------------------------------------------------------
+    # Per-image defaults / override dictionary
+    # ------------------------------------------------------------------
+    def effective_default_settings(self):
+        """Return session defaults in the same units consumed by detection.
+
+        ``--max-radius 0`` historically meant "largest image dimension".  With
+        an image list the correct interpretation is therefore per image rather
+        than once for the whole session.
+        """
+        min_radius = max(1.0, float(self.args.min_radius))
+
+        if self.args.max_radius == 0:
+            if self.gray is not None:
+                max_radius = float(max(self.gray.shape))
+            else:
+                # No image exists yet, so this value is only a temporary UI
+                # placeholder.  It will be replaced on first successful load.
+                max_radius = max(1600.0, min_radius)
+        else:
+            max_radius = float(self.args.max_radius)
+
+        max_radius = max(max_radius, min_radius)
+        return {
+            "threshold": int(self.args.threshold),
+            "min_radius": min_radius,
+            "max_radius": max_radius,
+            "max_error": float(self.args.max_error),
+            "min_coverage": float(self.args.min_coverage),
+        }
+
+    def settings_dict(self):
+        """Read and sanitize the five user-facing settings from Tk controls."""
+        min_radius = max(1.0, float(self.min_radius.get()))
+        max_radius = max(1.0, float(self.max_radius.get()))
+
+        # Keep the UI internally valid.  The guard suppresses the trace emitted
+        # by max_radius.set(), so this repair is not treated as a second edit.
+        if max_radius < min_radius:
+            max_radius = min_radius
+            self.restoring_settings = True
+            try:
+                self.max_radius.set(round(max_radius))
+            finally:
+                self.restoring_settings = False
+
+        return {
+            "threshold": int(self.threshold.get()),
+            "min_radius": min_radius,
+            "max_radius": max_radius,
+            "max_error": max(0.001, self.max_error.get() / 100),
+            "min_coverage": float(
+                np.clip(self.min_coverage.get() / 100, 0, 1)
+            ),
+        }
+
+    @staticmethod
+    def setting_equal(name, value, default):
+        """Compare a current setting with its default without float noise."""
+        if name == "threshold":
+            return int(value) == int(default)
+        return math.isclose(
+            float(value),
+            float(default),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+
+    def store_current_overrides(self):
+        """Update ``image_overrides`` with only non-default current values."""
+        if self.current_path is None:
+            return
+
+        current = self.settings_dict()
+        defaults = self.effective_default_settings()
+        overrides = {
+            name: current[name]
+            for name in SETTING_NAMES
+            if not self.setting_equal(name, current[name], defaults[name])
+        }
+
+        if overrides:
+            self.image_overrides[self.current_path] = overrides
+        else:
+            # No redundant all-default dictionaries are retained.
+            self.image_overrides.pop(self.current_path, None)
+
+    def restore_settings_for_current_image(self):
+        """Restore defaults, then overlay saved settings for this image path."""
+        defaults = self.effective_default_settings()
+        values = dict(defaults)
+        values.update(self.image_overrides.get(self.current_path, {}))
+
+        self.restoring_settings = True
+        try:
+            self.threshold.set(round(values["threshold"]))
+            self.min_radius.set(round(values["min_radius"]))
+            self.max_radius.set(round(values["max_radius"]))
+            self.max_error.set(values["max_error"] * 100)
+            self.min_coverage.set(round(values["min_coverage"] * 100))
+        finally:
+            self.restoring_settings = False
+
+    # ------------------------------------------------------------------
+    # Image-list loading and navigation
+    # ------------------------------------------------------------------
+    def load_images(self):
+        """Choose an ordered image list, replace the active list, load item 1."""
+        selected = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Select eclipse images",
+            filetypes=IMAGE_FILE_TYPES,
+        )
+        if not selected:
+            return
+
+        # Preserve pending edits from the old list before replacing it.  The
+        # dictionary itself is retained, so reloading the same path later in the
+        # session restores its remembered values.
+        self.store_current_overrides()
+        self.image_paths = [os.path.abspath(path) for path in selected]
+        self.current_index = -1
+        self.current_path = None
+        self.gray = None
+        self.palette = []
+        self.load_image_at(0)
+
+    def load_image_at(self, index):
+        """Load one image, restore its settings, then run Apply exactly once."""
+        if not 0 <= index < len(self.image_paths):
+            return
+
+        # Capture even unapplied slider changes before leaving the old image.
+        if self.current_path is not None:
+            self.store_current_overrides()
+
+        path = self.image_paths[index]
+        image = cv2.imread(path)
+
+        if image is None:
+            # Keep navigation usable even when one selected file cannot be read.
+            # The failed entry remains in the list so Previous/Next ordering is
+            # not silently changed behind the user's back.
+            self.current_index = index
+            self.current_path = path
+            self.gray = None
+            self.palette = []
+            self.last_threshold_preview = None
+            self.last_grayscale_preview = None
+            self.threshold_canvas.delete("all")
+            self.grayscale_canvas.delete("all")
+            self.placeholder(self.threshold_canvas, "Threshold preview")
+            self.placeholder(self.grayscale_canvas, "Unreadable image")
+            self.update_navigation_state()
+            self.status.set(f"Could not load image: {path}")
+            return
+
+        self.current_index = index
+        self.current_path = path
+        self.gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # Threshold suggestions are image-specific, so regenerate them from all
+        # grayscale pixels every time a different image is loaded.
+        self.palette = build_palette(
+            self.gray,
+            self.args.palette_size,
+            self.args.palette_min_gap,
+        )
+
+        # Restore detector controls BEFORE automatic Apply.  This ordering is the
+        # key to getting the same fitted result when returning to a tuned frame.
+        self.restore_settings_for_current_image()
+        self.update_radius_scale_limits()
+        self.rebuild_palette_buttons()
+
+        # Never leave the previous frame's threshold result visible.  The new raw
+        # grayscale frame can be shown immediately while Apply begins.
+        self.last_threshold_preview = None
+        self.last_grayscale_preview = cv2.cvtColor(
+            self.gray,
+            cv2.COLOR_GRAY2BGR,
+        )
+        self.threshold_photo = None
+        self.threshold_canvas.delete("all")
+        self.placeholder(self.threshold_canvas, "Threshold preview")
+        self.redraw()
+
+        self.update_navigation_state()
+        self.status.set(
+            "Image loaded; running detection with restored settings..."
+        )
+        self.root.update_idletasks()
+
+        # Requirement: every successful image load executes the existing Apply
+        # recomputation behavior exactly once, including startup and navigation.
+        self.apply()
+
+    def previous_image(self):
+        """Load the preceding list entry; stop at the first image (no wrap)."""
+        if self.current_index > 0:
+            self.load_image_at(self.current_index - 1)
+
+    def next_image(self):
+        """Load the following list entry; stop at the last image (no wrap)."""
+        if 0 <= self.current_index < len(self.image_paths) - 1:
+            self.load_image_at(self.current_index + 1)
+
+    def update_navigation_state(self):
+        """Enable/disable arrows and update the current image counter/name."""
+        count = len(self.image_paths)
+        has_current = 0 <= self.current_index < count
+        has_readable_image = has_current and self.gray is not None
+
+        self.previous_button.config(
+            state=(
+                tk.NORMAL
+                if has_current and self.current_index > 0
+                else tk.DISABLED
+            )
+        )
+        self.next_button.config(
+            state=(
+                tk.NORMAL
+                if has_current and self.current_index < count - 1
+                else tk.DISABLED
+            )
+        )
+        self.apply_button.config(
+            state=tk.NORMAL if has_readable_image else tk.DISABLED
+        )
+
+        if has_current:
+            filename = os.path.basename(self.current_path)
+            self.image_info.set(
+                f"{self.current_index + 1} / {count}   {filename}"
+            )
+        elif count:
+            self.image_info.set(f"0 / {count}")
+        else:
+            self.image_info.set("No image loaded")
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def build_navigation(self):
+        """Create multi-file loading and Previous/Next arrow controls."""
+        # Keep tuple padding in grid(), not the Frame constructor.  This is
+        # important for Windows Tk, where widget constructor pady=(8, 0) can be
+        # parsed as the invalid screen-distance string "8 0".
+        frame = tk.Frame(self.root, padx=10)
+        frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
+        frame.columnconfigure(3, weight=1)
+
+        tk.Button(
+            frame,
+            text="Load images...",
+            width=14,
+            command=self.load_images,
+        ).grid(row=0, column=0, padx=(0, 8))
+
+        self.previous_button = tk.Button(
+            frame,
+            text="◀ Previous",
+            width=12,
+            command=self.previous_image,
+        )
+        self.previous_button.grid(row=0, column=1, padx=(0, 5))
+
+        self.next_button = tk.Button(
+            frame,
+            text="Next ▶",
+            width=12,
+            command=self.next_image,
+        )
+        self.next_button.grid(row=0, column=2, padx=(0, 10))
+
+        tk.Label(
+            frame,
+            textvariable=self.image_info,
+            anchor="w",
+        ).grid(row=0, column=3, sticky="ew")
 
     def build_controls(self):
-        """Create sliders, grayscale threshold buttons, Apply, and status text."""
+        """Create sliders, threshold palette, Apply, and status text."""
         frame = tk.Frame(self.root, padx=10, pady=8)
-        frame.grid(row=0, column=0, sticky="ew")
+        frame.grid(row=1, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
 
-        radius_limit = max(1600, round(self.args.max_radius * 1.5))
+        defaults = self.effective_default_settings()
+        radius_limit = max(1600, round(defaults["max_radius"] * 1.5))
+
+        # Keep references to the two radius Scales because max-radius=0 can make
+        # their useful range image-dependent as the user navigates.
+        self.radius_scales = {}
+
         rows = [
             (
+                "threshold",
                 "Brightness threshold (0=black, 255=white)",
                 self.threshold,
                 0,
@@ -1369,6 +1742,7 @@ class DetectorApp:
                 lambda value: str(int(value)),
             ),
             (
+                "min_radius",
                 "Minimum fitted semi-axis radius (px)",
                 self.min_radius,
                 1,
@@ -1377,6 +1751,7 @@ class DetectorApp:
                 lambda value: f"{int(value)} px",
             ),
             (
+                "max_radius",
                 "Maximum fitted semi-axis radius (px)",
                 self.max_radius,
                 1,
@@ -1385,6 +1760,7 @@ class DetectorApp:
                 lambda value: f"{int(value)} px",
             ),
             (
+                "max_error",
                 "Maximum average normalized ellipse error (%)",
                 self.max_error,
                 0.5,
@@ -1393,25 +1769,31 @@ class DetectorApp:
                 lambda value: f"{float(value):.1f}%",
             ),
             (
+                "min_coverage",
                 "Minimum visible ellipse arc (%)",
                 self.min_coverage,
                 0,
                 100,
                 1,
-                lambda value: f"{int(value)}% (~{int(value) * 3.6:.0f}°)",
+                lambda value: (
+                    f"{int(value)}% (~{int(value) * 3.6:.0f}°)"
+                ),
             ),
         ]
 
         for row, spec in enumerate(rows):
-            self.add_scale(frame, row, *spec)
+            name, *scale_args = spec
+            scale = self.add_scale(frame, row, *scale_args)
+            if name in ("min_radius", "max_radius"):
+                self.radius_scales[name] = scale
 
         tk.Label(
             frame,
             text="Pick threshold from grayscale tones:",
         ).grid(row=5, column=0, sticky="nw")
 
-        palette_frame = tk.Frame(frame)
-        palette_frame.grid(
+        self.palette_frame = tk.Frame(frame)
+        self.palette_frame.grid(
             row=5,
             column=1,
             columnspan=2,
@@ -1419,27 +1801,18 @@ class DetectorApp:
             pady=(0, 8),
         )
 
-        for index, shade in enumerate(self.palette):
-            tk.Button(
-                palette_frame,
-                text=str(shade),
-                width=4,
-                bg=gray_hex(shade),
-                fg=text_color(shade),
-                command=lambda value=shade: self.pick(value),
-            ).grid(
-                row=index // 10,
-                column=index % 10,
-                padx=2,
-                pady=2,
-            )
-
-        tk.Button(
+        self.apply_button = tk.Button(
             frame,
             text="Apply",
             width=12,
             command=self.apply,
-        ).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        )
+        self.apply_button.grid(
+            row=6,
+            column=0,
+            sticky="w",
+            pady=(2, 0),
+        )
 
         tk.Label(
             frame,
@@ -1466,7 +1839,7 @@ class DetectorApp:
         resolution,
         formatter,
     ):
-        """Create one labeled slider and a separately formatted value label."""
+        """Create one labeled slider and return the Scale for later updates."""
         tk.Label(
             parent,
             text=text,
@@ -1480,7 +1853,7 @@ class DetectorApp:
             pady=2,
         )
 
-        tk.Scale(
+        scale = tk.Scale(
             parent,
             from_=low,
             to=high,
@@ -1490,7 +1863,8 @@ class DetectorApp:
             showvalue=False,
             length=420,
             highlightthickness=0,
-        ).grid(row=row, column=1, sticky="ew", pady=2)
+        )
+        scale.grid(row=row, column=1, sticky="ew", pady=2)
 
         value_label = tk.Label(parent, width=18, anchor="e")
         value_label.grid(row=row, column=2, pady=2)
@@ -1501,11 +1875,44 @@ class DetectorApp:
 
         variable.trace_add("write", update_value)
         update_value()
+        return scale
+
+    def update_radius_scale_limits(self):
+        """Expand radius slider ranges when the active image/default requires it."""
+        defaults = self.effective_default_settings()
+        current_high = max(
+            defaults["max_radius"],
+            float(self.min_radius.get()),
+            float(self.max_radius.get()),
+        )
+        radius_limit = max(1600, round(current_high * 1.5))
+        for scale in self.radius_scales.values():
+            scale.config(to=radius_limit)
+
+    def rebuild_palette_buttons(self):
+        """Rebuild grayscale threshold suggestions for the active image."""
+        for child in self.palette_frame.winfo_children():
+            child.destroy()
+
+        for index, shade in enumerate(self.palette):
+            tk.Button(
+                self.palette_frame,
+                text=str(shade),
+                width=4,
+                bg=gray_hex(shade),
+                fg=text_color(shade),
+                command=lambda value=shade: self.pick(value),
+            ).grid(
+                row=index // 10,
+                column=index % 10,
+                padx=2,
+                pady=2,
+            )
 
     def build_previews(self):
         """Create the two aspect-preserving image preview canvases."""
         frame = tk.Frame(self.root, padx=10)
-        frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1, uniform="preview")
         frame.columnconfigure(1, weight=1, uniform="preview")
@@ -1546,43 +1953,55 @@ class DetectorApp:
             padx=(5, 0),
         )
 
-        # Canvas resizing only redraws cached images; it never reruns detection.
+        # Canvas resize events redraw cached previews only; they never recompute
+        # contours, candidates, or ellipse fits.
         self.threshold_canvas.bind("<Configure>", self.schedule_redraw)
         self.grayscale_canvas.bind("<Configure>", self.schedule_redraw)
 
         self.placeholder(self.threshold_canvas, "Threshold preview")
         self.placeholder(self.grayscale_canvas, "Grayscale image")
 
+    # ------------------------------------------------------------------
+    # User actions and Apply-based recomputation
+    # ------------------------------------------------------------------
     def pick(self, value):
-        """Set a suggested grayscale threshold without recomputing detection."""
+        """Set a suggested grayscale threshold without rerunning detection."""
         self.threshold.set(value)
-        self.status.set(f"Threshold set to {value}. Click Apply to recompute.")
-
-    def pending(self, *_args):
-        """Indicate that controls changed after the last completed Apply."""
-        if self.last_grayscale_preview is not None:
-            self.status.set("Settings changed. Click Apply to recompute the result.")
-
-    def settings(self):
-        """Read and sanitize the current user-facing detector settings."""
-        min_radius = max(1.0, float(self.min_radius.get()))
-        max_radius = max(1.0, float(self.max_radius.get()))
-
-        if max_radius < min_radius:
-            max_radius = min_radius
-            self.max_radius.set(round(max_radius))
-
-        return (
-            int(self.threshold.get()),
-            min_radius,
-            max_radius,
-            max(0.001, self.max_error.get() / 100),
-            float(np.clip(self.min_coverage.get() / 100, 0, 1)),
+        self.status.set(
+            f"Threshold set to {value}. Click Apply to recompute."
         )
 
+    def pending(self, *_args):
+        """Store a control edit for this image, but do not rerun detection."""
+        if self.restoring_settings:
+            return
+
+        if self.current_path is not None:
+            # Keep the dictionary synchronized even before Apply.  Therefore an
+            # unapplied adjustment survives an immediate Previous/Next click.
+            self.store_current_overrides()
+            self.status.set(
+                "Settings changed and remembered for this image. "
+                "Click Apply to recompute the result."
+            )
+
+    def settings(self):
+        """Return the current settings tuple in the order expected by detection."""
+        values = self.settings_dict()
+        return tuple(values[name] for name in SETTING_NAMES)
+
     def apply(self):
-        """Run detection once using the currently displayed settings."""
+        """Run detection once on the current image with the current controls."""
+        if self.gray is None or self.current_path is None:
+            self.status.set(
+                "Load at least one readable image before applying detection."
+            )
+            return
+
         threshold, min_radius, max_radius, max_error, min_coverage = self.settings()
+
+        # settings_dict() may sanitize min/max radius, so store after reading it.
+        self.store_current_overrides()
 
         started = time.perf_counter()
         threshold_preview, grayscale_preview, ellipses = process_image(
@@ -1601,19 +2020,28 @@ class DetectorApp:
         self.last_grayscale_preview = grayscale_preview
         self.redraw()
 
+        override_count = len(
+            self.image_overrides.get(self.current_path, {})
+        )
         self.status.set(
-            f"Applied: T={threshold}; semi-axes={min_radius:.0f}-{max_radius:.0f}px; "
+            f"Applied: T={threshold}; "
+            f"semi-axes={min_radius:.0f}-{max_radius:.0f}px; "
             f"error={max_error:.1%}; arc={min_coverage:.0%}; "
-            f"{len(ellipses)} ellipse(s); {elapsed_ms:.1f} ms."
+            f"{len(ellipses)} ellipse(s); {elapsed_ms:.1f} ms; "
+            f"{override_count} per-image override(s)."
         )
 
-        # Console diagnostics are intentionally retained because they are useful
-        # when tuning difficult eclipse frames without adding more GUI controls.
+        # Keep console diagnostics for difficult eclipse frames without adding
+        # extra GUI controls.  Prefix each line with the filename so sequential
+        # navigation logs remain unambiguous.
         for ellipse in ellipses:
             print(
+                f"{os.path.basename(self.current_path)} | "
                 f"{ellipse['class']}: "
-                f"center=({ellipse['center'][0]:.2f}, {ellipse['center'][1]:.2f}), "
-                f"a={ellipse['major']:.2f}, b={ellipse['minor']:.2f}, "
+                f"center=({ellipse['center'][0]:.2f}, "
+                f"{ellipse['center'][1]:.2f}), "
+                f"a={ellipse['major']:.2f}, "
+                f"b={ellipse['minor']:.2f}, "
                 f"angle={ellipse['angle']:.1f}, "
                 f"arc={ellipse['coverage'] * 360:.1f}°, "
                 f"error={ellipse['relative_error']:.4f}, "
@@ -1621,13 +2049,13 @@ class DetectorApp:
             )
 
     def schedule_redraw(self, _event=None):
-        """Debounce resize events so canvas redraws do not thrash Tkinter."""
+        """Debounce resize events so cached-image redraws do not thrash Tk."""
         if self.resize_job is not None:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(60, self.redraw)
 
     def redraw(self):
-        """Resize cached images to the current canvas sizes and display them."""
+        """Resize cached images to current canvases without rerunning detection."""
         self.resize_job = None
 
         if self.last_threshold_preview is not None:
@@ -1659,10 +2087,13 @@ class DetectorApp:
         )
 
         interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        fitted = cv2.resize(image, fitted_size, interpolation=interpolation)
+        fitted = cv2.resize(
+            image,
+            fitted_size,
+            interpolation=interpolation,
+        )
 
-        # Tk PhotoImage accepts PNG data.  OpenCV handles both resize and PNG
-        # encoding, so Pillow is intentionally not required.
+        # OpenCV handles resize and PNG encoding, so Pillow remains unnecessary.
         ok, encoded = cv2.imencode(".png", fitted)
         if not ok:
             return None
@@ -1683,7 +2114,7 @@ class DetectorApp:
 
     @staticmethod
     def placeholder(canvas, text):
-        """Show initial guidance before the first Apply."""
+        """Show initial guidance when no computed preview is available."""
         canvas.create_text(
             160,
             120,
@@ -1692,16 +2123,30 @@ class DetectorApp:
             justify="center",
         )
 
+    def close(self):
+        """Capture pending per-image settings, then close the Tk session."""
+        self.store_current_overrides()
+        self.root.destroy()
+
 
 # ---------------------------------------------------------------------------
 # Command-line entry point
 # ---------------------------------------------------------------------------
 def build_parser():
-    """Create the command-line parser used to seed GUI defaults."""
+    """Create CLI options; positional images may now contain an ordered list."""
     parser = argparse.ArgumentParser(
-        description="Detect up to two inferred ellipses from thresholded image arcs."
+        description=(
+            "Detect up to two inferred ellipses from thresholded image arcs."
+        )
     )
-    parser.add_argument("image")
+    parser.add_argument(
+        "images",
+        nargs="*",
+        help=(
+            "Optional ordered input image list; more images can be loaded "
+            "through the Tk interface"
+        ),
+    )
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument(
         "--min-radius",
@@ -1713,7 +2158,10 @@ def build_parser():
         "--max-radius",
         type=float,
         default=1500.0,
-        help="Maximum allowed value for each ellipse semi-axis; 0 = largest image dimension",
+        help=(
+            "Maximum allowed value for each ellipse semi-axis; "
+            "0 = largest dimension of the active image"
+        ),
     )
     parser.add_argument("--max-error", type=float, default=0.08)
     parser.add_argument("--min-coverage", type=float, default=0.08)
@@ -1725,7 +2173,7 @@ def build_parser():
 
 
 def validate_args(args, parser):
-    """Fail early on invalid CLI values before loading the image or opening Tk."""
+    """Fail early on invalid detector defaults before opening the Tk window."""
     if not 0 <= args.threshold <= 255:
         parser.error("--threshold must be 0..255")
     if args.min_radius <= 0:
@@ -1743,31 +2191,13 @@ def validate_args(args, parser):
 
 
 def main():
-    """Load the image, build threshold suggestions, and start the Tk UI."""
+    """Start the Tk UI with zero, one, or many initial image paths."""
     parser = build_parser()
     args = parser.parse_args()
     validate_args(args, parser)
 
-    image = cv2.imread(args.image)
-    if image is None:
-        raise RuntimeError(f"Could not load image: {args.image}")
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # A max radius of zero is the documented request for an image-sized upper
-    # bound.  Then ensure the maximum cannot be lower than the minimum.
-    if args.max_radius == 0:
-        args.max_radius = float(max(gray.shape))
-    args.max_radius = max(args.max_radius, args.min_radius)
-
-    palette = build_palette(
-        gray,
-        args.palette_size,
-        args.palette_min_gap,
-    )
-
     root = tk.Tk()
-    DetectorApp(root, gray, palette, args)
+    DetectorApp(root, args.images, args)
     root.mainloop()
 
 
