@@ -16,7 +16,9 @@ The script is intentionally self-contained.  It performs three jobs:
 
 3. Present the result in a single Tkinter window.  The threshold preview shows
    the detected support arc in magenta, the dark ellipse in blue, and the light
-   ellipse in golden yellow.  The second preview remains plain grayscale.
+   ellipse in golden yellow.  The second preview shows the original full-color
+   image translated by whole pixels so the detected light/Sun ellipse is centered
+   whenever a light ellipse is available.
 
 4. Manage an ordered list of input images.  Previous/Next arrow buttons load one
    image at a time.  Settings that differ from the session defaults are kept in
@@ -1189,8 +1191,68 @@ def detect(
 
 
 # ---------------------------------------------------------------------------
-# Rendering and grayscale threshold palette
+# Rendering, Sun-centered color preview, and grayscale threshold palette
 # ---------------------------------------------------------------------------
+def center_color_image_on_light_ellipse(color_image, ellipses):
+    """Center the full-color preview on the detected light/Sun ellipse.
+
+    This adopts the useful no-resampling principle from the companion alignment
+    script: the fitted light-ellipse center is rounded to a source pixel and the
+    source raster is moved by an integer X/Y offset only.  Pixels are copied into
+    a same-size black canvas; no rotation, scaling, affine warp, or fractional
+    translation is used for this centering step.
+
+    The light ellipse is intentionally the only centering reference.  During a
+    partial eclipse the dark ellipse represents the Moon and should not silently
+    replace the solar center.  If no light ellipse is detected, return the color
+    image unchanged.
+    """
+    if color_image is None:
+        return None
+
+    light = next(
+        (
+            ellipse
+            for ellipse in ellipses
+            if ellipse.get("class") == "above threshold"
+        ),
+        None,
+    )
+    if light is None:
+        return color_image.copy()
+
+    height, width = color_image.shape[:2]
+    source_center_x = int(round(light["center"][0]))
+    source_center_y = int(round(light["center"][1]))
+    target_center_x = width // 2
+    target_center_y = height // 2
+
+    shift_x = target_center_x - source_center_x
+    shift_y = target_center_y - source_center_y
+
+    # Work out the overlapping source/destination rectangles after translation.
+    # Direct slice assignment preserves every copied source pixel exactly.
+    source_x0 = max(0, -shift_x)
+    source_y0 = max(0, -shift_y)
+    destination_x0 = max(0, shift_x)
+    destination_y0 = max(0, shift_y)
+
+    copy_width = min(width - source_x0, width - destination_x0)
+    copy_height = min(height - source_y0, height - destination_y0)
+
+    centered = np.zeros_like(color_image)
+    if copy_width > 0 and copy_height > 0:
+        centered[
+            destination_y0 : destination_y0 + copy_height,
+            destination_x0 : destination_x0 + copy_width,
+        ] = color_image[
+            source_y0 : source_y0 + copy_height,
+            source_x0 : source_x0 + copy_width,
+        ]
+
+    return centered
+
+
 def process_image(
     gray,
     threshold,
@@ -1200,8 +1262,9 @@ def process_image(
     min_coverage,
     max_contours,
     max_points,
+    color_image=None,
 ):
-    """Run detection and build the two images displayed by the Tkinter UI."""
+    """Run detection and build threshold plus Sun-centered color previews."""
     binary, ellipses = detect(
         gray,
         threshold,
@@ -1213,11 +1276,16 @@ def process_image(
         max_points,
     )
 
-    # The left pane is a color version of the threshold mask so annotations can
-    # be drawn without altering threshold semantics.  The right pane is kept as
-    # a strictly grayscale visual reference.
+    # The left pane remains the annotated threshold mask.  The right pane uses
+    # the original full-color raster and centers it on the detected light ellipse
+    # using integer-only pixel translation.
     threshold_preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-    grayscale_preview = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if color_image is None:
+        color_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    centered_color_preview = center_color_image_on_light_ellipse(
+        color_image,
+        ellipses,
+    )
 
     for ellipse in ellipses:
         cx, cy = ellipse["center"]
@@ -1280,7 +1348,7 @@ def process_image(
             cv2.LINE_AA,
         )
 
-    return threshold_preview, grayscale_preview, ellipses
+    return threshold_preview, centered_color_preview, ellipses
 
 
 def build_palette(gray, max_colors=20, min_gap=10):
@@ -1372,6 +1440,7 @@ class DetectorApp:
         self.image_paths = [os.path.abspath(path) for path in image_paths]
         self.current_index = -1
         self.current_path = None
+        self.color_image = None
         self.gray = None
         self.palette = []
 
@@ -1391,9 +1460,9 @@ class DetectorApp:
         # Cached previews.  Resizing the Tk window redraws these cached arrays;
         # it does not rerun the expensive detector.
         self.last_threshold_preview = None
-        self.last_grayscale_preview = None
+        self.last_color_preview = None
         self.threshold_photo = None
-        self.grayscale_photo = None
+        self.color_photo = None
         self.resize_job = None
 
         # Before an image is loaded, use a harmless placeholder max radius if
@@ -1559,6 +1628,7 @@ class DetectorApp:
         self.image_paths = [os.path.abspath(path) for path in selected]
         self.current_index = -1
         self.current_path = None
+        self.color_image = None
         self.gray = None
         self.palette = []
         self.load_image_at(0)
@@ -1581,21 +1651,23 @@ class DetectorApp:
             # not silently changed behind the user's back.
             self.current_index = index
             self.current_path = path
+            self.color_image = None
             self.gray = None
             self.palette = []
             self.last_threshold_preview = None
-            self.last_grayscale_preview = None
+            self.last_color_preview = None
             self.threshold_canvas.delete("all")
-            self.grayscale_canvas.delete("all")
+            self.color_canvas.delete("all")
             self.placeholder(self.threshold_canvas, "Threshold preview")
-            self.placeholder(self.grayscale_canvas, "Unreadable image")
+            self.placeholder(self.color_canvas, "Unreadable image")
             self.update_navigation_state()
             self.status.set(f"Could not load image: {path}")
             return
 
         self.current_index = index
         self.current_path = path
-        self.gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        self.color_image = image
+        self.gray = cv2.cvtColor(self.color_image, cv2.COLOR_BGR2GRAY)
 
         # Threshold suggestions are image-specific, so regenerate them from all
         # grayscale pixels every time a different image is loaded.
@@ -1612,12 +1684,9 @@ class DetectorApp:
         self.rebuild_palette_buttons()
 
         # Never leave the previous frame's threshold result visible.  The new raw
-        # grayscale frame can be shown immediately while Apply begins.
+        # full-color frame can be shown immediately while automatic Apply begins.
         self.last_threshold_preview = None
-        self.last_grayscale_preview = cv2.cvtColor(
-            self.gray,
-            cv2.COLOR_GRAY2BGR,
-        )
+        self.last_color_preview = self.color_image.copy()
         self.threshold_photo = None
         self.threshold_canvas.delete("all")
         self.placeholder(self.threshold_canvas, "Threshold preview")
@@ -1647,7 +1716,11 @@ class DetectorApp:
         """Enable/disable arrows and update the current image counter/name."""
         count = len(self.image_paths)
         has_current = 0 <= self.current_index < count
-        has_readable_image = has_current and self.gray is not None
+        has_readable_image = (
+            has_current
+            and self.gray is not None
+            and self.color_image is not None
+        )
 
         self.previous_button.config(
             state=(
@@ -1910,7 +1983,7 @@ class DetectorApp:
             )
 
     def build_previews(self):
-        """Create the two aspect-preserving image preview canvases."""
+        """Create threshold and Sun-centered full-color preview canvases."""
         frame = tk.Frame(self.root, padx=10)
         frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         frame.rowconfigure(1, weight=1)
@@ -1924,7 +1997,7 @@ class DetectorApp:
 
         tk.Label(
             frame,
-            text="Grayscale image",
+            text="Full-color image centered on detected light ellipse",
         ).grid(row=0, column=1, sticky="w", pady=(0, 4))
 
         self.threshold_canvas = tk.Canvas(
@@ -1933,7 +2006,7 @@ class DetectorApp:
             highlightthickness=1,
             highlightbackground="#808080",
         )
-        self.grayscale_canvas = tk.Canvas(
+        self.color_canvas = tk.Canvas(
             frame,
             bg="#202020",
             highlightthickness=1,
@@ -1946,7 +2019,7 @@ class DetectorApp:
             sticky="nsew",
             padx=(0, 5),
         )
-        self.grayscale_canvas.grid(
+        self.color_canvas.grid(
             row=1,
             column=1,
             sticky="nsew",
@@ -1956,10 +2029,10 @@ class DetectorApp:
         # Canvas resize events redraw cached previews only; they never recompute
         # contours, candidates, or ellipse fits.
         self.threshold_canvas.bind("<Configure>", self.schedule_redraw)
-        self.grayscale_canvas.bind("<Configure>", self.schedule_redraw)
+        self.color_canvas.bind("<Configure>", self.schedule_redraw)
 
         self.placeholder(self.threshold_canvas, "Threshold preview")
-        self.placeholder(self.grayscale_canvas, "Grayscale image")
+        self.placeholder(self.color_canvas, "Color image")
 
     # ------------------------------------------------------------------
     # User actions and Apply-based recomputation
@@ -1992,7 +2065,11 @@ class DetectorApp:
 
     def apply(self):
         """Run detection once on the current image with the current controls."""
-        if self.gray is None or self.current_path is None:
+        if (
+            self.gray is None
+            or self.color_image is None
+            or self.current_path is None
+        ):
             self.status.set(
                 "Load at least one readable image before applying detection."
             )
@@ -2004,7 +2081,7 @@ class DetectorApp:
         self.store_current_overrides()
 
         started = time.perf_counter()
-        threshold_preview, grayscale_preview, ellipses = process_image(
+        threshold_preview, color_preview, ellipses = process_image(
             self.gray,
             threshold,
             min_radius,
@@ -2013,11 +2090,12 @@ class DetectorApp:
             min_coverage,
             self.args.max_contours,
             self.args.max_search_points,
+            color_image=self.color_image,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
 
         self.last_threshold_preview = threshold_preview
-        self.last_grayscale_preview = grayscale_preview
+        self.last_color_preview = color_preview
         self.redraw()
 
         override_count = len(
@@ -2064,10 +2142,10 @@ class DetectorApp:
                 self.last_threshold_preview,
             )
 
-        if self.last_grayscale_preview is not None:
-            self.grayscale_photo = self.show_image(
-                self.grayscale_canvas,
-                self.last_grayscale_preview,
+        if self.last_color_preview is not None:
+            self.color_photo = self.show_image(
+                self.color_canvas,
+                self.last_color_preview,
             )
 
     @staticmethod
