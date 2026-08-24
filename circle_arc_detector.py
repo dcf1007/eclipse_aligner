@@ -317,18 +317,24 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
         max_points,
     )
 
-    output = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    threshold_preview = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    grayscale_preview = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    arc_color = (255, 0, 255)
+    dark_ellipse_color = (255, 0, 0)
+    light_ellipse_color = (0, 255, 255)
+
     for ellipse in ellipses:
         cx, cy = ellipse["center"]
         center = (int(round(cx)), int(round(cy)))
         axes = (max(1, int(round(ellipse["major"]))), max(1, int(round(ellipse["minor"]))))
+        ellipse_color = dark_ellipse_color if ellipse["class"] == "below threshold" else light_ellipse_color
 
         support = np.rint(ellipse["points"]).astype(np.int32).reshape(-1, 1, 2)
         if len(support) >= 2:
-            cv2.polylines(output, [support], False, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.polylines(threshold_preview, [support], False, arc_color, 2, cv2.LINE_AA)
 
-        cv2.ellipse(output, center, axes, ellipse["angle"], 0, 360, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.circle(output, center, 3, (0, 0, 255), -1)
+        cv2.ellipse(threshold_preview, center, axes, ellipse["angle"], 0, 360, ellipse_color, 2, cv2.LINE_AA)
+        cv2.circle(threshold_preview, center, 3, ellipse_color, -1)
 
         kind = "DARK <= T" if ellipse["class"] == "below threshold" else "BRIGHT > T"
         text = (
@@ -336,17 +342,17 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
             f"arc={ellipse['coverage'] * 360:.0f}deg  err={ellipse['relative_error']:.3f}"
         )
         cv2.putText(
-            output,
+            threshold_preview,
             text,
             (center[0] + 10, max(18, center[1] - 10)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (0, 0, 255),
+            ellipse_color,
             1,
             cv2.LINE_AA,
         )
 
-    return binary, output, ellipses
+    return threshold_preview, grayscale_preview, ellipses
 
 
 def build_palette(gray, max_colors=20, min_gap=10):
@@ -398,7 +404,7 @@ class DetectorApp:
         self.gray = gray
         self.palette = palette
         self.args = args
-        self.last_binary = None
+        self.last_threshold_preview = None
         self.last_result = None
         self.binary_photo = None
         self.result_photo = None
@@ -486,8 +492,8 @@ class DetectorApp:
         frame.columnconfigure(0, weight=1, uniform="preview")
         frame.columnconfigure(1, weight=1, uniform="preview")
 
-        tk.Label(frame, text="Threshold preview").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(frame, text="Detected ellipses on grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        tk.Label(frame, text="Threshold preview with detected arcs and ellipses").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        tk.Label(frame, text="Grayscale image").grid(row=0, column=1, sticky="w", pady=(0, 4))
 
         self.binary_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
         self.result_canvas = tk.Canvas(frame, bg="#202020", highlightthickness=1, highlightbackground="#808080")
@@ -497,7 +503,7 @@ class DetectorApp:
         self.binary_canvas.bind("<Configure>", self.schedule_redraw)
         self.result_canvas.bind("<Configure>", self.schedule_redraw)
         self.placeholder(self.binary_canvas, "Threshold preview")
-        self.placeholder(self.result_canvas, "Detected ellipses")
+        self.placeholder(self.result_canvas, "Grayscale image")
 
     def pick(self, value):
         self.threshold.set(value)
@@ -524,7 +530,7 @@ class DetectorApp:
     def apply(self):
         threshold, min_radius, max_radius, max_error, min_coverage = self.settings()
         started = time.perf_counter()
-        binary, result, ellipses = process_image(
+        threshold_preview, result, ellipses = process_image(
             self.gray,
             threshold,
             min_radius,
@@ -536,7 +542,7 @@ class DetectorApp:
         )
         elapsed = (time.perf_counter() - started) * 1000
 
-        self.last_binary = binary
+        self.last_threshold_preview = threshold_preview
         self.last_result = result
         self.redraw()
 
@@ -558,8 +564,8 @@ class DetectorApp:
 
     def redraw(self):
         self.resize_job = None
-        if self.last_binary is not None:
-            self.binary_photo = self.show_image(self.binary_canvas, self.last_binary)
+        if self.last_threshold_preview is not None:
+            self.binary_photo = self.show_image(self.binary_canvas, self.last_threshold_preview)
         if self.last_result is not None:
             self.result_photo = self.show_image(self.result_canvas, self.last_result)
 
