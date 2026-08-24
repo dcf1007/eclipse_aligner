@@ -352,14 +352,28 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
 def build_palette(gray, max_colors=20, min_gap=10):
     grayscale_values = gray.reshape(-1)
     hist = np.bincount(grayscale_values, minlength=256).astype(float)
+
+    # Seed with the most dominant exact grayscale levels, before applying spacing.
+    dominant_seed_count = min(5, max_colors)
+    shades = []
+    for shade in np.argsort(hist)[::-1]:
+        shade = int(shade)
+        if hist[shade] <= 0:
+            break
+        shades.append(shade)
+        if len(shades) >= dominant_seed_count:
+            break
+
+    # Fill the remaining slots with other strong grayscale regions, now enforcing
+    # the minimum spacing relative to every already-selected threshold.
     smooth_radius = max(2, min_gap // 3)
     density = np.convolve(hist, np.ones(2 * smooth_radius + 1), mode="same")
-
-    shades = []
     for shade in np.argsort(density)[::-1]:
         shade = int(shade)
         if density[shade] <= 0:
             break
+        if shade in shades:
+            continue
         if any(abs(shade - old) < min_gap for old in shades):
             continue
         shades.append(shade)
