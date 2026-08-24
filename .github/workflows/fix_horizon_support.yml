@@ -1,0 +1,394 @@
+name: Fix and stage horizon support
+
+on:
+  push:
+    branches:
+      - debug/preview-horizon-multiarc
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch horizon support logic
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('circle_arc_detector.py')
+          source = path.read_text(encoding='utf-8')
+
+          old = '''def visible_fraction(mask, candidate, exclude=None):
+    height, width = mask.shape
+    x0, y0, x1, y1 = ellipse_bounds(candidate, width, height)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0, 0
+
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    valid = ellipse_inside(xx, yy, candidate)
+    if exclude is not None:
+        valid &= ~ellipse_inside(xx, yy, exclude)
+
+    visible_pixels = int(np.count_nonzero(valid))
+    if visible_pixels == 0:
+        return 0.0, 0
+    matching = int(np.count_nonzero(mask[y0:y1, x0:x1][valid]))
+    return matching / visible_pixels, visible_pixels
+'''
+          new = '''def visible_fraction(mask, candidate, exclude=None, horizon=None):
+    """Measure class occupancy only where the candidate is physically visible.
+
+    With a detected horizon, the occluded half-plane and a narrow strip around
+    the straight horizon edge are excluded from the denominator.  This prevents
+    the horizon-dark side from making a legitimate sunset light ellipse appear
+    insufficiently bright while preserving the existing Moon-overlap exclusion.
+    """
+    height, width = mask.shape
+    x0, y0, x1, y1 = ellipse_bounds(candidate, width, height)
+    if x0 >= x1 or y0 >= y1:
+        return 0.0, 0
+
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    valid = ellipse_inside(xx, yy, candidate)
+    if exclude is not None:
+        valid &= ~ellipse_inside(xx, yy, exclude)
+
+    if horizon is not None:
+        signed = (
+            xx * horizon["normal"][0]
+            + yy * horizon["normal"][1]
+            + horizon["c"]
+        )
+        margin = max(
+            2.0,
+            HORIZON_EXCLUSION_RADIUS * candidate["equivalent_radius"],
+        )
+        valid &= signed * horizon["visible_sign"] >= margin
+
+    visible_pixels = int(np.count_nonzero(valid))
+    if visible_pixels == 0:
+        return 0.0, 0
+    matching = int(np.count_nonzero(mask[y0:y1, x0:x1][valid]))
+    return matching / visible_pixels, visible_pixels
+'''
+          if source.count(old) != 1:
+              raise SystemExit('visible_fraction patch anchor mismatch')
+          source = source.replace(old, new, 1)
+
+          old = '''    # Seed bins identify the physical boundary that started the growth.  At least
+    # one retained component must overlap the seed; other disconnected components
+    # may join the same ellipse when they independently have enough support.
+    seed_x, seed_y = ellipse_coordinates(ellipse["points"], ellipse)
+    seed_theta = np.mod(np.arctan2(seed_y, seed_x), 2.0 * np.pi)
+    seed_bins = set(
+        np.mod(
+            np.rint(seed_theta / (2.0 * np.pi) * ARC_GROW_SAMPLES).astype(np.int32),
+            ARC_GROW_SAMPLES,
+        ).tolist()
+    )
+
+    retained = []
+    seed_overlap_any = False
+    min_component_bins = max(3, round(ARC_GROW_SAMPLES * 0.01))
+
+    for component in components:
+        actual_indices = component[supported[component]]
+        if len(actual_indices) < 5:
+            continue
+        density = len(actual_indices) / len(component)
+        if len(component) < min_component_bins and density < 0.8:
+            continue
+        overlap = sum(int(index) in seed_bins for index in component)
+        if overlap:
+            seed_overlap_any = True
+        retained.append((component, actual_indices, density, overlap))
+
+    if not retained or not seed_overlap_any:
+        return None
+'''
+          new = '''    # Seed overlap normally prevents growth from jumping to a nearby unrelated
+    # edge.  Horizon clipping needs one exception: a seed window can itself be
+    # dominated by the straight horizon or by points that are subsequently
+    # removed from the dark half-plane.  In that case there may be too few valid
+    # visible seed points to overlap the true curved limb.  We then allow strong
+    # visible-side components to proceed to the normal geometry/error/polarity
+    # checks instead of rejecting them solely because the original seed was
+    # clipped.  The dark half-plane is still excluded above and can never become
+    # support.
+    seed_points = np.asarray(ellipse["points"], np.float64)
+    if horizon is not None and len(seed_points):
+        seed_margin = max(
+            2.0,
+            HORIZON_EXCLUSION_RADIUS * ellipse["equivalent_radius"],
+        )
+        seed_points = seed_points[
+            points_on_visible_side(seed_points, horizon, seed_margin)
+        ]
+
+    seed_bins = set()
+    if len(seed_points):
+        seed_x, seed_y = ellipse_coordinates(seed_points, ellipse)
+        seed_theta = np.mod(np.arctan2(seed_y, seed_x), 2.0 * np.pi)
+        seed_bins = set(
+            np.mod(
+                np.rint(
+                    seed_theta / (2.0 * np.pi) * ARC_GROW_SAMPLES
+                ).astype(np.int32),
+                ARC_GROW_SAMPLES,
+            ).tolist()
+        )
+
+    require_seed_overlap = horizon is None or len(seed_points) >= 5
+    retained = []
+    seed_overlap_any = False
+    min_component_bins = max(3, round(ARC_GROW_SAMPLES * 0.01))
+
+    for component in components:
+        actual_indices = component[supported[component]]
+        if len(actual_indices) < 5:
+            continue
+        density = len(actual_indices) / len(component)
+        if len(component) < min_component_bins and density < 0.8:
+            continue
+        overlap = sum(int(index) in seed_bins for index in actual_indices)
+        if overlap:
+            seed_overlap_any = True
+        retained.append((component, actual_indices, density, overlap))
+
+    if not retained or (require_seed_overlap and not seed_overlap_any):
+        return None
+'''
+          if source.count(old) != 1:
+              raise SystemExit('seed-overlap patch anchor mismatch')
+          source = source.replace(old, new, 1)
+
+          old = '''    segments = []
+    all_points = []
+    total_bins = 0
+    largest_bins = 0
+    support_count = 0
+    for component, actual_indices, density, overlap in retained:
+        segment_points = np.column_stack(
+            (found_x[actual_indices], found_y[actual_indices])
+        ).astype(np.float64)
+        segments.append(segment_points)
+        all_points.append(segment_points)
+        total_bins += len(component)
+        largest_bins = max(largest_bins, len(component))
+        support_count += len(actual_indices)
+
+    return {
+        "points": np.vstack(all_points),
+        "arc_segments": segments,
+        "coverage": total_bins / ARC_GROW_SAMPLES,
+        "total_supported_coverage": total_bins / ARC_GROW_SAMPLES,
+        "largest_segment_coverage": largest_bins / ARC_GROW_SAMPLES,
+        "segment_count": len(segments),
+        "supported_fraction": support_count / max(total_bins, 1),
+        "support_count": int(support_count),
+    }
+'''
+          new = '''    segments = []
+    all_points = []
+    supported_bins = 0
+    grouped_bins = 0
+    largest_supported_bins = 0
+    support_count = 0
+    for component, actual_indices, density, overlap in retained:
+        segment_points = np.column_stack(
+            (found_x[actual_indices], found_y[actual_indices])
+        ).astype(np.float64)
+        segments.append(segment_points)
+        all_points.append(segment_points)
+
+        # ``component`` may include bins inserted only to bridge tiny gaps for
+        # grouping.  Those bins are deliberately NOT evidence and therefore do
+        # not count toward total or largest-segment coverage.  Only the original
+        # actually supported angular samples contribute to coverage.
+        actual_count = len(actual_indices)
+        supported_bins += actual_count
+        grouped_bins += len(component)
+        largest_supported_bins = max(largest_supported_bins, actual_count)
+        support_count += actual_count
+
+    return {
+        "points": np.vstack(all_points),
+        "arc_segments": segments,
+        "coverage": supported_bins / ARC_GROW_SAMPLES,
+        "total_supported_coverage": supported_bins / ARC_GROW_SAMPLES,
+        "largest_segment_coverage": largest_supported_bins / ARC_GROW_SAMPLES,
+        "segment_count": len(segments),
+        "supported_fraction": support_count / max(grouped_bins, 1),
+        "support_count": int(support_count),
+    }
+'''
+          if source.count(old) != 1:
+              raise SystemExit('coverage patch anchor mismatch')
+          source = source.replace(old, new, 1)
+
+          old = '''    fallback = None
+    if (
+        axes_in_range(seed, min_radius, max_radius)
+        and seed.get("relative_error", math.inf) <= max_error
+        and seed.get("coverage", 0.0) >= min_coverage
+    ):
+        fallback = seed.copy()
+        fallback.setdefault("arc_segments", [np.asarray(seed["points"], np.float64)])
+        fallback.setdefault("total_supported_coverage", fallback["coverage"])
+        fallback.setdefault("largest_segment_coverage", fallback["coverage"])
+        fallback.setdefault("segment_count", 1)
+        fallback.setdefault("supported_fraction", 1.0)
+        fallback.setdefault("support_count", len(fallback["points"]))
+        if horizon is not None:
+            margin = max(2.0, HORIZON_EXCLUSION_RADIUS * fallback["equivalent_radius"])
+            if not np.all(points_on_visible_side(fallback["points"], horizon, margin)):
+                fallback = None
+'''
+          new = '''    fallback = None
+    if (
+        horizon is None
+        and axes_in_range(seed, min_radius, max_radius)
+        and seed.get("relative_error", math.inf) <= max_error
+        and seed.get("coverage", 0.0) >= min_coverage
+    ):
+        # Keep the established non-horizon short-arc fallback for regression
+        # stability.  Horizon mode intentionally has no raw-seed fallback: every
+        # accepted horizon-clipped candidate must be rebuilt from explicitly
+        # visible-side support recovered by ``grow_arc_support``.
+        fallback = seed.copy()
+        fallback.setdefault("arc_segments", [np.asarray(seed["points"], np.float64)])
+        fallback.setdefault("total_supported_coverage", fallback["coverage"])
+        fallback.setdefault("largest_segment_coverage", fallback["coverage"])
+        fallback.setdefault("segment_count", 1)
+        fallback.setdefault("supported_fraction", 1.0)
+        fallback.setdefault("support_count", len(fallback["points"]))
+'''
+          if source.count(old) != 1:
+              raise SystemExit('fallback patch anchor mismatch')
+          source = source.replace(old, new, 1)
+
+          old = '''            fraction, visible_pixels = visible_fraction(light_mask, candidate, dark)
+'''
+          new = '''            fraction, visible_pixels = visible_fraction(
+                light_mask,
+                candidate,
+                dark,
+                horizon=horizon,
+            )
+'''
+          if source.count(old) != 1:
+              raise SystemExit('visible fraction call patch anchor mismatch')
+          source = source.replace(old, new, 1)
+
+          path.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Compile and run geometry smoke tests
+        shell: bash
+        run: |
+          python -m py_compile circle_arc_detector.py
+          python - <<'PY'
+          import importlib.util
+          import numpy as np
+          import cv2
+
+          spec = importlib.util.spec_from_file_location('det', 'circle_arc_detector.py')
+          det = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(det)
+
+          # Synthetic horizon-clipped bright disk.  The seed points lie on the
+          # horizon itself so horizon mode must recover curved visible support
+          # without depending on raw seed overlap.
+          size = 260
+          center = (130.0, 130.0)
+          radius = 72.0
+          mask = np.zeros((size, size), np.uint8)
+          cv2.circle(mask, (130, 130), 72, 255, -1)
+          mask[150:, :] = 0
+
+          horizon = {
+              'normal': (0.0, 1.0),
+              'c': -150.0,
+              'visible_sign': -1.0,
+          }
+          seed_points = np.column_stack((
+              np.linspace(95, 165, 18),
+              np.full(18, 150.0),
+          ))
+          seed = {
+              'center': center,
+              'major': radius,
+              'minor': radius,
+              'angle': 0.0,
+              'equivalent_radius': radius,
+              'points': seed_points,
+              'coverage': 0.10,
+              'relative_error': 0.05,
+          }
+          support = det.grow_arc_support(mask, seed, horizon=horizon)
+          assert support is not None, 'horizon-clipped support was rejected'
+          margin = max(2.0, det.HORIZON_EXCLUSION_RADIUS * radius)
+          assert np.all(
+              det.points_on_visible_side(support['points'], horizon, margin)
+          ), 'support leaked into the horizon-dark half-plane'
+          expected_coverage = support['support_count'] / det.ARC_GROW_SAMPLES
+          assert abs(support['coverage'] - expected_coverage) < 1e-12, (
+              'bridged gap bins were counted as observed coverage'
+          )
+          assert support['largest_segment_coverage'] <= support['coverage'] + 1e-12
+
+          # visible_fraction must ignore the dark half-plane rather than penalize
+          # the light candidate for physically occluded pixels.
+          ellipse = {
+              'center': center,
+              'major': radius,
+              'minor': radius,
+              'angle': 0.0,
+              'equivalent_radius': radius,
+          }
+          fraction, count = det.visible_fraction(mask, ellipse, horizon=horizon)
+          assert count > 0
+          assert fraction > 0.85, fraction
+          print('horizon support smoke tests passed')
+          PY
+
+      - name: Materialize exact patched source for local regression
+        shell: bash
+        run: |
+          rm -rf .debug_parts
+          mkdir .debug_parts
+          python - <<'PY'
+          from pathlib import Path
+          import base64, gzip
+
+          encoded = base64.b64encode(
+              gzip.compress(Path('circle_arc_detector.py').read_bytes(), 9)
+          ).decode('ascii')
+          size = 4000
+          for index, offset in enumerate(range(0, len(encoded), size)):
+              Path(f'.debug_parts/part{index:03d}.txt').write_text(
+                  encoded[offset:offset + size], encoding='ascii'
+              )
+          Path('.debug_parts/count.txt').write_text(
+              str((len(encoded) + size - 1) // size), encoding='ascii'
+          )
+          PY
+
+      - name: Commit patched branch state
+        shell: bash
+        run: |
+          rm -rf __pycache__
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add circle_arc_detector.py .debug_parts
+          git rm -r --ignore-unmatch __pycache__
+          git commit -m 'Fix horizon-clipped multi-arc support'
+          git push origin HEAD:debug/preview-horizon-multiarc
