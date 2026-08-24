@@ -18,6 +18,7 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import re
+          import textwrap
 
           path = Path('circle_arc_detector.py')
           text = path.read_text()
@@ -27,26 +28,26 @@ jobs:
               r"\s+palette_size=20\):.*?\n\n\n# ---------------------------------------------------------------------------\n# Tkinter UI",
               re.S,
           )
-          replacement = r'''def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radius,
-                                max_error, min_coverage, max_contours, max_points,
-                                palette_size=20):
+          replacement = textwrap.dedent(r'''
+          def auto_select_threshold(color_image, fallback_threshold, min_radius, max_radius,
+                                    max_error, min_coverage, max_contours, max_points,
+                                    palette_size=20):
               """Choose a fast, robust per-image starting threshold.
 
-              The first pass uses the lowest credible adaptive brightness/color hint.
-              That conservative value is enough for the normal partial-eclipse,
-              totality, and full-Sun regression groups.  Extra work is reserved for
-              genuinely difficult frames: a non-dominant dark-only result, a very
-              weak single ellipse, or no ellipse at all.
+              Use the lowest credible adaptive brightness/color hint first.  That
+              conservative value handles the normal partial-eclipse, totality and
+              full-Sun cases cheaply.  Extra work is reserved for difficult frames:
+              non-dominant dark-only, weak single-ellipse, or no-ellipse results.
 
-              Difficult frames first test the narrow neighborhood around the legacy
-              fallback (normally 6..10 around T=8) at normal preview resolution.
-              This is deliberate: late-sunset images can change from dark-only to
-              both ellipses after a one-level threshold change.  If that neighborhood
-              still does not give a convincing result, only the strongest remaining
-              adaptive hints are verified at preview resolution.
+              Difficult frames verify the narrow neighborhood around the legacy
+              fallback (normally T=6..10 around T=8) at normal preview resolution.
+              Late-sunset frames can change result after a one-level threshold move,
+              so this neighborhood is intentionally contiguous.  Only if it fails
+              are the strongest remaining adaptive hints preview-verified.
               """
-              working, auto_scale = resize_for_detection(color_image, AUTO_THRESHOLD_MAX_DIM)
-              gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+              working, auto_scale = resize_for_detection(
+                  color_image, AUTO_THRESHOLD_MAX_DIM
+              )
               solar_hint = adaptive_solar_hint(working)
 
               hints = sorted({
@@ -90,7 +91,9 @@ jobs:
                       solar_hint=hint,
                       expected_radius=expected_radius,
                   )
-                  score -= 0.0005 * abs(int(threshold) - int(fallback_threshold))
+                  score -= 0.0005 * abs(
+                      int(threshold) - int(fallback_threshold)
+                  )
                   return ellipses, horizon, score
 
               def light_near_hint(ellipses, hint, expected_radius):
@@ -98,8 +101,11 @@ jobs:
                   if center is None:
                       return True
                   light = next(
-                      (ellipse for ellipse in ellipses
-                       if ellipse.get("class") == "above threshold"),
+                      (
+                          ellipse
+                          for ellipse in ellipses
+                          if ellipse.get("class") == "above threshold"
+                      ),
                       None,
                   )
                   if light is None:
@@ -114,23 +120,33 @@ jobs:
 
               def result_kind(ellipses, expected_radius, hint):
                   dark = next(
-                      (ellipse for ellipse in ellipses
-                       if ellipse.get("class") == "below threshold"),
+                      (
+                          ellipse
+                          for ellipse in ellipses
+                          if ellipse.get("class") == "below threshold"
+                      ),
                       None,
                   )
                   light = next(
-                      (ellipse for ellipse in ellipses
-                       if ellipse.get("class") == "above threshold"),
+                      (
+                          ellipse
+                          for ellipse in ellipses
+                          if ellipse.get("class") == "above threshold"
+                      ),
                       None,
                   )
                   if dark is not None and light is not None:
-                      if light_near_hint(ellipses, hint, expected_radius):
-                          return "both"
-                      return "weak"
+                      return (
+                          "both"
+                          if light_near_hint(ellipses, hint, expected_radius)
+                          else "weak"
+                      )
                   if dark is not None:
-                      if dark.get("coverage", 0.0) >= DARK_DOMINANT_COVERAGE:
-                          return "dominant_dark"
-                      return "weak"
+                      return (
+                          "dominant_dark"
+                          if dark.get("coverage", 0.0) >= DARK_DOMINANT_COVERAGE
+                          else "weak"
+                      )
                   if light is not None:
                       if (
                           light.get("coverage", 0.0) >= max(0.20, min_coverage)
@@ -140,7 +156,7 @@ jobs:
                       return "weak"
                   return "none"
 
-              primary_ellipses, primary_horizon, primary_score = run_detection(
+              primary_ellipses, _, primary_score = run_detection(
                   working,
                   primary,
                   auto_scale,
@@ -156,9 +172,6 @@ jobs:
               if primary_kind in ("both", "dominant_dark", "light"):
                   return int(primary)
 
-              # Difficult-case verification uses the same resolution as the GUI's
-              # Refresh Preview, so the automatically selected threshold matches the
-              # geometry the user actually sees rather than a 600-pixel proxy.
               preview_image, preview_scale = resize_for_detection(
                   color_image,
                   PREVIEW_MAX_DIM,
@@ -183,12 +196,11 @@ jobs:
 
               best_threshold = int(primary)
               best_score = float(primary_score)
-              best_kind = primary_kind
 
-              # Use the normal search caps here.  Tight contour/point caps were
-              # specifically found to miss T=6/T=7 sunset solutions.
+              # Normal search caps are intentional here: reduced contour/point
+              # caps were observed to miss legitimate T=6/T=7 sunset limbs.
               for threshold in low_order:
-                  ellipses, horizon, score = run_detection(
+                  ellipses, _, score = run_detection(
                       preview_image,
                       threshold,
                       preview_scale,
@@ -204,18 +216,14 @@ jobs:
                   if score > best_score:
                       best_threshold = int(threshold)
                       best_score = score
-                      best_kind = kind
-                  # A physically located two-ellipse result is the strongest
-                  # useful outcome for a partial eclipse; stop immediately.
                   if kind == "both":
                       return int(threshold)
 
-              # Rank the remaining adaptive hints cheaply, then verify only the
-              # best two at normal preview resolution.
               adaptive_pool = set(hints)
               for hint in list(hints):
                   adaptive_pool.update(
-                      value for value in (hint - 1, hint + 1)
+                      value
+                      for value in (hint - 1, hint + 1)
                       if 0 <= value <= 255
                   )
               adaptive_pool.difference_update(low_order)
@@ -235,7 +243,7 @@ jobs:
               ranked.sort(reverse=True)
 
               for _, threshold in ranked[:2]:
-                  ellipses, horizon, score = run_detection(
+                  ellipses, _, score = run_detection(
                       preview_image,
                       threshold,
                       preview_scale,
@@ -251,34 +259,43 @@ jobs:
                   if score > best_score:
                       best_threshold = int(threshold)
                       best_score = score
-                      best_kind = kind
                   if kind == "both":
                       return int(threshold)
 
               return int(best_threshold)
 
 
-# ---------------------------------------------------------------------------
-# Tkinter UI'''
-          new_text, count = pattern.subn(replacement, text)
+          # ---------------------------------------------------------------------------
+          # Tkinter UI
+          ''').strip()
+
+          new_text, count = pattern.subn(lambda _match: replacement, text)
           if count != 1:
-              raise SystemExit(f'auto_select_threshold replacement count={count}')
-          path.write_text(new_text)
+              raise SystemExit(
+                  f'auto_select_threshold replacement count={count}'
+              )
+          path.write_text(new_text + ('\n' if not new_text.endswith('\n') else ''))
           PY
           python -m py_compile circle_arc_detector.py
           python - <<'PY'
           import ast
           from pathlib import Path
+
           tree = ast.parse(Path('circle_arc_detector.py').read_text())
-          names = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+          names = {
+              node.name
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+          }
           required = {'auto_select_threshold', 'detect', 'DetectorApp'}
           missing = required - names
           if missing:
               raise SystemExit(f'missing: {sorted(missing)}')
           PY
           rm -f .debug_source_export.txt
-          rm -f .github/workflows/export_debug_source.yml
-          rm -f .github/workflows/finalize_auto_threshold.yml
+          rm -f .trigger_*
+          rm -rf __pycache__
+          rm -rf .github
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
