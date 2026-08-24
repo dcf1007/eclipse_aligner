@@ -1,3 +1,4 @@
+# second push intentionally triggers this already-installed workflow
 name: Refactor quick threshold selection
 on:
   push:
