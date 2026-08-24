@@ -608,7 +608,7 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
     grayscale_preview = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     arc_color = (255, 0, 255)
     dark_ellipse_color = (255, 0, 0)
-    light_ellipse_color = (0, 255, 255)
+    light_ellipse_color = (0, 190, 255)
 
     for ellipse in ellipses:
         cx, cy = ellipse["center"]
@@ -620,7 +620,7 @@ def process_image(gray, threshold, min_radius, max_radius, max_error, min_covera
         if len(support) >= 2:
             cv2.polylines(threshold_preview, [support], False, arc_color, 2, cv2.LINE_AA)
 
-        cv2.ellipse(threshold_preview, center, axes, ellipse["angle"], 0, 360, ellipse_color, 2, cv2.LINE_AA)
+        cv2.ellipse(threshold_preview, center, axes, ellipse["angle"], 0, 360, ellipse_color, 3, cv2.LINE_AA)
         cv2.circle(threshold_preview, center, 3, ellipse_color, -1)
 
         kind = "DARK <= T" if ellipse["class"] == "below threshold" else "BRIGHT > T"
