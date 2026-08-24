@@ -1,5 +1,0 @@
-visible_signature=1
-seed_comment=1
-coverage_vars=1
-fallback=1
-visible_call=1
