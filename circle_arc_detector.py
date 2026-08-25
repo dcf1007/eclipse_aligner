@@ -82,6 +82,15 @@ INTERMEDIATE_MAX_FACTOR = 1.35
 PREVIEW_MAX_DIM = 2400
 AUTO_THRESHOLD_MAX_DIM = 600
 
+# Automatic thresholding first isolates the solar connected component, then
+# probes only a few nearby thresholds with a cheap ellipse fit.  These values
+# intentionally describe "clear separation", not final detector acceptance.
+AUTO_THRESHOLD_COMPONENT_DOMINANCE = 0.995
+AUTO_THRESHOLD_COMPONENT_MIN_FRACTION = 0.0002
+AUTO_THRESHOLD_FIT_MIN_CONTAINMENT = 0.9885
+AUTO_THRESHOLD_FIT_SCORE_RATIO = 1.10
+AUTO_THRESHOLD_FIT_PROBE_OFFSETS = (0, 2, 4, 6, 8)
+
 # Horizon geometry validation.  The raster threshold remains authoritative.
 HORIZON_EXCLUSION_RADIUS = 0.012
 
@@ -2418,33 +2427,230 @@ def build_threshold_candidates(gray, bgr=None, max_colors=20, fallback=8):
     return sorted(set(int(v) for v in selected))[:max_colors]
 
 
-def auto_select_threshold(color_image, fallback_threshold):
-    """Return a quick orientative per-image threshold estimate.
+def _auto_threshold_component_is_clear(component, light_mask):
+    """Whether the hinted bright component is cleanly separated from background."""
+    if component is None or component["touches_border"]:
+        return False
+    bright_pixels = int(np.count_nonzero(light_mask))
+    if bright_pixels <= 0:
+        return False
+    dominance = component["area"] / bright_pixels
+    area_fraction = component["area"] / max(light_mask.size, 1)
+    return (
+        dominance >= AUTO_THRESHOLD_COMPONENT_DOMINANCE
+        and area_fraction >= AUTO_THRESHOLD_COMPONENT_MIN_FRACTION
+    )
 
-    Automatic initialization is deliberately cheap.  It downsizes the image,
-    derives warm/bright solar evidence plus local grayscale/Otsu hints, and uses
-    the lowest credible adaptive hint as a conservative starting threshold.
 
-    This function performs no contour search, ellipse fitting, arc recovery,
-    horizon detection, morphology, or multi-threshold detector scoring.  The
-    normal Refresh Preview pass is the first real detector run; the threshold is
-    then explicitly stored per image and remains available for manual fine tuning.
+def _auto_threshold_component_containment(component_mask, ellipse):
+    """Fraction of the solar component inside an ellipse with 2-pixel tolerance."""
+    ys, xs = np.nonzero(component_mask)
+    if len(xs) == 0:
+        return 0.0
+    expanded = ellipse.copy()
+    expanded["major"] += 2.0
+    expanded["minor"] += 2.0
+    return float(np.mean(ellipse_inside(xs, ys, expanded)))
+
+
+def _auto_threshold_fast_light_fit(light_mask, component, settings):
+    """Score a cheap light-limb fit without running the full detector.
+
+    Only real contour points from the detached solar component are used as fit
+    seeds.  Each candidate is still evaluated against the untouched threshold
+    mask by ``evaluate_region``.  No horizon search or 360-degree arc growth is
+    performed here; this is only a threshold-quality probe.
+    """
+    contours, _ = cv2.findContours(
+        component["mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    points = contour.reshape(-1, 2).astype(np.float64, copy=False)
+    if len(points) < 12:
+        return None
+
+    # Bound initialization cost. Uniform sampling preserves the complete contour
+    # topology while making the number of fitted windows independent of image size.
+    if len(points) > 240:
+        indices = np.linspace(0, len(points) - 1, 240, dtype=np.int32)
+        points = points[indices]
+
+    point_count = len(points)
+    extended = np.vstack((points, points))
+    lengths = sorted({
+        max(12, min(point_count, int(round(point_count * fraction))))
+        for fraction in (0.12, 0.18, 0.25, 0.35, 0.50, 0.70)
+    })
+    starts = np.unique(np.linspace(
+        0,
+        point_count - 1,
+        min(18, max(6, point_count // 12)),
+        dtype=np.int32,
+    ))
+
+    best = None
+    for length in lengths:
+        for start in starts:
+            candidate = evaluate_region(
+                extended,
+                point_count,
+                int(start),
+                int(length),
+                light_mask,
+                settings,
+            )
+            if candidate is None or not axes_in_range(candidate, settings):
+                continue
+
+            containment = _auto_threshold_component_containment(
+                component["mask"], candidate
+            )
+            if containment < AUTO_THRESHOLD_FIT_MIN_CONTAINMENT:
+                continue
+
+            # A threshold is better when the same small residual explains more
+            # of the limb. This suppresses tiny, locally excellent short-arc fits.
+            coverage = max(
+                candidate["coverage"], settings.min_coverage, 1e-6
+            )
+            fit_score = candidate["relative_error"] / coverage
+            item = (fit_score, candidate, containment)
+            if best is None or item[0] < best[0]:
+                best = item
+    return best
+
+
+def auto_select_threshold(
+    color_image,
+    fallback_threshold,
+    min_radius,
+    max_radius,
+    max_error,
+    min_coverage,
+):
+    """Choose the lowest threshold with clean component separation and limb fit.
+
+    The previous color/histogram estimate is retained as a cheap *upper anchor*.
+    From that known-plausible level we walk downward through the same contiguous
+    detached-component basin, avoiding transient low-threshold islands that a
+    blind 0-up scan can stop on.  A handful of thresholds near the basin floor
+    are then compared with a fast real-contour ellipse probe.
+
+    If no credible light ellipse exists (for example during totality), the
+    detached-component floor is returned.  The normal Preview remains the first
+    authoritative detector pass and can still be adjusted manually.
     """
     fallback = int(np.clip(fallback_threshold, 0, 255))
     if color_image is None or color_image.size == 0:
-        return accepted_seed
+        return fallback
 
-    working, _ = resize_for_detection(color_image, AUTO_THRESHOLD_MAX_DIM)
+    working, scale = resize_for_detection(color_image, AUTO_THRESHOLD_MAX_DIM)
+    gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
     solar_hint = adaptive_solar_hint(working)
     hints = sorted({
         int(np.clip(value, 0, 255))
         for value in solar_hint.get("threshold_hints", [])
         if 0 < int(value) < 255
     })
+    anchor = int(hints[0]) if hints else fallback
 
-    # The lowest credible adaptive hint is intentionally conservative.  It is an
-    # orientation only, not an attempt to optimize detection automatically.
-    return int(hints[0]) if hints else fallback
+    center = solar_hint.get("center")
+    if center is None:
+        y, x = np.unravel_index(int(np.argmax(gray)), gray.shape)
+        center = (float(x), float(y))
+
+    settings = DetectionSettings(
+        min_radius=max(1.0, float(min_radius) * scale),
+        max_radius=max(1.0, float(max_radius) * scale),
+        max_error=float(max_error),
+        min_coverage=float(min_coverage),
+        max_contours=20,
+        max_search_points=240,
+        morphology=False,
+        outer_limb_assistance=False,
+    )
+    if settings.max_radius < settings.min_radius:
+        settings = DetectionSettings(
+            min_radius=settings.min_radius,
+            max_radius=settings.min_radius,
+            max_error=settings.max_error,
+            min_coverage=settings.min_coverage,
+            max_contours=settings.max_contours,
+            max_search_points=settings.max_search_points,
+        )
+
+    states = {}
+
+    def threshold_state(value):
+        value = int(np.clip(value, 0, 255))
+        if value not in states:
+            _, light_mask = cv2.threshold(
+                gray, value, 255, cv2.THRESH_BINARY
+            )
+            component = component_for_hint(light_mask, center)
+            states[value] = (light_mask, component)
+        return states[value]
+
+    # The old estimate is normally already in a detached regime. If not, allow a
+    # small upward rescue before falling back to the old estimate unchanged.
+    clear_anchor = anchor
+    if not _auto_threshold_component_is_clear(
+        threshold_state(clear_anchor)[1], threshold_state(clear_anchor)[0]
+    ):
+        rescued = None
+        for value in range(anchor + 1, min(255, anchor + 32) + 1):
+            light_mask, component = threshold_state(value)
+            if _auto_threshold_component_is_clear(component, light_mask):
+                rescued = value
+                break
+        if rescued is None:
+            return anchor
+        clear_anchor = rescued
+
+    # Descending from a known-good threshold chooses the bottom of *this stable
+    # basin*, unlike a 0-up search which can stop at an unrelated transient island.
+    component_floor = clear_anchor
+    for value in range(clear_anchor - 1, -1, -1):
+        light_mask, component = threshold_state(value)
+        if not _auto_threshold_component_is_clear(component, light_mask):
+            break
+        component_floor = value
+
+    # Coarse probes are enough because component topology already bounded the
+    # useful range.  The winning probe is refined by one grayscale level each side.
+    fits = {}
+    for offset in AUTO_THRESHOLD_FIT_PROBE_OFFSETS:
+        value = component_floor + offset
+        if value > clear_anchor:
+            continue
+        light_mask, component = threshold_state(value)
+        fits[value] = _auto_threshold_fast_light_fit(
+            light_mask, component, settings
+        )
+
+    good = {value: fit for value, fit in fits.items() if fit is not None}
+    if not good:
+        return int(component_floor)
+
+    coarse_best = min(good, key=lambda value: good[value][0])
+    for value in (coarse_best - 1, coarse_best + 1):
+        if not component_floor <= value <= clear_anchor or value in fits:
+            continue
+        light_mask, component = threshold_state(value)
+        fits[value] = _auto_threshold_fast_light_fit(
+            light_mask, component, settings
+        )
+
+    good = {value: fit for value, fit in fits.items() if fit is not None}
+    best_score = min(fit[0] for fit in good.values())
+    acceptable = [
+        value for value, fit in good.items()
+        if fit[0] <= best_score * AUTO_THRESHOLD_FIT_SCORE_RATIO
+    ]
+    return int(min(acceptable))
 
 
 # ---------------------------------------------------------------------------
@@ -2622,6 +2828,10 @@ class DetectorApp:
         threshold = auto_select_threshold(
             self.color_image,
             defaults["threshold"],
+            defaults["min_radius"],
+            defaults["max_radius"],
+            defaults["max_error"],
+            defaults["min_coverage"],
         )
         self.image_overrides[self.current_path] = {"threshold": int(threshold)}
 
