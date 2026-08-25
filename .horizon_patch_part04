@@ -1,0 +1,146 @@
+ndary.  A provisional light ellipse far from the warm/bright Sun is not
+-    # allowed to steer horizon detection to an unrelated skyline edge.
+-    solar_hint = adaptive_solar_hint(color_image) if color_image is not None else None
+-    horizon_reference = provisional_light
+-    if solar_hint is not None and solar_hint.get("center") is not None:
+-        expected_radius = 0.5 * (min_radius + max_radius)
+-        if horizon_reference is not None:
+-            distance = math.hypot(
+-                horizon_reference["center"][0] - solar_hint["center"][0],
+-                horizon_reference["center"][1] - solar_hint["center"][1],
++        geometry = horizon_geometry_score(
++            light_mask,
++            proposal,
++            proposal_light,
++            proposal_dark,
++        )
++        if geometry is not None or proposal_is_sunset_fallback(proposal):
++            horizon = proposal.copy()
++            horizon["geometry_score"] = float(geometry[0]) if geometry else 0.0
++            horizon["chord_transition"] = (
++                float(geometry[1]) if geometry else float(proposal["transition"])
+             )
+-            if distance > 1.25 * expected_radius:
+-                horizon_reference = None
+-
+-    # Under the geometric chord rule a color-only solar hint is insufficient to
+-    # declare a horizon: there must be an actual provisional light ellipse whose
+-    # boundary supplies the required chord endpoints.
+-    horizon = detect_horizon(
+-        light_mask,
+-        horizon_reference,
+-        provisional_dark=provisional_dark,
+-    )
++            horizon["visible_light_fraction"] = float(proposal["bright_fraction"])
++            horizon["local_light_contrast"] = float(proposal["transition"])
++            horizon_dark_candidates = proposal_dark
++            horizon_light_candidates = proposal_light
++            break
+ 
+-    # Once a horizon is accepted, both classes are re-grown with the half-plane
+-    # constraint so no support survives on the physically dark side.
+     if horizon is None:
+-        dark_candidates = provisional_dark_candidates
+-        light_candidates = provisional_light_candidates
+-    else:
++        # Ordinary no-horizon path remains unchanged, including optional morphology
++        # and outer-limb assistance.
++        dark_seeds = find_candidates(
++            dark_mask,
++            min_radius,
++            max_radius,
++            max_error,
++            min_coverage,
++            max_contours,
++            max_points,
++            morphology=morphology,
++            outer_limb_assistance=outer_limb_assistance,
++        )
++        light_seeds = find_candidates(
++            light_mask,
++            min_radius,
++            max_radius,
++            max_error,
++            min_coverage,
++            max_contours,
++            max_points,
++            morphology=morphology,
++            outer_limb_assistance=outer_limb_assistance,
++        )
+         dark_candidates = prepare_candidates(
+             dark_mask,
+             dark_seeds,
+@@ -1573,7 +2090,7 @@
+             max_radius,
+             max_error,
+             min_coverage,
+-            horizon=horizon,
++            horizon=None,
+         )
+         light_candidates = prepare_candidates(
+             light_mask,
+@@ -1582,15 +2099,61 @@
+             max_radius,
+             max_error,
+             min_coverage,
+-            horizon=horizon,
++            horizon=None,
+         )
++    else:
++        # Re-grow from line-excluded seeds with the confirmed visible half-plane.
++        # This enforces both user requirements: no horizon-as-magenta-arc leakage,
++        # and no ellipse support on the dark side of the green line.
++        dark_candidates = []
++        for seed in horizon_dark_candidates[:MAX_CLASS_CANDIDATES]:
++            candidate = grow_candidate(
++                dark_mask,
++                seed,
++                min_radius,
++                max_radius,
++                max_error,
++                min_coverage,
++                horizon=horizon,
++            )
++            if candidate is not None and not any(
++                same_ellipse(candidate, old, 0.08, 0.08, 12.0)
++                for old in dark_candidates
++            ):
++                dark_candidates.append(candidate)
++        light_candidates = []
++        for seed in horizon_light_candidates[:MAX_CLASS_CANDIDATES]:
++            candidate = grow_candidate(
++                light_mask,
++                seed,
++                min_radius,
++                max_radius,
++                max_error,
++                min_coverage,
++                horizon=horizon,
++            )
++            if candidate is not None and not any(
++                same_ellipse(candidate, old, 0.08, 0.08, 12.0)
++                for old in light_candidates
++            ):
++                light_candidates.append(candidate)
++        for candidates in (dark_candidates, light_candidates):
++            candidates.sort(
++                key=lambda item: (
++                    item["coverage"],
++                    item.get("largest_segment_coverage", 0.0),
++                    item.get("supported_fraction", 1.0),
++                    item.get("boundary_polarity", 0.0),
++                    -item["relative_error"],
++                ),
++                reverse=True,
++            )
+ 
+     dark = dark_candidates[0].copy() if dark_candidates else None
+     if dark is not None:
+         dark["class"] = "below threshold"
+ 
+-    # Preserve the established totality safeguard for now.  The user explicitly
+-    # requested that this remain unchanged rather than become configurable yet.
++    # Preserve the established totality safeguard.
+     if dark is not None and dark["coverage"] >= DARK_DOMINANT_COVERAGE:
+         return light_mask, [dark], horizon
+ 
