@@ -1,0 +1,33 @@
+name: Apply recovered threshold palette behavior
+
+on:
+  push:
+    branches:
+      - refactor/cleanup-performance
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/cleanup-performance
+          fetch-depth: 0
+      - name: Apply recovered palette patch
+        run: |
+          git apply --check .chatgpt_palette_recovery.patch
+          git apply .chatgpt_palette_recovery.patch
+          python -m py_compile circle_arc_detector.py
+          test "$(git hash-object circle_arc_detector.py)" = "39be52b3c0e30788ca957551fd8be4a60fb1ada0"
+      - name: Commit recovered detector and remove transport files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add circle_arc_detector.py
+          git rm .chatgpt_palette_recovery.patch .github/workflows/chatgpt-palette-recovery.yml
+          git commit -m "Restore tested threshold palette reservation"
+          git push origin HEAD:refactor/cleanup-performance
