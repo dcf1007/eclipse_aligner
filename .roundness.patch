@@ -1,0 +1,157 @@
+--- a/circle_arc_detector.py
++++ b/circle_arc_detector.py
+@@ -64,6 +64,13 @@
+ ARC_GROW_SAMPLES = 720
+ DARK_DOMINANT_COVERAGE = 0.55
+ 
++# Prefer the simplest/roundest geometric model unless the extra ellipse degrees
++# of freedom produce a materially better normalized radial fit on the *same*
++# support points.  This stabilizes short or noisy eclipse arcs, which can make a
++# free ellipse look more eccentric than the physical limb really is.
++ROUNDNESS_MIN_ABS_ERROR_IMPROVEMENT = 0.0015
++ROUNDNESS_MIN_REL_ERROR_IMPROVEMENT = 0.10
++
+ # Intermediate ellipse hypotheses are deliberately allowed outside the strict
+ # final user range.  Final candidates must still pass the exact selected limits.
+ INTERMEDIATE_MIN_FACTOR = 0.65
+@@ -240,13 +247,22 @@
+ 
+ 
+ def fit_ellipse_options(points):
+-    """Try Direct, AMS, standard OpenCV ellipse fits plus a circle prior."""
++    """Return a circle-constrained fit first, then free ellipse fits.
++
++    The circle is deliberately evaluated first.  Model selection later compares
++    all fits on the same support points and keeps the rounder one unless the extra
++    ellipse degrees of freedom improve normalized radial residual significantly.
++    """
+     points = np.asarray(points, np.float32)
+     if len(points) < 5:
+         return []
+ 
+-    shaped = points.reshape(-1, 1, 2)
+     options = []
++    circle = fit_circle_prior(points)
++    if circle is not None:
++        options.append(circle)
++
++    shaped = points.reshape(-1, 1, 2)
+     for fitter in (cv2.fitEllipseDirect, cv2.fitEllipseAMS, cv2.fitEllipse):
+         try:
+             ellipse = normalize_ellipse(fitter(shaped))
+@@ -254,13 +270,58 @@
+             ellipse = None
+         if ellipse is not None:
+             options.append(ellipse)
+-
+-    circle = fit_circle_prior(points)
+-    if circle is not None:
+-        options.append(circle)
+     return options
+ 
+ 
++def ellipse_eccentricity_fraction(ellipse):
++    """Simple 0..1 eccentricity proxy used only for model preference."""
++    return max(
++        0.0,
++        1.0 - ellipse["minor"] / max(ellipse["major"], 1e-9),
++    )
++
++
++def fit_improvement_is_significant(baseline_error, improved_error):
++    """Whether a more flexible model materially improves radial residual."""
++    if not (np.isfinite(baseline_error) and np.isfinite(improved_error)):
++        return False
++    improvement = baseline_error - improved_error
++    required = max(
++        ROUNDNESS_MIN_ABS_ERROR_IMPROVEMENT,
++        ROUNDNESS_MIN_REL_ERROR_IMPROVEMENT * max(baseline_error, 0.0),
++    )
++    return improvement > required
++
++
++def prefer_rounder_fit(candidates):
++    """Choose the roundest fit whose residual is effectively best.
++
++    ``candidates`` must describe fits evaluated on the same support points and
++    contain ``relative_error``.  First find the lowest residual.  Any candidate
++    for which that best residual is *not* a significant improvement is considered
++    statistically equivalent for this detector, and the roundest equivalent model
++    wins.  Existing detector score is used only as a final tie-breaker.
++    """
++    if not candidates:
++        return None
++
++    best_error = min(item["relative_error"] for item in candidates)
++    equivalent = [
++        item for item in candidates
++        if not fit_improvement_is_significant(
++            item["relative_error"], best_error
++        )
++    ]
++    return min(
++        equivalent,
++        key=lambda item: (
++            ellipse_eccentricity_fraction(item),
++            item["relative_error"],
++            -item.get("score", 0.0),
++        ),
++    )
++
++
+ def ellipse_coordinates(points, ellipse):
+     """Convert image points into normalized coordinates of a rotated ellipse."""
+     points = np.asarray(points, np.float64)
+@@ -379,7 +440,7 @@
+ 
+     start %= point_count
+     region = extended_points[start:start + length]
+-    best = None
++    valid_candidates = []
+ 
+     for ellipse in fit_ellipse_options(region):
+         if not axes_in_intermediate_range(ellipse, min_radius, max_radius):
+@@ -429,9 +490,9 @@
+         candidate["interior_fraction"] = inside_fraction
+         candidate["score"] = geometry_score * polarity**2
+ 
+-        if best is None or candidate["score"] > best["score"]:
+-            best = candidate
+-    return best
++        valid_candidates.append(candidate)
++
++    return prefer_rounder_fit(valid_candidates)
+ 
+ 
+ def refine_region(candidate, extended_points, point_count, minimum_length,
+@@ -1870,7 +1931,7 @@
+     if support is None:
+         return fallback
+ 
+-    best = None
++    grown_candidates = []
+     for ellipse in fit_ellipse_options(support["points"]):
+         # Exact user axis limits are imposed here, after all disconnected support
+         # available to the model has been gathered.
+@@ -1919,18 +1980,9 @@
+         if candidate["coverage"] < min_coverage:
+             continue
+ 
+-        if best is None or (
+-            candidate["coverage"],
+-            candidate["largest_segment_coverage"],
+-            candidate["score"],
+-            candidate["support_count"],
+-        ) > (
+-            best["coverage"],
+-            best["largest_segment_coverage"],
+-            best["score"],
+-            best["support_count"],
+-        ):
+-            best = candidate
++        grown_candidates.append(candidate)
++
++    best = prefer_rounder_fit(grown_candidates)
+     return best if best is not None else fallback
+ 
+ 

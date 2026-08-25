@@ -1,0 +1,35 @@
+name: Apply roundness fit preference
+
+on:
+  push:
+    branches:
+      - debug/preview-horizon-multiarc
+    paths:
+      - .roundness-trigger
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: debug/preview-horizon-multiarc
+          fetch-depth: 0
+      - name: Apply and verify tested patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply .roundness.patch
+          PYTHONDONTWRITEBYTECODE=1 python -B -m py_compile circle_arc_detector.py
+          actual="$(git hash-object circle_arc_detector.py)"
+          expected="b7c09714e565280328ac3a2a78c55c1df4a8c23c"
+          test "$actual" = "$expected"
+          rm -f .roundness.patch .roundness-trigger .github/workflows/apply_roundness.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Prefer round fits unless ellipse significantly improves"
+          git push origin HEAD:debug/preview-horizon-multiarc
