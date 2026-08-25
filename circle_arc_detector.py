@@ -39,7 +39,7 @@ Detection overview
    ellipse is centered.  No interpolation is used for that centering operation.
 
 Dependencies:
-    pip install opencv-python numpy
+    pip install opencv-python numpy scipy
 """
 
 import argparse
@@ -53,6 +53,7 @@ from tkinter import filedialog
 
 import cv2
 import numpy as np
+from scipy.optimize import least_squares
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,15 @@ ARC_GROW_SAMPLES = 720
 # free ellipse look more eccentric than the physical limb really is.
 ROUNDNESS_MIN_ABS_ERROR_IMPROVEMENT = 0.0015
 ROUNDNESS_MIN_REL_ERROR_IMPROVEMENT = 0.10
+
+# Final support-point regularization follows the tested fixed-axis-ratio path.
+# Q=major/minor=1 is a circle. Light/Sun regularization also requires the fitted
+# ellipse to contain essentially all of the relevant observed solar component,
+# then prefers the smallest equivalent radius that remains error-equivalent.
+ROUNDNESS_PATH_SAMPLES = 33
+LIGHT_COMPONENT_MIN_CONTAINMENT = 0.99
+LIGHT_COMPONENT_CONTAINMENT_TOLERANCE = 2.0
+LIGHT_SIZE_PATH_SAMPLES = 45
 
 # Intermediate ellipse hypotheses are deliberately allowed outside the strict
 # final user range.  Final candidates must still pass the exact selected limits.
@@ -370,6 +380,329 @@ def ellipse_error_and_coverage(points, ellipse):
     angles = np.unwrap(np.arctan2(y_norm, x_norm))
     coverage = float(np.clip(np.ptp(angles) / (2.0 * np.pi), 0.0, 1.0))
     return relative_error, coverage
+
+
+def ellipse_from_axis_ratio(cx, cy, equivalent_radius, axis_ratio, angle_radians):
+    """Construct an ellipse from equivalent radius and q=major/minor >= 1."""
+    q = max(float(axis_ratio), 1.0)
+    root_q = math.sqrt(q)
+    major = float(equivalent_radius) * root_q
+    minor = float(equivalent_radius) / root_q
+    return {
+        "center": (float(cx), float(cy)),
+        "major": major,
+        "minor": minor,
+        "angle": float(math.degrees(angle_radians) % 180.0),
+        "equivalent_radius": float(equivalent_radius),
+    }
+
+
+def fit_fixed_axis_ratio(points, initial, axis_ratio, settings, image_shape,
+                         max_nfev=120):
+    """Refit center/radius/angle while holding q=major/minor fixed.
+
+    This is the tested continuous path between the circle and free-ellipse models.
+    Exact final semi-axis limits are converted to the equivalent-radius interval
+    for each q, so no path point can violate the user's final radius bounds.
+    """
+    points = np.asarray(points, np.float64)
+    if len(points) < 5:
+        return None
+    q = max(float(axis_ratio), 1.0)
+    root_q = math.sqrt(q)
+    r_low = settings.min_radius * root_q
+    r_high = settings.max_radius / root_q
+    if r_low > r_high + 1e-9:
+        return None
+    if r_high - r_low < 1e-8:
+        return fit_fixed_axis_ratio_radius(
+            points, initial, q, 0.5 * (r_low + r_high), settings,
+            image_shape, max_nfev=max_nfev
+        )
+
+    height, width = image_shape[:2]
+    margin = 1.5 * settings.max_radius
+    cx0, cy0 = initial["center"]
+    r0 = float(np.clip(initial["equivalent_radius"], r_low + 1e-8, r_high - 1e-8))
+    theta0 = math.radians(initial["angle"])
+    x0 = np.array([cx0, cy0, math.log(r0), theta0], np.float64)
+    lower = np.array([
+        -margin, -margin, math.log(r_low), -4.0 * math.pi
+    ], np.float64)
+    upper = np.array([
+        width - 1.0 + margin, height - 1.0 + margin,
+        math.log(r_high), 4.0 * math.pi
+    ], np.float64)
+    x0 = np.clip(x0, lower + 1e-9, upper - 1e-9)
+
+    def residual(parameters):
+        ellipse = ellipse_from_axis_ratio(
+            parameters[0], parameters[1], math.exp(parameters[2]),
+            q, parameters[3]
+        )
+        x_norm, y_norm = ellipse_coordinates(points, ellipse)
+        return np.hypot(x_norm, y_norm) - 1.0
+
+    result = least_squares(
+        residual,
+        x0,
+        bounds=(lower, upper),
+        max_nfev=max_nfev,
+        xtol=1e-9,
+        ftol=1e-9,
+        gtol=1e-9,
+    )
+    ellipse = ellipse_from_axis_ratio(
+        result.x[0], result.x[1], math.exp(result.x[2]), q, result.x[3]
+    )
+    error, _coverage = ellipse_error_and_coverage(points, ellipse)
+    ellipse["relative_error"] = error
+    ellipse["axis_ratio"] = q
+    return ellipse
+
+
+def fit_fixed_axis_ratio_radius(points, initial, axis_ratio, equivalent_radius,
+                                settings, image_shape, max_nfev=100):
+    """Refit only center/angle for a fixed q and equivalent radius."""
+    points = np.asarray(points, np.float64)
+    if len(points) < 5:
+        return None
+    q = max(float(axis_ratio), 1.0)
+    radius = float(equivalent_radius)
+    root_q = math.sqrt(q)
+    major = radius * root_q
+    minor = radius / root_q
+    if not (
+        settings.min_radius <= minor <= settings.max_radius
+        and settings.min_radius <= major <= settings.max_radius
+    ):
+        return None
+
+    height, width = image_shape[:2]
+    margin = 1.5 * settings.max_radius
+    cx0, cy0 = initial["center"]
+    x0 = np.array([cx0, cy0, math.radians(initial["angle"])], np.float64)
+    lower = np.array([-margin, -margin, -4.0 * math.pi], np.float64)
+    upper = np.array([
+        width - 1.0 + margin, height - 1.0 + margin, 4.0 * math.pi
+    ], np.float64)
+    x0 = np.clip(x0, lower + 1e-9, upper - 1e-9)
+
+    def residual(parameters):
+        ellipse = ellipse_from_axis_ratio(
+            parameters[0], parameters[1], radius, q, parameters[2]
+        )
+        x_norm, y_norm = ellipse_coordinates(points, ellipse)
+        return np.hypot(x_norm, y_norm) - 1.0
+
+    result = least_squares(
+        residual,
+        x0,
+        bounds=(lower, upper),
+        max_nfev=max_nfev,
+        xtol=1e-9,
+        ftol=1e-9,
+        gtol=1e-9,
+    )
+    ellipse = ellipse_from_axis_ratio(
+        result.x[0], result.x[1], radius, q, result.x[2]
+    )
+    error, _coverage = ellipse_error_and_coverage(points, ellipse)
+    ellipse["relative_error"] = error
+    ellipse["axis_ratio"] = q
+    return ellipse
+
+
+def relevant_component_points(mask, ellipse):
+    """Return threshold components supported immediately inside the fitted limb.
+
+    This is the support-voting method used in the containment studies. Multiple
+    component labels may be retained when disconnected visible solar stretches
+    belong to the same fitted Sun. Unrelated stars elsewhere in the image do not
+    become containment requirements.
+    """
+    count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
+        (mask != 0).astype(np.uint8), 8
+    )
+    if count <= 1:
+        return None
+    support = np.asarray(ellipse.get("points", []), np.float64)
+    if len(support) < 5:
+        return None
+
+    x_norm, y_norm = ellipse_coordinates(support, ellipse)
+    theta = np.arctan2(y_norm, x_norm)
+    px, py, nx, ny = ellipse_points_and_normals(ellipse, theta)
+    height, width = mask.shape
+    votes = {}
+    for distance in (2.0, 4.0, 7.0):
+        x = np.rint(px - nx * distance).astype(np.int32)
+        y = np.rint(py - ny * distance).astype(np.int32)
+        valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+        for label in labels[y[valid], x[valid]]:
+            label = int(label)
+            if label:
+                votes[label] = votes.get(label, 0) + 1
+    if not votes:
+        return None
+
+    maximum = max(votes.values())
+    chosen = [
+        label for label, vote in votes.items()
+        if vote >= max(3, 0.15 * maximum)
+    ]
+    yy, xx = np.nonzero(np.isin(labels, chosen))
+    if len(xx) == 0:
+        return None
+    return np.column_stack((xx, yy)).astype(np.float64)
+
+
+def component_points_containment(points, ellipse, tolerance=0.0):
+    """Fraction of relevant observed component pixels contained by ``ellipse``."""
+    if points is None or len(points) == 0:
+        return math.nan
+    candidate = ellipse
+    if tolerance > 0:
+        candidate = ellipse.copy()
+        candidate["major"] += tolerance
+        candidate["minor"] += tolerance
+    x_norm, y_norm = ellipse_coordinates(points, candidate)
+    return float(np.mean(np.hypot(x_norm, y_norm) <= 1.0))
+
+
+def regularize_final_ellipse(mask, candidate, settings, image_shape,
+                             light_class=False):
+    """Apply the tested circle-to-ellipse path to final recovered support.
+
+    Candidate discovery/growth remains unchanged. On the final real support
+    points, fit a grid of fixed axis ratios q=major/minor from 1 (circle) through
+    the full feasible ellipse range. Select the roundest q whose residual is not
+    materially worse than the best fit. For the light/Sun class, only path points
+    that contain >=99% of the relevant observed solar component are eligible;
+    after q is selected, search downward for the smallest error-equivalent radius
+    that preserves the same containment requirement.
+    """
+    if candidate is None:
+        return None
+    points = np.asarray(candidate.get("points", []), np.float64)
+    if len(points) < 5:
+        return candidate
+
+    component_points = relevant_component_points(mask, candidate) if light_class else None
+    q_max = settings.max_radius / max(settings.min_radius, 1e-9)
+    q_max = max(1.0, q_max)
+    q_values = np.linspace(1.0, q_max, ROUNDNESS_PATH_SAMPLES)
+
+    path = []
+    previous = candidate
+    for q in q_values:
+        fitted = fit_fixed_axis_ratio(
+            points, previous, q, settings, image_shape, max_nfev=120
+        )
+        if fitted is None:
+            continue
+        previous = fitted
+        if fitted["relative_error"] > settings.max_error:
+            continue
+        containment = math.nan
+        if light_class:
+            containment = component_points_containment(
+                component_points, fitted, LIGHT_COMPONENT_CONTAINMENT_TOLERANCE
+            )
+            if (
+                not np.isfinite(containment)
+                or containment < LIGHT_COMPONENT_MIN_CONTAINMENT
+            ):
+                continue
+        fitted["component_containment"] = containment
+        path.append(fitted)
+
+    # Never suppress a previously valid ellipse solely because regularization
+    # cannot find a better admissible path point.
+    if not path:
+        return candidate
+
+    best = min(path, key=lambda item: item["relative_error"])
+    equivalent = [
+        item for item in path
+        if not fit_improvement_is_significant(
+            item["relative_error"], best["relative_error"]
+        )
+    ]
+    roundest = min(
+        equivalent,
+        key=lambda item: (
+            item["axis_ratio"], item["relative_error"],
+            item["equivalent_radius"]
+        ),
+    )
+    selected = roundest
+
+    if light_class:
+        q = roundest["axis_ratio"]
+        root_q = math.sqrt(q)
+        r_low = settings.min_radius * root_q
+        r_high = min(
+            roundest["equivalent_radius"],
+            settings.max_radius / root_q,
+        )
+        if r_low <= r_high + 1e-9:
+            size_path = []
+            previous_size = roundest
+            for radius in np.linspace(r_low, r_high, LIGHT_SIZE_PATH_SAMPLES):
+                fitted = fit_fixed_axis_ratio_radius(
+                    points, previous_size, q, radius, settings, image_shape,
+                    max_nfev=100
+                )
+                if fitted is None:
+                    continue
+                previous_size = fitted
+                if fitted["relative_error"] > settings.max_error:
+                    continue
+                containment = component_points_containment(
+                    component_points, fitted, LIGHT_COMPONENT_CONTAINMENT_TOLERANCE
+                )
+                if (
+                    not np.isfinite(containment)
+                    or containment < LIGHT_COMPONENT_MIN_CONTAINMENT
+                ):
+                    continue
+                # "Admissible" uses the same significant-improvement test as the
+                # roundness path: the round-selected model must not fit materially
+                # better than this smaller candidate.
+                if fit_improvement_is_significant(
+                    fitted["relative_error"], roundest["relative_error"]
+                ):
+                    continue
+                fitted["component_containment"] = containment
+                size_path.append(fitted)
+            if size_path:
+                selected = min(
+                    size_path,
+                    key=lambda item: (
+                        item["equivalent_radius"], item["relative_error"]
+                    ),
+                )
+
+    # Preserve the actual recovered support/coverage metadata; only the geometric
+    # model is regularized. Recheck final boundary polarity on the authoritative
+    # threshold mask before accepting the changed geometry.
+    result = candidate.copy()
+    for name in (
+        "center", "major", "minor", "angle", "equivalent_radius",
+        "relative_error", "axis_ratio", "component_containment"
+    ):
+        if name in selected:
+            result[name] = selected[name]
+    polarity, _inside_fraction, sample_count = boundary_polarity(mask, result)
+    if sample_count < 5 or polarity < MIN_BOUNDARY_POLARITY:
+        return candidate
+    result["boundary_polarity"] = polarity
+    result["regularized"] = True
+    result["regularized_from_axis_ratio"] = (
+        candidate["major"] / max(candidate["minor"], 1e-9)
+    )
+    return result
 
 
 def boundary_polarity(mask, ellipse):
@@ -2115,6 +2448,17 @@ def detect(gray, threshold, settings, color_image=None, use_horizon=True):
         dark_candidates,
         light_candidates,
         horizon=active_horizon,
+    )
+
+    # Candidate discovery, horizon screening and support recovery above are kept
+    # unchanged. Regularize only the final selected models on those same recovered
+    # support points. Dark/Moon uses the roundness path only; light/Sun additionally
+    # uses component containment and the tested smallest-admissible size path.
+    dark = regularize_final_ellipse(
+        dark_mask, dark, settings, gray.shape, light_class=False
+    )
+    light = regularize_final_ellipse(
+        light_mask, light, settings, gray.shape, light_class=True
     )
     ellipses = [ellipse for ellipse in (dark, light) if ellipse is not None]
     return light_mask, ellipses, detected_horizon
