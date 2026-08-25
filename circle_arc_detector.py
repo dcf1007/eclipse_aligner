@@ -85,6 +85,13 @@ AUTO_THRESHOLD_MAX_DIM = 600
 # Horizon geometry validation.  The raster threshold remains authoritative.
 HORIZON_EXCLUSION_RADIUS = 0.012
 
+# Solar-component guidance margins are expressed in expected solar radii.  They
+# restrict *where candidate evidence is searched*; they never clip the final
+# ellipse, alter the authoritative threshold mask, or relax final validation.
+LIGHT_COMPONENT_GUIDANCE_RADIUS = 0.25
+HORIZON_COMPONENT_GUIDANCE_RADIUS = 0.75
+
+
 # Horizon proposals are found before ellipse fitting. These values express
 # threshold-border quality rather than a minimum horizon length. Straightness is
 # normalized by the sagitta a circular solar limb would have over the same span;
@@ -593,6 +600,105 @@ def morphology_guidance(mask):
     cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, MORPH_KERNEL)
     return cleaned
+
+
+def component_for_hint(mask, center):
+    """Return the threshold component containing ``center`` plus metadata.
+
+    The returned component is a binary uint8 mask in full-image coordinates.
+    Nothing here assumes that the component is a complete Sun: at sunset it may
+    be only a small clipped fragment.  ``touches_border`` is intentionally
+    reported because background-connected components are not safe guidance for
+    automatic thresholding or candidate restriction.
+    """
+    if center is None or mask is None or mask.size == 0:
+        return None
+
+    binary = (mask != 0).astype(np.uint8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    if count <= 1:
+        return None
+
+    height, width = mask.shape
+    x = int(np.clip(round(center[0]), 0, width - 1))
+    y = int(np.clip(round(center[1]), 0, height - 1))
+    label = int(labels[y, x])
+    if label <= 0:
+        return None
+
+    left, top, component_width, component_height, area = map(
+        int, stats[label]
+    )
+    touches_border = (
+        left == 0
+        or top == 0
+        or left + component_width >= width
+        or top + component_height >= height
+    )
+    component = np.where(labels == label, 255, 0).astype(np.uint8)
+    return {
+        "mask": component,
+        "label": label,
+        "bbox": (left, top, component_width, component_height),
+        "area": area,
+        "area_fraction": area / max(mask.size, 1),
+        "centroid": (
+            float(centroids[label, 0]),
+            float(centroids[label, 1]),
+        ),
+        "touches_border": bool(touches_border),
+        "bright_fraction": float(np.count_nonzero(binary)) / max(mask.size, 1),
+        "bright_dominance": area / max(int(np.count_nonzero(binary)), 1),
+    }
+
+
+def dilated_component_mask(component_mask, margin):
+    """Return a rounded distance dilation without inventing physical edges.
+
+    A distance transform is evaluated only in the component bounding box plus
+    the requested margin, avoiding a very large morphology kernel and unnecessary
+    full-frame work.  The ROI is guidance-only: callers must continue to sample
+    and validate against the original threshold/grayscale images.
+    """
+    component = (component_mask != 0).astype(np.uint8)
+    if not np.any(component):
+        return np.zeros_like(component_mask, dtype=np.uint8)
+
+    ys, xs = np.nonzero(component)
+    height, width = component.shape
+    padding = max(0, int(math.ceil(float(margin))))
+    x0 = max(0, int(xs.min()) - padding)
+    x1 = min(width, int(xs.max()) + padding + 1)
+    y0 = max(0, int(ys.min()) - padding)
+    y1 = min(height, int(ys.max()) + padding + 1)
+
+    crop = component[y0:y1, x0:x1]
+    if padding == 0:
+        dilated_crop = crop != 0
+    else:
+        # distanceTransform measures non-zero pixels to the nearest zero.  Making
+        # the observed component zero therefore gives every outside pixel its
+        # Euclidean distance to real solar evidence.
+        outside = np.where(crop != 0, 0, 255).astype(np.uint8)
+        distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
+        dilated_crop = distance <= float(margin)
+
+    result = np.zeros_like(component_mask, dtype=np.uint8)
+    result[y0:y1, x0:x1] = np.where(dilated_crop, 255, 0).astype(np.uint8)
+    return result
+
+
+def component_guidance(mask, center, margin):
+    """Return solar component metadata plus a rounded search-guidance mask."""
+    info = component_for_hint(mask, center)
+    if info is None:
+        return None
+    result = dict(info)
+    result["guidance_mask"] = dilated_component_mask(info["mask"], margin)
+    result["guidance_fraction"] = (
+        float(np.count_nonzero(result["guidance_mask"])) / max(mask.size, 1)
+    )
+    return result
 
 
 def contour_runs_for_horizon(points, horizon, margin, minimum_points,
