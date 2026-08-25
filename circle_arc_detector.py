@@ -82,14 +82,17 @@ INTERMEDIATE_MAX_FACTOR = 1.35
 PREVIEW_MAX_DIM = 2400
 AUTO_THRESHOLD_MAX_DIM = 600
 
-# Automatic thresholding first isolates the solar connected component, then
-# probes only a few nearby thresholds with a cheap ellipse fit.  These values
-# intentionally describe "clear separation", not final detector acceptance.
+# Automatic threshold initialization starts from the existing fast brightness
+# estimate, descends to the bottom of its stable detached-solar-component basin,
+# then performs real light-ellipse fitting only in a short local neighborhood.
+# The component figures are deliberately strict enough to reject background-
+# connected threshold floods while allowing a few unrelated hot/star pixels.
 AUTO_THRESHOLD_COMPONENT_DOMINANCE = 0.995
-AUTO_THRESHOLD_COMPONENT_MIN_FRACTION = 0.0002
-AUTO_THRESHOLD_FIT_MIN_CONTAINMENT = 0.9885
-AUTO_THRESHOLD_FIT_SCORE_RATIO = 1.10
-AUTO_THRESHOLD_FIT_PROBE_OFFSETS = (0, 2, 4, 6, 8)
+AUTO_THRESHOLD_COMPONENT_MIN_AREA = 0.0002
+AUTO_THRESHOLD_FIT_WINDOW = 12
+AUTO_THRESHOLD_LIGHT_CONTAINMENT = 0.9885
+AUTO_THRESHOLD_MAX_CONTOURS = 24
+AUTO_THRESHOLD_MAX_SEARCH_POINTS = 240
 
 # Horizon geometry validation.  The raster threshold remains authoritative.
 HORIZON_EXCLUSION_RADIUS = 0.012
@@ -2427,121 +2430,119 @@ def build_threshold_candidates(gray, bgr=None, max_colors=20, fallback=8):
     return sorted(set(int(v) for v in selected))[:max_colors]
 
 
-def _auto_threshold_component_is_clear(component, light_mask):
-    """Whether the hinted bright component is cleanly separated from background."""
-    if component is None or component["touches_border"]:
-        return False
-    bright_pixels = int(np.count_nonzero(light_mask))
-    if bright_pixels <= 0:
-        return False
-    dominance = component["area"] / bright_pixels
-    area_fraction = component["area"] / max(light_mask.size, 1)
+def component_is_clear_for_threshold(component):
+    """Whether a bright component is cleanly separated from background.
+
+    This is intentionally a topology/population test rather than an ellipse test.
+    It establishes only the lower edge of the useful threshold basin.
+    """
     return (
-        dominance >= AUTO_THRESHOLD_COMPONENT_DOMINANCE
-        and area_fraction >= AUTO_THRESHOLD_COMPONENT_MIN_FRACTION
+        component is not None
+        and not component["touches_border"]
+        and component["area_fraction"] >= AUTO_THRESHOLD_COMPONENT_MIN_AREA
+        and component["bright_dominance"] >= AUTO_THRESHOLD_COMPONENT_DOMINANCE
     )
 
 
-def _auto_threshold_component_containment(component_mask, ellipse):
-    """Fraction of the solar component inside an ellipse with 2-pixel tolerance."""
+def threshold_component(gray, center, threshold):
+    """Return the hinted bright component and whether it is background-separated."""
+    _, light_mask = cv2.threshold(
+        gray, int(threshold), 255, cv2.THRESH_BINARY
+    )
+    component = component_for_hint(light_mask, center)
+    return light_mask, component, component_is_clear_for_threshold(component)
+
+
+def lowest_clear_threshold_in_anchor_basin(gray, center, anchor):
+    """Find the lower edge of the clear component basin containing ``anchor``.
+
+    Searching downward from the existing quick estimate is deliberate.  A 0-up
+    scan can stop on a transient low-threshold island that becomes ambiguous again
+    before the stable solar/background separation regime.
+    """
+    anchor = int(np.clip(anchor, 0, 254))
+    seen_clear = False
+    lowest_clear = None
+    for threshold in range(anchor, -1, -1):
+        _mask, _component, clear = threshold_component(gray, center, threshold)
+        if clear:
+            seen_clear = True
+            lowest_clear = threshold
+        elif seen_clear:
+            return lowest_clear
+
+    if lowest_clear is not None:
+        return lowest_clear
+
+    # Rare case: the quick estimate started below every detached-component basin.
+    # Find the first basin above it rather than falling back to a blind 0-up scan.
+    for threshold in range(anchor + 1, 255):
+        _mask, _component, clear = threshold_component(gray, center, threshold)
+        if clear:
+            return threshold
+    return None
+
+
+def component_containment_fraction(component_mask, ellipse, tolerance=1.0):
+    """Fraction of one observed bright component enclosed by an ellipse.
+
+    ``tolerance`` is a raster allowance in pixels.  Containment is measured on the
+    actual observed component, not on the rounded search ROI.
+    """
     ys, xs = np.nonzero(component_mask)
     if len(xs) == 0:
         return 0.0
-    expanded = ellipse.copy()
-    expanded["major"] += 2.0
-    expanded["minor"] += 2.0
-    return float(np.mean(ellipse_inside(xs, ys, expanded)))
+    candidate = ellipse.copy()
+    candidate["major"] += tolerance
+    candidate["minor"] += tolerance
+    return float(np.mean(ellipse_inside(xs, ys, candidate)))
 
 
-def _auto_threshold_fast_light_fit(light_mask, component, settings):
-    """Score a cheap light-limb fit without running the full detector.
-
-    Only real contour points from the detached solar component are used as fit
-    seeds.  Each candidate is still evaluated against the untouched threshold
-    mask by ``evaluate_region``.  No horizon search or 360-degree arc growth is
-    performed here; this is only a threshold-quality probe.
-    """
-    contours, _ = cv2.findContours(
-        component["mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+def automatic_light_fit(gray, light_mask, component, settings):
+    """Fit the light limb cheaply for automatic-threshold stability testing."""
+    expected_radius = max(1.0, 0.5 * (settings.min_radius + settings.max_radius))
+    guidance_roi = dilated_component_mask(
+        component["mask"],
+        LIGHT_COMPONENT_GUIDANCE_RADIUS * expected_radius,
     )
-    if not contours:
+    guidance_mask = cv2.bitwise_and(light_mask, guidance_roi)
+    candidates = discover_candidates(
+        light_mask,
+        settings,
+        allow_outer_limb=False,
+        guidance_mask=guidance_mask,
+    )
+    if not candidates:
         return None
 
-    contour = max(contours, key=cv2.contourArea)
-    points = contour.reshape(-1, 2).astype(np.float64, copy=False)
-    if len(points) < 12:
-        return None
-
-    # Bound initialization cost. Uniform sampling preserves the complete contour
-    # topology while making the number of fitted windows independent of image size.
-    if len(points) > 240:
-        indices = np.linspace(0, len(points) - 1, 240, dtype=np.int32)
-        points = points[indices]
-
-    point_count = len(points)
-    extended = np.vstack((points, points))
-    lengths = sorted({
-        max(12, min(point_count, int(round(point_count * fraction))))
-        for fraction in (0.12, 0.18, 0.25, 0.35, 0.50, 0.70)
-    })
-    starts = np.unique(np.linspace(
-        0,
-        point_count - 1,
-        min(18, max(6, point_count // 12)),
-        dtype=np.int32,
-    ))
-
-    best = None
-    for length in lengths:
-        for start in starts:
-            candidate = evaluate_region(
-                extended,
-                point_count,
-                int(start),
-                int(length),
-                light_mask,
-                settings,
-            )
-            if candidate is None or not axes_in_range(candidate, settings):
-                continue
-
-            containment = _auto_threshold_component_containment(
-                component["mask"], candidate
-            )
-            if containment < AUTO_THRESHOLD_FIT_MIN_CONTAINMENT:
-                continue
-
-            # A threshold is better when the same small residual explains more
-            # of the limb. This suppresses tiny, locally excellent short-arc fits.
-            coverage = max(
-                candidate["coverage"], settings.min_coverage, 1e-6
-            )
-            fit_score = candidate["relative_error"] / coverage
-            item = (fit_score, candidate, containment)
-            if best is None or item[0] < best[0]:
-                best = item
-    return best
+    for candidate in candidates:
+        tolerance = max(1.0, 0.005 * candidate["equivalent_radius"])
+        containment = component_containment_fraction(
+            component["mask"], candidate, tolerance=tolerance
+        )
+        if containment < AUTO_THRESHOLD_LIGHT_CONTAINMENT:
+            continue
+        result = candidate.copy()
+        result["component_containment"] = containment
+        return result
+    return None
 
 
-def auto_select_threshold(
-    color_image,
-    fallback_threshold,
-    min_radius,
-    max_radius,
-    max_error,
-    min_coverage,
-):
-    """Choose the lowest threshold with clean component separation and limb fit.
+def auto_select_threshold(color_image, fallback_threshold, min_radius=1000.0,
+                          max_radius=1500.0, max_error=0.08,
+                          min_coverage=0.08):
+    """Choose the lowest threshold with clean, stable solar separation.
 
-    The previous color/histogram estimate is retained as a cheap *upper anchor*.
-    From that known-plausible level we walk downward through the same contiguous
-    detached-component basin, avoiding transient low-threshold islands that a
-    blind 0-up scan can stop on.  A handful of thresholds near the basin floor
-    are then compared with a fast real-contour ellipse probe.
+    The old color/histogram estimator is retained as a fast *upper anchor*.  From
+    that anchor the selector descends through connected-component topology to the
+    bottom of the stable solar/background basin, then runs real light-ellipse
+    discovery only for a short range above that boundary.  The first threshold in
+    a stable adjacent pair of acceptable fits wins.
 
-    If no credible light ellipse exists (for example during totality), the
-    detached-component floor is returned.  The normal Preview remains the first
-    authoritative detector pass and can still be adjusted manually.
+    No horizon search or dark-ellipse search runs during initialization.  If a
+    frame genuinely has no usable light ellipse (for example some totality
+    frames), the detached-component boundary is returned rather than weakening
+    ellipse validity merely to manufacture a threshold.
     """
     fallback = int(np.clip(fallback_threshold, 0, 255))
     if color_image is None or color_image.size == 0:
@@ -2550,107 +2551,62 @@ def auto_select_threshold(
     working, scale = resize_for_detection(color_image, AUTO_THRESHOLD_MAX_DIM)
     gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
     solar_hint = adaptive_solar_hint(working)
+    center = solar_hint.get("center")
+    if center is None:
+        high = gray >= np.percentile(gray, 99.8)
+        ys, xs = np.nonzero(high)
+        center = (
+            (float(xs.mean()), float(ys.mean()))
+            if len(xs)
+            else (0.5 * gray.shape[1], 0.5 * gray.shape[0])
+        )
+
     hints = sorted({
         int(np.clip(value, 0, 255))
         for value in solar_hint.get("threshold_hints", [])
         if 0 < int(value) < 255
     })
     anchor = int(hints[0]) if hints else fallback
+    component_floor = lowest_clear_threshold_in_anchor_basin(
+        gray, center, anchor
+    )
+    if component_floor is None:
+        return anchor
 
-    center = solar_hint.get("center")
-    if center is None:
-        y, x = np.unravel_index(int(np.argmax(gray)), gray.shape)
-        center = (float(x), float(y))
-
+    working_min = max(1.0, float(min_radius) * scale)
+    working_max = max(working_min, float(max_radius) * scale)
     settings = DetectionSettings(
-        min_radius=max(1.0, float(min_radius) * scale),
-        max_radius=max(1.0, float(max_radius) * scale),
+        min_radius=working_min,
+        max_radius=working_max,
         max_error=float(max_error),
         min_coverage=float(min_coverage),
-        max_contours=20,
-        max_search_points=240,
+        max_contours=AUTO_THRESHOLD_MAX_CONTOURS,
+        max_search_points=AUTO_THRESHOLD_MAX_SEARCH_POINTS,
         morphology=False,
         outer_limb_assistance=False,
     )
-    if settings.max_radius < settings.min_radius:
-        settings = DetectionSettings(
-            min_radius=settings.min_radius,
-            max_radius=settings.min_radius,
-            max_error=settings.max_error,
-            min_coverage=settings.min_coverage,
-            max_contours=settings.max_contours,
-            max_search_points=settings.max_search_points,
+
+    upper = min(254, component_floor + AUTO_THRESHOLD_FIT_WINDOW)
+    for threshold in range(component_floor, upper + 1):
+        light_mask, component, clear = threshold_component(
+            gray, center, threshold
         )
-
-    states = {}
-
-    def threshold_state(value):
-        value = int(np.clip(value, 0, 255))
-        if value not in states:
-            _, light_mask = cv2.threshold(
-                gray, value, 255, cv2.THRESH_BINARY
-            )
-            component = component_for_hint(light_mask, center)
-            states[value] = (light_mask, component)
-        return states[value]
-
-    # The old estimate is normally already in a detached regime. If not, allow a
-    # small upward rescue before falling back to the old estimate unchanged.
-    clear_anchor = anchor
-    if not _auto_threshold_component_is_clear(
-        threshold_state(clear_anchor)[1], threshold_state(clear_anchor)[0]
-    ):
-        rescued = None
-        for value in range(anchor + 1, min(255, anchor + 32) + 1):
-            light_mask, component = threshold_state(value)
-            if _auto_threshold_component_is_clear(component, light_mask):
-                rescued = value
-                break
-        if rescued is None:
-            return anchor
-        clear_anchor = rescued
-
-    # Descending from a known-good threshold chooses the bottom of *this stable
-    # basin*, unlike a 0-up search which can stop at an unrelated transient island.
-    component_floor = clear_anchor
-    for value in range(clear_anchor - 1, -1, -1):
-        light_mask, component = threshold_state(value)
-        if not _auto_threshold_component_is_clear(component, light_mask):
-            break
-        component_floor = value
-
-    # Coarse probes are enough because component topology already bounded the
-    # useful range.  The winning probe is refined by one grayscale level each side.
-    fits = {}
-    for offset in AUTO_THRESHOLD_FIT_PROBE_OFFSETS:
-        value = component_floor + offset
-        if value > clear_anchor:
+        if not clear:
             continue
-        light_mask, component = threshold_state(value)
-        fits[value] = _auto_threshold_fast_light_fit(
-            light_mask, component, settings
+
+        candidate = automatic_light_fit(
+            gray, light_mask, component, settings
         )
+        if candidate is not None:
+            # Component topology already established that this threshold belongs
+            # to the stable separation basin.  The first sufficiently containing
+            # physical light fit is therefore the lowest useful threshold.  Do
+            # not demand adjacent-threshold geometry agreement: very short sunset
+            # arcs are genuinely underconstrained and can jump between acceptable
+            # radii by one grayscale level.
+            return threshold
 
-    good = {value: fit for value, fit in fits.items() if fit is not None}
-    if not good:
-        return int(component_floor)
-
-    coarse_best = min(good, key=lambda value: good[value][0])
-    for value in (coarse_best - 1, coarse_best + 1):
-        if not component_floor <= value <= clear_anchor or value in fits:
-            continue
-        light_mask, component = threshold_state(value)
-        fits[value] = _auto_threshold_fast_light_fit(
-            light_mask, component, settings
-        )
-
-    good = {value: fit for value, fit in fits.items() if fit is not None}
-    best_score = min(fit[0] for fit in good.values())
-    acceptable = [
-        value for value, fit in good.items()
-        if fit[0] <= best_score * AUTO_THRESHOLD_FIT_SCORE_RATIO
-    ]
-    return int(min(acceptable))
+    return component_floor
 
 
 # ---------------------------------------------------------------------------
@@ -2828,10 +2784,10 @@ class DetectorApp:
         threshold = auto_select_threshold(
             self.color_image,
             defaults["threshold"],
-            defaults["min_radius"],
-            defaults["max_radius"],
-            defaults["max_error"],
-            defaults["min_coverage"],
+            min_radius=defaults["min_radius"],
+            max_radius=defaults["max_radius"],
+            max_error=defaults["max_error"],
+            min_coverage=defaults["min_coverage"],
         )
         self.image_overrides[self.current_path] = {"threshold": int(threshold)}
 
