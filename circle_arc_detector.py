@@ -23,10 +23,10 @@ Detection overview
    semi-axis limits so short arcs are not rejected before they can be grown.
 4. Optionally add outer-limb seeds using actual contour points that lie on the
    convex envelope.  Artificial convex-hull chords are never used as fit points.
-5. Detect a horizon whenever a strong straight light/dark boundary cuts the
-   provisional light/Sun ellipse.  Horizon orientation is unrestricted.  A
-   horizon is accepted only when one half-plane is predominantly dark and the
-   opposite half-plane contains the visible solar region.
+5. Propose a horizon directly from a globally straight, sharp threshold border
+   before ellipse fitting. Horizon orientation is unrestricted. Solar-bright
+   pixels must lie on one half-plane and the opposite side must remain dark at
+   the border; curved ellipse fits are then tested with that line excluded.
 6. Grow each ellipse around all 360 degrees and retain *multiple disconnected
    real support segments*.  Gaps remain gaps and do not count toward coverage.
    When a horizon exists, every retained arc must lie on the visible side; the
@@ -84,6 +84,21 @@ HORIZON_VISIBLE_SIDE_MIN_LIGHT = 0.12
 HORIZON_MIN_SIDE_CONTRAST = 0.10
 HORIZON_EXCLUSION_RADIUS = 0.012
 HORIZON_CHORD_MIN_TRANSITION = 0.72
+
+# Horizon proposals are found before ellipse fitting. These values express
+# threshold-border quality rather than a minimum horizon length. Straightness is
+# normalized by the sagitta a circular solar limb would have over the same span;
+# it is used only for ranking and the narrow saturated-sunset fallback.
+HORIZON_PROPOSAL_MAX_WRONG_BRIGHT = 0.08
+HORIZON_PROPOSAL_MAX_DARK_GAP = 0.45
+HORIZON_PROPOSAL_MIN_TRANSITION = 0.28
+HORIZON_PROPOSAL_MIN_BRIGHT_SIDE = 0.30
+HORIZON_PROPOSAL_MAX_DARK_SIDE = 0.35
+HORIZON_SUNSET_MIN_WARM_FRACTION = 0.85
+HORIZON_SUNSET_MAX_STRAIGHTNESS = 0.18
+HORIZON_SHARPNESS_MIN_LEVELS = 4.0
+HORIZON_SHARPNESS_NOISE_MULTIPLIER = 3.0
+HORIZON_PROPOSAL_LIMIT = 6
 
 # Small morphology is guidance-only.  It can help contour discovery but can
 # never redefine the final measured limb.
@@ -514,6 +529,45 @@ def morphology_guidance(mask):
     return cleaned
 
 
+def split_contour_by_excluded_line(points, horizon, margin, minimum_points):
+    """Return contiguous actual contour runs outside an excluded line band.
+
+    The raster mask is deliberately left untouched: erasing a line from the mask
+    would create two artificial band edges that could themselves seed ellipses.
+    Splitting the original ordered contour points removes the horizon as evidence
+    while preserving every real curved point on either side.
+    """
+    points = np.asarray(points, np.float64)
+    if horizon is None or len(points) == 0:
+        return [points] if len(points) >= minimum_points else []
+
+    distance = np.abs(line_signed_distance(points, horizon))
+    keep = distance > margin
+    count = len(points)
+    if not np.any(keep):
+        return []
+    if np.all(keep):
+        return [points] if count >= minimum_points else []
+
+    start = (int(np.flatnonzero(~keep)[0]) + 1) % count
+    order = (start + np.arange(count)) % count
+    values = keep[order]
+    runs = []
+    index = 0
+    while index < count:
+        if not values[index]:
+            index += 1
+            continue
+        end = index
+        while end < count and values[end]:
+            end += 1
+        run = points[order[index:end]]
+        if len(run) >= minimum_points:
+            runs.append(run)
+        index = end
+    return runs
+
+
 def outer_limb_seed_from_contour(contour, original_mask, min_radius, max_radius,
                                 max_error, min_coverage):
     """Fit actual convex-envelope contour vertices as optional outer-limb seeds."""
@@ -567,8 +621,14 @@ def outer_limb_seed_from_contour(contour, original_mask, min_radius, max_radius,
 
 def find_candidates(original_mask, min_radius, max_radius, max_error,
                     min_coverage, max_contours, max_points,
-                    morphology=False, outer_limb_assistance=False):
-    """Discover ellipse seeds from contours while validating on original mask."""
+                    morphology=False, outer_limb_assistance=False,
+                    excluded_horizon=None):
+    """Discover ellipse seeds from contours while validating on original mask.
+
+    If a horizon proposal has been accepted, points in a narrow band around that
+    straight edge are omitted from candidate discovery. The mask itself is never
+    edited, so no artificial replacement edge is introduced.
+    """
     guidance_mask = morphology_guidance(original_mask) if morphology else original_mask
     contours, _ = cv2.findContours(
         guidance_mask,
@@ -590,26 +650,37 @@ def find_candidates(original_mask, min_radius, max_radius, max_error,
     if max_contours > 0:
         usable = usable[:max_contours]
 
+    exclusion_margin = max(2.0, HORIZON_EXCLUSION_RADIUS * 0.5 * (min_radius + max_radius))
     candidates = []
     for _, contour in usable:
-        points = contour.reshape(-1, 2).astype(np.float64, copy=False)
-        if max_points > 0 and len(points) > max_points:
-            indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
-            points = points[indices]
-
-        candidates.extend(
-            find_regions(
-                points,
-                original_mask,
-                min_radius,
-                max_radius,
-                max_error,
-                min_coverage,
-                minimum_points,
-            )
+        contour_points = contour.reshape(-1, 2).astype(np.float64, copy=False)
+        point_sets = split_contour_by_excluded_line(
+            contour_points,
+            excluded_horizon,
+            exclusion_margin,
+            minimum_points,
         )
+        for points in point_sets:
+            if max_points > 0 and len(points) > max_points:
+                indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
+                points = points[indices]
 
-        if outer_limb_assistance:
+            candidates.extend(
+                find_regions(
+                    points,
+                    original_mask,
+                    min_radius,
+                    max_radius,
+                    max_error,
+                    min_coverage,
+                    minimum_points,
+                )
+            )
+
+        # During horizon-constrained discovery the convex envelope can reconnect
+        # points across the deliberately removed line gap. Skip that optional seed
+        # source rather than reintroducing the horizon through a hull chord.
+        if outer_limb_assistance and excluded_horizon is None:
             candidates.extend(
                 outer_limb_seed_from_contour(
                     contour,
@@ -750,6 +821,435 @@ def _fit_line_to_points(points):
     nx, ny = -vy, vx
     c = -(nx * float(x0) + ny * float(y0))
     return (vx, vy), (nx, ny), float(c)
+
+
+def _horizon_line_metrics(gray, light_mask, solar_pixels, edge_points,
+                          seed, expected_radius, color_image=None):
+    """Refit one Hough seed to its complete contiguous straight threshold edge."""
+    x1, y1, x2, y2 = map(float, seed)
+    direction = np.array([x2 - x1, y2 - y1], dtype=np.float64)
+    seed_length = float(np.linalg.norm(direction))
+    if seed_length < 4.0:
+        return None
+    direction /= seed_length
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    c = -float(normal @ np.array([x1, y1], dtype=np.float64))
+
+    distance = np.abs(edge_points @ normal + c)
+    projection = edge_points @ direction
+    seed_min = min(np.dot([x1, y1], direction), np.dot([x2, y2], direction))
+    seed_max = max(np.dot([x1, y1], direction), np.dot([x2, y2], direction))
+    near = (
+        (distance <= max(2.0, 0.008 * expected_radius))
+        & (projection >= seed_min - max(5.0, 0.05 * expected_radius))
+        & (projection <= seed_max + max(5.0, 0.05 * expected_radius))
+    )
+    points = edge_points[near]
+    if len(points) < 6:
+        return None
+
+    fitted = _fit_line_to_points(points)
+    if fitted is None:
+        return None
+    (vx, vy), (nx, ny), c = fitted
+    direction = np.array([vx, vy], dtype=np.float64)
+    normal = np.array([nx, ny], dtype=np.float64)
+
+    # Collect all real threshold-edge pixels near the infinite proposal, then keep
+    # only the contiguous projection cluster that contains the original seed.
+    distance = np.abs(edge_points @ normal + c)
+    projection = edge_points @ direction
+    indices = np.flatnonzero(distance <= max(2.0, 0.010 * expected_radius))
+    if len(indices) < 6:
+        return None
+    values = projection[indices]
+    order = np.argsort(values)
+    values = values[order]
+    indices = indices[order]
+    gap = max(4.0, 0.025 * expected_radius)
+    cuts = np.where(np.diff(values) > gap)[0] + 1
+    groups = [group for group in np.split(indices, cuts) if len(group) >= 6]
+    if not groups:
+        return None
+    seed_mid = 0.5 * (
+        np.dot([x1, y1], direction) + np.dot([x2, y2], direction)
+    )
+    group = min(
+        groups,
+        key=lambda ids: abs(float(np.median(edge_points[ids] @ direction)) - seed_mid),
+    )
+    points = edge_points[group]
+
+    # Two robust-ish expansion/refit passes extend over the complete available
+    # straight stretch without connecting separate collinear objects.
+    for _ in range(2):
+        fitted = _fit_line_to_points(points)
+        if fitted is None:
+            return None
+        (vx, vy), (nx, ny), c = fitted
+        direction = np.array([vx, vy], dtype=np.float64)
+        normal = np.array([nx, ny], dtype=np.float64)
+        distance = np.abs(edge_points @ normal + c)
+        projection = edge_points @ direction
+        run_projection = points @ direction
+        low = float(run_projection.min())
+        high = float(run_projection.max())
+        take = (
+            (distance <= max(2.0, 0.012 * expected_radius))
+            & (projection >= low - gap)
+            & (projection <= high + gap)
+        )
+        expanded = edge_points[take]
+        if len(expanded) >= len(points):
+            points = expanded
+
+    fitted = _fit_line_to_points(points)
+    if fitted is None:
+        return None
+    (vx, vy), (nx, ny), c = fitted
+    direction = np.array([vx, vy], dtype=np.float64)
+    normal = np.array([nx, ny], dtype=np.float64)
+    signed = points @ normal + c
+    residual = float(np.sqrt(np.mean(signed**2)))
+    run_projection = points @ direction
+    low = float(run_projection.min())
+    high = float(run_projection.max())
+    span = high - low
+    if span < 6.0:
+        return None
+
+    sample_count = int(np.clip(math.ceil(span / 2.0), 12, 500))
+    t = np.linspace(low, high, sample_count)
+    p0 = -c * normal
+    base = p0[None, :] + t[:, None] * direction[None, :]
+    sample_offset = max(2.0, 0.012 * expected_radius)
+    height, width = light_mask.shape
+
+    def sample(sign, multiplier=1.0):
+        q = np.rint(
+            base + sign * sample_offset * multiplier * normal[None, :]
+        ).astype(np.int32)
+        valid = (
+            (q[:, 0] >= 0) & (q[:, 0] < width)
+            & (q[:, 1] >= 0) & (q[:, 1] < height)
+        )
+        binary = np.zeros(sample_count, dtype=bool)
+        binary[valid] = light_mask[q[valid, 1], q[valid, 0]] != 0
+        return q, binary, valid
+
+    plus_points, plus, plus_valid = sample(1)
+    minus_points, minus, minus_valid = sample(-1)
+    valid = plus_valid & minus_valid
+    if np.count_nonzero(valid) < 8:
+        return None
+    plus_fraction = float(np.mean(plus[valid]))
+    minus_fraction = float(np.mean(minus[valid]))
+    visible_sign = 1.0 if plus_fraction >= minus_fraction else -1.0
+    bright = plus if visible_sign > 0 else minus
+    dark = minus if visible_sign > 0 else plus
+    bright_points = plus_points if visible_sign > 0 else minus_points
+    dark_points = minus_points if visible_sign > 0 else plus_points
+
+    transition = float(np.mean(bright[valid] & ~dark[valid]))
+    dark_gap = float(np.mean(~bright[valid] & ~dark[valid]))
+    bright_fraction = float(np.mean(bright[valid]))
+    dark_fraction = float(np.mean(dark[valid]))
+
+    _, plus2, plus_valid2 = sample(1, 2.0)
+    _, minus2, minus_valid2 = sample(-1, 2.0)
+    valid2 = plus_valid2 & minus_valid2
+    bright2 = plus2 if visible_sign > 0 else minus2
+    dark2 = minus2 if visible_sign > 0 else plus2
+    transition2 = (
+        float(np.mean(bright2[valid2] & ~dark2[valid2])) if np.any(valid2) else 0.0
+    )
+    dark_gap2 = (
+        float(np.mean(~bright2[valid2] & ~dark2[valid2])) if np.any(valid2) else 1.0
+    )
+
+    # Global physical criterion: essentially all threshold-bright solar pixels
+    # must lie on one side of the proposed horizon. Dark pixels are allowed on the
+    # visible side; bright solar pixels on the occluded side are not.
+    solar_distance = solar_pixels @ normal + c
+    wrong_bright = (
+        float(np.mean(
+            solar_distance * visible_sign < -max(1.0, 0.006 * expected_radius)
+        ))
+        if len(solar_pixels) else 1.0
+    )
+
+    # The binary edge can be created by a smooth red-disk gradient. Test the raw
+    # grayscale jump immediately across the same border so that both sides being
+    # dark/near-equal cannot masquerade as a horizon.
+    valid_gray = valid.copy()
+    gray_bright = gray[
+        bright_points[valid_gray, 1], bright_points[valid_gray, 0]
+    ].astype(np.float64)
+    gray_dark = gray[
+        dark_points[valid_gray, 1], dark_points[valid_gray, 0]
+    ].astype(np.float64)
+    gray_contrast = (
+        float(np.median(gray_bright - gray_dark)) if len(gray_bright) else 0.0
+    )
+    local_noise = 0.0
+    if len(gray_bright) > 2:
+        local_noise = max(
+            float(np.median(np.abs(np.diff(gray_bright)))),
+            float(np.median(np.abs(np.diff(gray_dark)))),
+        )
+    sharpness_floor = max(
+        HORIZON_SHARPNESS_MIN_LEVELS,
+        HORIZON_SHARPNESS_NOISE_MULTIPLIER * local_noise,
+    )
+    sharp = gray_contrast >= sharpness_floor
+
+    # Straightness is normalized by the sagitta expected from a circular limb of
+    # the selected solar radius over the same observed chord. This is a ranking
+    # property; ordinary neutral-color horizons may still be confirmed by ellipse
+    # geometry even if it is not below the saturated-sunset fallback cutoff.
+    chord = min(span, 1.98 * expected_radius)
+    if chord < 2.0 * expected_radius:
+        sagitta = max(
+            0.25,
+            expected_radius - math.sqrt(max(
+                0.0, expected_radius**2 - (0.5 * chord)**2
+            )),
+        )
+    else:
+        sagitta = expected_radius
+    straightness = residual / sagitta
+
+    warm_fraction = 0.0
+    median_saturation = 0.0
+    if color_image is not None and np.any(valid_gray):
+        hsv = cv2.cvtColor(color_image, cv2.COLOR_BGR2HSV)
+        q = bright_points[valid_gray]
+        hue = hsv[q[:, 1], q[:, 0], 0]
+        saturation = hsv[q[:, 1], q[:, 0], 1]
+        warm = ((hue <= 45) | (hue >= 170)) & (saturation >= 100)
+        warm_fraction = float(np.mean(warm)) if len(warm) else 0.0
+        median_saturation = (
+            float(np.median(saturation)) if len(saturation) else 0.0
+        )
+
+    score = (
+        transition * 2.5
+        + transition2 * 1.5
+        + (1.0 - wrong_bright) * 2.0
+        + min(span / max(expected_radius, 1.0), 1.5) * 0.7
+        - dark_gap * 1.8
+        - dark_gap2 * 0.8
+        - min(straightness, 2.0) * 0.35
+        - dark_fraction * 0.8
+    )
+    return {
+        "direction": (float(direction[0]), float(direction[1])),
+        "normal": (float(normal[0]), float(normal[1])),
+        "c": float(c),
+        "visible_sign": float(visible_sign),
+        "points": points,
+        "span": float(span),
+        "residual": float(residual),
+        "straightness": float(straightness),
+        "transition": transition,
+        "transition2": transition2,
+        "dark_gap": dark_gap,
+        "dark_gap2": dark_gap2,
+        "bright_fraction": bright_fraction,
+        "dark_light_fraction": dark_fraction,
+        "wrong_bright": wrong_bright,
+        "gray_contrast": gray_contrast,
+        "local_noise": local_noise,
+        "sharp": bool(sharp),
+        "warm_fraction": warm_fraction,
+        "median_saturation": median_saturation,
+        "score": float(score),
+    }
+
+
+def find_horizon_proposals(gray, light_mask, color_image, min_radius, max_radius):
+    """Find straight threshold-border proposals before any ellipse is fitted."""
+    height, width = gray.shape
+    expected_radius = max(1.0, 0.5 * (min_radius + max_radius))
+    search_radius = 1.35 * max_radius
+
+    center = None
+    if color_image is not None:
+        hint = adaptive_solar_hint(color_image)
+        center = hint.get("center")
+    if center is None:
+        high = gray >= np.percentile(gray, 99.8)
+        ys, xs = np.nonzero(high)
+        if len(xs):
+            center = (float(xs.mean()), float(ys.mean()))
+        else:
+            center = (0.5 * width, 0.5 * height)
+
+    cx, cy = center
+    x0 = max(0, int(math.floor(cx - search_radius)))
+    x1 = min(width, int(math.ceil(cx + search_radius)) + 1)
+    y0 = max(0, int(math.floor(cy - search_radius)))
+    y1 = min(height, int(math.ceil(cy + search_radius)) + 1)
+    if x0 >= x1 or y0 >= y1:
+        return []
+
+    roi = light_mask[y0:y1, x0:x1]
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    near = (xx - cx)**2 + (yy - cy)**2 <= search_radius**2
+    solar_y, solar_x = np.nonzero((roi != 0) & near)
+    solar_pixels = np.column_stack((solar_x + x0, solar_y + y0)).astype(np.float64)
+    if len(solar_pixels) < 10:
+        return []
+
+    edges = cv2.Canny(roi, 40, 120)
+    edge_y, edge_x = np.nonzero(edges)
+    edge_points = np.column_stack((edge_x + x0, edge_y + y0)).astype(np.float64)
+    if len(edge_points) < 10:
+        return []
+
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 720.0,
+        threshold=max(8, int(0.04 * expected_radius)),
+        minLineLength=max(8, int(0.04 * expected_radius)),
+        maxLineGap=max(3, int(0.02 * expected_radius)),
+    )
+    if lines is None:
+        return []
+
+    proposals = []
+    for raw in lines[:, 0, :]:
+        seed = (
+            raw[0] + x0, raw[1] + y0,
+            raw[2] + x0, raw[3] + y0,
+        )
+        candidate = _horizon_line_metrics(
+            gray,
+            light_mask,
+            solar_pixels,
+            edge_points,
+            seed,
+            expected_radius,
+            color_image=color_image,
+        )
+        if candidate is None:
+            continue
+        if candidate["transition"] < HORIZON_PROPOSAL_MIN_TRANSITION:
+            continue
+        if candidate["bright_fraction"] < HORIZON_PROPOSAL_MIN_BRIGHT_SIDE:
+            continue
+        if candidate["dark_light_fraction"] > HORIZON_PROPOSAL_MAX_DARK_SIDE:
+            continue
+        if candidate["dark_gap"] > HORIZON_PROPOSAL_MAX_DARK_GAP:
+            continue
+        if candidate["wrong_bright"] > HORIZON_PROPOSAL_MAX_WRONG_BRIGHT:
+            continue
+        if not candidate["sharp"]:
+            continue
+        proposals.append(candidate)
+
+    # Rank longer/globally straighter physical borders first, then deduplicate
+    # nearly identical lines. Straightness is not itself a hard acceptance rule.
+    proposals.sort(
+        key=lambda item: (
+            item["score"],
+            item["span"],
+            -item["straightness"],
+        ),
+        reverse=True,
+    )
+    unique = []
+    for candidate in proposals:
+        angle = math.atan2(candidate["direction"][1], candidate["direction"][0])
+        duplicate = False
+        for previous in unique:
+            old_angle = math.atan2(previous["direction"][1], previous["direction"][0])
+            angle_delta = abs((angle - old_angle + math.pi / 2) % math.pi - math.pi / 2)
+            if angle_delta >= math.radians(4.0):
+                continue
+            # Compare perpendicular distance of both lines at the solar hint.
+            dc = abs(
+                abs(np.dot(center, candidate["normal"]) + candidate["c"])
+                - abs(np.dot(center, previous["normal"]) + previous["c"])
+            )
+            if dc < 0.06 * expected_radius:
+                duplicate = True
+                break
+        if not duplicate:
+            candidate["segment"] = line_segment_across_image(candidate, width, height)
+            unique.append(candidate)
+        if len(unique) >= HORIZON_PROPOSAL_LIMIT:
+            break
+    return unique
+
+
+def horizon_geometry_score(light_mask, proposal, light_candidates, dark_candidates):
+    """Return best ellipse-based confirmation score for one straight proposal."""
+    direction = proposal["direction"]
+    normal = proposal["normal"]
+    best = None
+    dark_options = [None] + list(dark_candidates[:5])
+    for light in light_candidates[:8]:
+        for dark in dark_options:
+            intervals = visible_horizon_intervals(
+                direction,
+                normal,
+                proposal["c"],
+                light,
+                dark,
+            )
+            if not intervals:
+                continue
+            transition, samples = validate_full_horizon_chord(
+                light_mask,
+                direction,
+                normal,
+                proposal["c"],
+                proposal["visible_sign"],
+                intervals,
+                light["equivalent_radius"],
+            )
+            if samples < 8:
+                continue
+            # Use the configured half-plane tolerance instead of the old 2.5%
+            # hard-coded value. Proposal polarity already established the edge.
+            height, width = light_mask.shape
+            bx0, by0, bx1, by1 = ellipse_bounds(light, width, height)
+            yy, xx = np.ogrid[by0:by1, bx0:bx1]
+            inside = ellipse_inside(xx, yy, light)
+            signed = xx * normal[0] + yy * normal[1] + proposal["c"]
+            margin = max(1.0, 0.004 * light["equivalent_radius"])
+            visible_region = inside & (signed * proposal["visible_sign"] > margin)
+            dark_region = inside & (signed * proposal["visible_sign"] < -margin)
+            if np.count_nonzero(visible_region) < 16 or np.count_nonzero(dark_region) < 16:
+                continue
+            mask_roi = light_mask[by0:by1, bx0:bx1] != 0
+            visible_fraction_value = float(np.mean(mask_roi[visible_region]))
+            dark_fraction = float(np.mean(mask_roi[dark_region]))
+            if dark_fraction > HORIZON_DARK_SIDE_MAX_LIGHT:
+                continue
+            if visible_fraction_value <= dark_fraction + 0.01:
+                continue
+            score = (
+                transition
+                * (1.0 - dark_fraction)
+                * (0.5 + 0.5 * min(1.0, visible_fraction_value))
+            )
+            if best is None or score > best[0]:
+                best = (score, transition, light, dark)
+    return best
+
+
+def proposal_is_sunset_fallback(proposal):
+    """Narrow no-ellipse fallback for tiny/obscured warm sunset solar regions."""
+    return (
+        proposal["sharp"]
+        and proposal["warm_fraction"] >= HORIZON_SUNSET_MIN_WARM_FRACTION
+        and proposal["straightness"] <= HORIZON_SUNSET_MAX_STRAIGHTNESS
+        and proposal["wrong_bright"] <= HORIZON_PROPOSAL_MAX_WRONG_BRIGHT
+        and proposal["dark_gap"] <= HORIZON_PROPOSAL_MAX_DARK_GAP
+    )
 
 
 def line_ellipse_intersections(direction, normal, c, ellipse):
@@ -1472,7 +1972,7 @@ def prepare_candidates(mask, candidates, min_radius, max_radius, max_error,
 def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage,
            max_contours, max_points, morphology=False,
            outer_limb_assistance=False, color_image=None):
-    """Detect at most one dark and one light ellipse plus an optional horizon."""
+    """Detect at most one dark/light ellipse plus an independent horizon."""
     _, dark_mask = cv2.threshold(
         gray, int(threshold), 255, cv2.THRESH_BINARY_INV
     )
@@ -1480,92 +1980,109 @@ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage,
         gray, int(threshold), 255, cv2.THRESH_BINARY
     )
 
-    dark_seeds = find_candidates(
-        dark_mask,
-        min_radius,
-        max_radius,
-        max_error,
-        min_coverage,
-        max_contours,
-        max_points,
-        morphology=morphology,
-        outer_limb_assistance=outer_limb_assistance,
-    )
-    light_seeds = find_candidates(
+    # Horizon proposals are discovered from the untouched threshold/raw grayscale
+    # image BEFORE ellipse fitting. This prevents a straight horizon from being
+    # absorbed into a provisional ellipse merely because morphology is disabled.
+    proposals = find_horizon_proposals(
+        gray,
         light_mask,
+        color_image,
         min_radius,
         max_radius,
-        max_error,
-        min_coverage,
-        max_contours,
-        max_points,
-        morphology=morphology,
-        outer_limb_assistance=outer_limb_assistance,
     )
 
-    # Prepare provisional light candidates without a horizon solely so a straight
-    # clipping edge can be tested relative to a plausible solar geometry.
-    provisional_light_candidates = prepare_candidates(
-        light_mask,
-        light_seeds,
-        min_radius,
-        max_radius,
-        max_error,
-        min_coverage,
-        horizon=None,
-    )
-    provisional_light = (
-        provisional_light_candidates[0] if provisional_light_candidates else None
-    )
+    horizon = None
+    horizon_dark_candidates = []
+    horizon_light_candidates = []
+    for proposal in proposals:
+        # Remove only actual contour points near the proposed line while fitting
+        # curved geometry. The raster remains authoritative and unchanged.
+        proposal_dark_seeds = find_candidates(
+            dark_mask,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            max_contours,
+            max_points,
+            morphology=morphology,
+            outer_limb_assistance=False,
+            excluded_horizon=proposal,
+        )
+        proposal_light_seeds = find_candidates(
+            light_mask,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            max_contours,
+            max_points,
+            morphology=morphology,
+            outer_limb_assistance=False,
+            excluded_horizon=proposal,
+        )
+        proposal_dark = prepare_candidates(
+            dark_mask,
+            proposal_dark_seeds,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            horizon=None,
+        )
+        proposal_light = prepare_candidates(
+            light_mask,
+            proposal_light_seeds,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            horizon=None,
+        )
 
-    # A provisional dark ellipse is used only to determine whether the Moon
-    # physically truncates one end of a possible horizon chord.  As with the
-    # light ellipse, this is computed before any horizon half-plane is imposed.
-    provisional_dark_candidates = prepare_candidates(
-        dark_mask,
-        dark_seeds,
-        min_radius,
-        max_radius,
-        max_error,
-        min_coverage,
-        horizon=None,
-    )
-    provisional_dark = (
-        provisional_dark_candidates[0] if provisional_dark_candidates else None
-    )
-
-    # Horizon detection is always attempted.  Color information, when available
-    # in the GUI/preview path, supplies only a coarse solar-location hint; the
-    # actual horizon is still measured from the original grayscale threshold
-    # boundary.  A provisional light ellipse far from the warm/bright Sun is not
-    # allowed to steer horizon detection to an unrelated skyline edge.
-    solar_hint = adaptive_solar_hint(color_image) if color_image is not None else None
-    horizon_reference = provisional_light
-    if solar_hint is not None and solar_hint.get("center") is not None:
-        expected_radius = 0.5 * (min_radius + max_radius)
-        if horizon_reference is not None:
-            distance = math.hypot(
-                horizon_reference["center"][0] - solar_hint["center"][0],
-                horizon_reference["center"][1] - solar_hint["center"][1],
+        geometry = horizon_geometry_score(
+            light_mask,
+            proposal,
+            proposal_light,
+            proposal_dark,
+        )
+        if geometry is not None or proposal_is_sunset_fallback(proposal):
+            horizon = proposal.copy()
+            horizon["geometry_score"] = float(geometry[0]) if geometry else 0.0
+            horizon["chord_transition"] = (
+                float(geometry[1]) if geometry else float(proposal["transition"])
             )
-            if distance > 1.25 * expected_radius:
-                horizon_reference = None
+            horizon["visible_light_fraction"] = float(proposal["bright_fraction"])
+            horizon["local_light_contrast"] = float(proposal["transition"])
+            horizon_dark_candidates = proposal_dark
+            horizon_light_candidates = proposal_light
+            break
 
-    # Under the geometric chord rule a color-only solar hint is insufficient to
-    # declare a horizon: there must be an actual provisional light ellipse whose
-    # boundary supplies the required chord endpoints.
-    horizon = detect_horizon(
-        light_mask,
-        horizon_reference,
-        provisional_dark=provisional_dark,
-    )
-
-    # Once a horizon is accepted, both classes are re-grown with the half-plane
-    # constraint so no support survives on the physically dark side.
     if horizon is None:
-        dark_candidates = provisional_dark_candidates
-        light_candidates = provisional_light_candidates
-    else:
+        # Ordinary no-horizon path remains unchanged, including optional morphology
+        # and outer-limb assistance.
+        dark_seeds = find_candidates(
+            dark_mask,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            max_contours,
+            max_points,
+            morphology=morphology,
+            outer_limb_assistance=outer_limb_assistance,
+        )
+        light_seeds = find_candidates(
+            light_mask,
+            min_radius,
+            max_radius,
+            max_error,
+            min_coverage,
+            max_contours,
+            max_points,
+            morphology=morphology,
+            outer_limb_assistance=outer_limb_assistance,
+        )
         dark_candidates = prepare_candidates(
             dark_mask,
             dark_seeds,
@@ -1573,7 +2090,7 @@ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage,
             max_radius,
             max_error,
             min_coverage,
-            horizon=horizon,
+            horizon=None,
         )
         light_candidates = prepare_candidates(
             light_mask,
@@ -1582,15 +2099,61 @@ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage,
             max_radius,
             max_error,
             min_coverage,
-            horizon=horizon,
+            horizon=None,
         )
+    else:
+        # Re-grow from line-excluded seeds with the confirmed visible half-plane.
+        # This enforces both user requirements: no horizon-as-magenta-arc leakage,
+        # and no ellipse support on the dark side of the green line.
+        dark_candidates = []
+        for seed in horizon_dark_candidates[:MAX_CLASS_CANDIDATES]:
+            candidate = grow_candidate(
+                dark_mask,
+                seed,
+                min_radius,
+                max_radius,
+                max_error,
+                min_coverage,
+                horizon=horizon,
+            )
+            if candidate is not None and not any(
+                same_ellipse(candidate, old, 0.08, 0.08, 12.0)
+                for old in dark_candidates
+            ):
+                dark_candidates.append(candidate)
+        light_candidates = []
+        for seed in horizon_light_candidates[:MAX_CLASS_CANDIDATES]:
+            candidate = grow_candidate(
+                light_mask,
+                seed,
+                min_radius,
+                max_radius,
+                max_error,
+                min_coverage,
+                horizon=horizon,
+            )
+            if candidate is not None and not any(
+                same_ellipse(candidate, old, 0.08, 0.08, 12.0)
+                for old in light_candidates
+            ):
+                light_candidates.append(candidate)
+        for candidates in (dark_candidates, light_candidates):
+            candidates.sort(
+                key=lambda item: (
+                    item["coverage"],
+                    item.get("largest_segment_coverage", 0.0),
+                    item.get("supported_fraction", 1.0),
+                    item.get("boundary_polarity", 0.0),
+                    -item["relative_error"],
+                ),
+                reverse=True,
+            )
 
     dark = dark_candidates[0].copy() if dark_candidates else None
     if dark is not None:
         dark["class"] = "below threshold"
 
-    # Preserve the established totality safeguard for now.  The user explicitly
-    # requested that this remain unchanged rather than become configurable yet.
+    # Preserve the established totality safeguard.
     if dark is not None and dark["coverage"] >= DARK_DOMINANT_COVERAGE:
         return light_mask, [dark], horizon
 
