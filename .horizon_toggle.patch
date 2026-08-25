@@ -1,0 +1,197 @@
+--- a/circle_arc_detector.py
++++ b/circle_arc_detector.py
+@@ -134,6 +134,7 @@
+     "min_coverage",
+     "morphology",
+     "outer_limb_assistance",
++    "use_horizon",
+ )
+ NON_THRESHOLD_SETTING_NAMES = SETTING_NAMES[1:]
+ 
+@@ -1971,7 +1972,7 @@
+ # ---------------------------------------------------------------------------
+ def detect(gray, threshold, min_radius, max_radius, max_error, min_coverage,
+            max_contours, max_points, morphology=False,
+-           outer_limb_assistance=False, color_image=None):
++           outer_limb_assistance=False, color_image=None, use_horizon=True):
+     """Detect at most one dark/light ellipse plus an independent horizon."""
+     _, dark_mask = cv2.threshold(
+         gray, int(threshold), 255, cv2.THRESH_BINARY_INV
+@@ -2058,7 +2059,14 @@
+             horizon_light_candidates = proposal_light
+             break
+ 
+-    if horizon is None:
++    # Detection and application are deliberately separate.  The UI may keep a
++    # detected horizon available while the user disables it as a false positive.
++    detected_horizon = horizon
++    if detected_horizon is not None:
++        detected_horizon["active"] = bool(use_horizon)
++    active_horizon = detected_horizon if use_horizon else None
++
++    if active_horizon is None:
+         # Ordinary no-horizon path remains unchanged, including optional morphology
+         # and outer-limb assistance.
+         dark_seeds = find_candidates(
+@@ -2114,7 +2122,7 @@
+                 max_radius,
+                 max_error,
+                 min_coverage,
+-                horizon=horizon,
++                horizon=active_horizon,
+             )
+             if candidate is not None and not any(
+                 same_ellipse(candidate, old, 0.08, 0.08, 12.0)
+@@ -2130,7 +2138,7 @@
+                 max_radius,
+                 max_error,
+                 min_coverage,
+-                horizon=horizon,
++                horizon=active_horizon,
+             )
+             if candidate is not None and not any(
+                 same_ellipse(candidate, old, 0.08, 0.08, 12.0)
+@@ -2155,7 +2163,7 @@
+ 
+     # Preserve the established totality safeguard.
+     if dark is not None and dark["coverage"] >= DARK_DOMINANT_COVERAGE:
+-        return light_mask, [dark], horizon
++        return light_mask, [dark], detected_horizon
+ 
+     light = None
+     for candidate in light_candidates:
+@@ -2170,7 +2178,7 @@
+         break
+ 
+     ellipses = [ellipse for ellipse in (dark, light) if ellipse is not None]
+-    return light_mask, ellipses, horizon
++    return light_mask, ellipses, detected_horizon
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2301,7 +2309,7 @@
+             cv2.LINE_AA,
+         )
+ 
+-    if horizon is not None:
++    if horizon is not None and horizon.get("active", True):
+         segment = horizon.get("segment")
+         if segment is None:
+             segment = line_segment_across_image(
+@@ -2324,7 +2332,7 @@
+ 
+ def process_working_image(gray, threshold, min_radius, max_radius, max_error,
+                           min_coverage, max_contours, max_points, morphology,
+-                          outer_limb_assistance, color_image=None):
++                          outer_limb_assistance, color_image=None, use_horizon=True):
+     binary, ellipses, horizon = detect(
+         gray,
+         threshold,
+@@ -2337,6 +2345,7 @@
+         morphology=morphology,
+         outer_limb_assistance=outer_limb_assistance,
+         color_image=color_image,
++        use_horizon=use_horizon,
+     )
+     threshold_preview = annotate_threshold(binary, ellipses, horizon)
+     return threshold_preview, ellipses, horizon
+@@ -2578,6 +2587,8 @@
+         self.min_coverage = tk.IntVar(value=round(defaults["min_coverage"] * 100))
+         self.morphology = tk.BooleanVar(value=False)
+         self.outer_limb_assistance = tk.BooleanVar(value=False)
++        self.use_horizon = tk.BooleanVar(value=True)
++        self.horizon_detected_current = False
+ 
+         self.status = tk.StringVar(value="Load images to begin.")
+         self.image_info = tk.StringVar(value="No image loaded")
+@@ -2622,6 +2633,7 @@
+             "min_coverage": float(self.args.min_coverage),
+             "morphology": False,
+             "outer_limb_assistance": False,
++            "use_horizon": True,
+         }
+ 
+     def settings_dict(self):
+@@ -2643,6 +2655,7 @@
+             "min_coverage": float(np.clip(self.min_coverage.get() / 100, 0, 1)),
+             "morphology": bool(self.morphology.get()),
+             "outer_limb_assistance": bool(self.outer_limb_assistance.get()),
++            "use_horizon": bool(self.use_horizon.get()),
+         }
+ 
+     @staticmethod
+@@ -2680,6 +2693,7 @@
+             self.min_coverage.set(round(values["min_coverage"] * 100))
+             self.morphology.set(bool(values["morphology"]))
+             self.outer_limb_assistance.set(bool(values["outer_limb_assistance"]))
++            self.use_horizon.set(bool(values["use_horizon"]))
+         finally:
+             self.restoring_settings = False
+ 
+@@ -2748,6 +2762,8 @@
+         # the image later simply restores that stored value, even when it is 8.
+         self.initialize_threshold_if_needed()
+         self.restore_settings_for_current_image()
++        self.horizon_detected_current = False
++        self.update_horizon_control_state(False)
+         self.update_radius_scale_limits()
+ 
+         self.palette = build_threshold_candidates(
+@@ -2863,7 +2879,15 @@
+             text="Outer-limb assistance",
+             variable=self.outer_limb_assistance,
+             command=self.pending,
+-        ).grid(row=0, column=1, sticky="w")
++        ).grid(row=0, column=1, sticky="w", padx=(0, 20))
++        self.horizon_checkbox = tk.Checkbutton(
++            options,
++            text="Use detected horizon",
++            variable=self.use_horizon,
++            command=self.pending,
++            state=tk.DISABLED,
++        )
++        self.horizon_checkbox.grid(row=0, column=2, sticky="w")
+ 
+         tk.Label(frame, text="Useful threshold candidates:").grid(
+             row=6, column=0, sticky="nw"
+@@ -2991,6 +3015,14 @@
+         self.rebuild_palette_buttons()
+         self.status.set(f"Threshold set to {value}. Refresh Preview or Apply Full Resolution.")
+ 
++    def update_horizon_control_state(self, detected):
++        """Enable the horizon override only when this run found a horizon."""
++        self.horizon_detected_current = bool(detected)
++        if hasattr(self, "horizon_checkbox"):
++            self.horizon_checkbox.config(
++                state=tk.NORMAL if detected else tk.DISABLED
++            )
++
+     def pending(self, *_args):
+         if self.restoring_settings:
+             return
+@@ -3034,8 +3066,11 @@
+             settings["morphology"],
+             settings["outer_limb_assistance"],
+             color_image=working_color,
++            use_horizon=settings["use_horizon"],
+         )
+ 
++        self.update_horizon_control_state(working_horizon is not None)
++
+         # Map preview geometry to original coordinates only for the full-color
+         # centering pane.  Full-resolution mode already has factor 1.
+         to_original = 1.0 / scale
+@@ -3059,7 +3094,12 @@
+         self.result_mode = mode_label
+         self.redraw()
+ 
+-        horizon_text = "horizon=yes" if working_horizon is not None else "horizon=no"
++        if working_horizon is None:
++            horizon_text = "horizon=no"
++        elif settings["use_horizon"]:
++            horizon_text = "horizon=detected/applied"
++        else:
++            horizon_text = "horizon=detected/ignored"
+         self.status.set(
+             f"{mode_label}: working={working_gray.shape[1]}x{working_gray.shape[0]}; "
+             f"T={settings['threshold']}; final semi-axes={settings['min_radius']:.0f}-"
