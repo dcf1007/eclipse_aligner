@@ -4,8 +4,9 @@ This milestone intentionally contains the user interface only. Detection,
 threshold candidate generation, ellipse fitting, horizon handling, and image
 centering are not implemented yet. The interface is based on the latest GUI from
 ``refactor/cleanup-performance`` and adds a mutually exclusive centering target:
-light ellipse (default) or dark ellipse. Sliders retain keyboard focus after
-clicking, and GUI-only Auto select buttons are provided for threshold and radius.
+light ellipse (default) or dark ellipse. A clicked slider retains keyboard focus
+for arrow-key adjustment until the mouse is clicked anywhere outside that slider.
+GUI-only Auto select buttons are provided for threshold and radius.
 """
 
 from __future__ import annotations
@@ -73,6 +74,10 @@ class DetectorApp:
         self.build_previews()
         self.update_center_preview_label()
 
+        # Tk's toplevel bindtag receives mouse events from every child widget.
+        # Use it to clear slider keyboard focus as soon as the user clicks
+        # anywhere outside the currently focused slider.
+        root.bind("<ButtonPress-1>", self.release_scale_focus_if_outside, add="+")
         root.bind("<Return>", lambda _event: self.apply_full_resolution())
         root.bind("<Escape>", lambda _event: self.close())
 
@@ -339,6 +344,18 @@ class DetectorApp:
     def focus_scale(event):
         """Keep a clicked slider focused so arrow keys continue to adjust it."""
         event.widget.focus_set()
+
+    def release_scale_focus_if_outside(self, event):
+        """Release slider focus immediately when the mouse clicks elsewhere.
+
+        Clicking the focused slider itself keeps focus. Clicking a different slider
+        transfers focus through that slider's own ButtonPress binding, so this
+        handler also leaves it alone. Any non-slider click removes the keyboard
+        focus ring from the previously focused slider.
+        """
+        focused = self.root.focus_get()
+        if isinstance(focused, tk.Scale) and event.widget is not focused:
+            self.root.focus_set()
 
     def build_previews(self):
         frame = tk.Frame(self.root, padx=10)
