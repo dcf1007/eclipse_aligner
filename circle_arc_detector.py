@@ -6,7 +6,8 @@ centering are not implemented yet. The interface is based on the latest GUI from
 ``refactor/cleanup-performance`` and adds a mutually exclusive centering target:
 light ellipse (default) or dark ellipse. A clicked slider retains keyboard focus
 for arrow-key adjustment until the mouse is clicked anywhere outside that slider.
-GUI-only Auto select buttons are provided for threshold and radius.
+GUI-only Auto select buttons are provided for threshold and radius, and a
+Save centered images placeholder is available beside the image-loading control.
 """
 
 from __future__ import annotations
@@ -165,21 +166,28 @@ class DetectorApp:
     def build_navigation(self):
         frame = tk.Frame(self.root, padx=10)
         frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
-        frame.columnconfigure(3, weight=1)
+        frame.columnconfigure(4, weight=1)
 
         tk.Button(frame, text="Load images...", width=14, command=self.load_images).grid(
             row=0, column=0, padx=(0, 8)
         )
+        self.save_centered_button = tk.Button(
+            frame,
+            text="Save centered images",
+            width=20,
+            command=self.save_centered_images,
+        )
+        self.save_centered_button.grid(row=0, column=1, padx=(0, 10))
         self.previous_button = tk.Button(
             frame, text="◀ Previous", width=12, command=self.previous_image
         )
-        self.previous_button.grid(row=0, column=1, padx=(0, 5))
+        self.previous_button.grid(row=0, column=2, padx=(0, 5))
         self.next_button = tk.Button(
             frame, text="Next ▶", width=12, command=self.next_image
         )
-        self.next_button.grid(row=0, column=2, padx=(0, 10))
+        self.next_button.grid(row=0, column=3, padx=(0, 10))
         tk.Label(frame, textvariable=self.image_info, anchor="w").grid(
-            row=0, column=3, sticky="ew"
+            row=0, column=4, sticky="ew"
         )
 
     def build_controls(self):
@@ -389,6 +397,11 @@ class DetectorApp:
     # ------------------------------------------------------------------
     # GUI-only actions
     # ------------------------------------------------------------------
+    def save_centered_images(self):
+        self.status.set(
+            "Save centered images: export functionality is not implemented in the GUI milestone."
+        )
+
     def auto_select_threshold(self):
         self.status.set(
             "Auto select threshold: algorithm not implemented in the GUI milestone."
