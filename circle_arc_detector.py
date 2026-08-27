@@ -212,6 +212,40 @@ def deepest_component_point(component_u8: np.ndarray) -> tuple[int, int]:
     return int(x), int(y)
 
 
+def brightest_supported_component_point(
+    gray: np.ndarray,
+    component_u8: np.ndarray,
+) -> tuple[int, int]:
+    """Choose the brightest robust interior seed; depth breaks brightness ties.
+
+    Seed candidates normally must survive a 5x5 erosion of the component. This
+    prevents an isolated hot pixel, one-pixel filament, or boundary artifact from
+    becoming the solar seed. If a very thin component has no 5x5-supported pixel,
+    the component itself is used as a deterministic fallback.
+    """
+    source = (component_u8 != 0).astype(np.uint8)
+    if gray.shape != source.shape:
+        raise ValueError("gray and component must have identical shapes")
+    if not np.any(source):
+        raise ThresholdResolutionError("Empty component")
+
+    supported = cv2.erode(
+        source,
+        np.ones((5, 5), dtype=np.uint8),
+        iterations=1,
+    ) != 0
+    if not np.any(supported):
+        supported = source != 0
+
+    max_gray = int(gray[supported].max())
+    brightest = supported & (gray == max_gray)
+
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    scores = np.where(brightest, distance, -1.0)
+    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    return int(x), int(y)
+
+
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -263,7 +297,7 @@ def coarse_threshold_search(work_gray: np.ndarray) -> CoarseThresholdResult:
             continue
         seed_threshold = int(threshold)
         seed_mask = np.where(component, 255, 0).astype(np.uint8)
-        seed_point = deepest_component_point(seed_mask)
+        seed_point = brightest_supported_component_point(work_gray, seed_mask)
         break
 
     if seed_threshold is None or seed_point is None or seed_mask is None:
@@ -324,7 +358,7 @@ def establish_full_resolution_seed(
     coarse_seed_mask: np.ndarray,
     seed_threshold: int,
 ) -> tuple[int, int]:
-    """Map only the coarse seed bbox and pick an actual bright original pixel."""
+    """Map the coarse solar seed and choose a bright, well-supported source pixel."""
     ys, xs = np.nonzero(coarse_seed_mask)
     if len(xs) == 0:
         raise ThresholdResolutionError("Coarse seed mask is empty")
@@ -340,19 +374,12 @@ def establish_full_resolution_seed(
     local_gray = full_gray[y0:y1, x0:x1]
     candidate = mapped & (local_gray > int(seed_threshold))
 
-    if not np.any(candidate):
-        # This does not choose T; it only recovers an original-resolution coordinate
-        # underneath the known coarse solar seed if area averaging shifted all local
-        # values across Tstart.
-        cy, cx = np.nonzero(mapped)
-        if len(cx) == 0:
-            raise ThresholdResolutionError("Mapped solar seed is empty")
-        values = local_gray[cy, cx]
-        i = int(np.argmax(values))
-        return x0 + int(cx[i]), y0 + int(cy[i])
+    source = candidate if np.any(candidate) else mapped
+    if not np.any(source):
+        raise ThresholdResolutionError("Mapped solar seed is empty")
 
-    local = np.where(candidate, 255, 0).astype(np.uint8)
-    px, py = deepest_component_point(local)
+    local = np.where(source, 255, 0).astype(np.uint8)
+    px, py = brightest_supported_component_point(local_gray, local)
     return x0 + px, y0 + py
 
 
