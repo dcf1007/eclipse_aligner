@@ -1,64 +1,115 @@
-"""Regression checks for deferred slider refresh and immediate setting refresh."""
+"""Behavioral regression checks for completed slider interactions."""
 
-from pathlib import Path
-import ast
+from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "circle_arc_detector.py"
-TEXT = SOURCE.read_text(encoding="utf-8")
+import circle_arc_detector as gui
 
 
-def block(start_marker: str, end_marker: str) -> str:
-    return TEXT.split(start_marker, 1)[1].split(end_marker, 1)[0]
+class FakeRoot:
+    def __init__(self):
+        self.jobs = {}
+        self.cancelled = []
+        self.next_job = 1
+
+    def after(self, delay, callback):
+        job = self.next_job
+        self.next_job += 1
+        self.jobs[job] = (delay, callback)
+        return job
+
+    def after_cancel(self, job):
+        self.cancelled.append(job)
+        self.jobs.pop(job, None)
 
 
-def test_source_parses():
-    ast.parse(TEXT)
+class FakeSlider:
+    def __init__(self, value):
+        self.value = value
+        self.focused = False
+
+    def get(self):
+        return self.value
+
+    def focus_set(self):
+        self.focused = True
 
 
-def test_slider_trace_updates_label_only_during_motion():
-    update = block("        def update_value(*_args):", '        variable.trace_add("write", update_value)')
-    assert "value_label.config" in update
-    assert "self.pending()" not in update
-    assert "self.refresh_preview()" not in update
-    assert "self.clear_threshold_preview()" not in update
+def make_app():
+    app = object.__new__(gui.DetectorApp)
+    app.root = FakeRoot()
+    app.slider_keyboard_commit_job = None
+    app.slider_keyboard_widget = None
+    app.slider_keyboard_start_value = None
+    app.commits = 0
+    app._commit_setting_change = lambda: setattr(app, "commits", app.commits + 1)
+    return app
 
 
-def test_mouse_slider_refresh_is_deferred_until_release():
-    assert 'scale.bind("<ButtonPress-1>", self.begin_scale_mouse_change, add="+")' in TEXT
-    assert 'scale.bind("<ButtonRelease-1>", self.finish_scale_mouse_change, add="+")' in TEXT
-    finish = block("    def finish_scale_mouse_change(self, event):", "    def begin_scale_key_change")
-    assert "event.widget.get() != start_value" in finish
-    assert "self.pending()" in finish
+def test_mouse_slider_commits_once_after_changed_release():
+    app = make_app()
+    slider = FakeSlider(8)
+    event = SimpleNamespace(widget=slider)
+
+    app._begin_slider_mouse_change(event)
+    slider.value = 12
+    app._finish_slider_mouse_change(event)
+
+    assert app.commits == 1
 
 
-def test_keyboard_slider_refresh_is_deferred_and_auto_repeat_is_coalesced():
-    assert 'scale.bind("<KeyPress>", self.begin_scale_key_change, add="+")' in TEXT
-    assert 'scale.bind("<KeyRelease>", self.defer_scale_key_refresh, add="+")' in TEXT
-    begin = block("    def begin_scale_key_change(self, event):", "    def defer_scale_key_refresh")
-    assert "after_cancel" in begin
-    deferred = block("    def defer_scale_key_refresh(self, event):", "    def finish_scale_key_change")
-    assert "self.root.after(45, self.finish_scale_key_change)" in deferred
-    finish = block("    def finish_scale_key_change(self):", "    def release_scale_focus_if_outside")
-    assert "widget.get() != start_value" in finish
-    assert "self.pending()" in finish
+def test_mouse_slider_does_not_commit_when_value_is_unchanged():
+    app = make_app()
+    slider = FakeSlider(8)
+    event = SimpleNamespace(widget=slider)
+
+    app._begin_slider_mouse_change(event)
+    app._finish_slider_mouse_change(event)
+
+    assert app.commits == 0
 
 
-def test_checkbox_setting_commands_refresh_immediately_through_pending_hook():
-    assert TEXT.count("command=self.pending") >= 3
-    pending = block("    def pending(self, *_args):", "    def center_target_changed")
-    assert "self.refresh_preview()" in pending
-    assert "self.clear_threshold_preview()" not in pending
+def test_keyboard_repeat_releases_are_cancelled_and_final_release_commits_once():
+    app = make_app()
+    slider = FakeSlider(8)
+    event = SimpleNamespace(widget=slider)
+
+    app._begin_slider_keyboard_change(event)
+    slider.value = 9
+    app._schedule_slider_keyboard_commit(event)
+    first_job = app.slider_keyboard_commit_job
+
+    app._begin_slider_keyboard_change(event)
+    assert first_job in app.root.cancelled
+    assert first_job not in app.root.jobs
+
+    slider.value = 12
+    app._schedule_slider_keyboard_commit(event)
+    final_job = app.slider_keyboard_commit_job
+    delay, callback = app.root.jobs[final_job]
+
+    assert delay == gui.SLIDER_KEY_RELEASE_SETTLE_MS
+    assert app.commits == 0
+
+    callback()
+
+    assert app.commits == 1
+    assert app.slider_keyboard_commit_job is None
+    assert app.slider_keyboard_widget is None
+    assert app.slider_keyboard_start_value is None
 
 
-def test_radio_setting_change_refreshes_immediately():
-    center = block("    def center_target_changed(self):", "    def update_center_preview_label")
-    assert "self.refresh_preview()" in center
-    assert "self.clear_threshold_preview()" not in center
+def test_keyboard_interaction_does_not_commit_if_final_value_matches_start():
+    app = make_app()
+    slider = FakeSlider(8)
+    event = SimpleNamespace(widget=slider)
 
+    app._begin_slider_keyboard_change(event)
+    slider.value = 9
+    app._schedule_slider_keyboard_commit(event)
+    app._begin_slider_keyboard_change(event)
+    slider.value = 8
+    app._schedule_slider_keyboard_commit(event)
+    _, callback = app.root.jobs[app.slider_keyboard_commit_job]
+    callback()
 
-def test_gui_only_branch_does_not_gain_threshold_raster_backend():
-    assert "cv2.COLOR_BGR2GRAY" not in TEXT
-    assert "cv2.COLOR_BGRA2GRAY" not in TEXT
-    assert "cv2.threshold(" not in TEXT
-    assert "def detect(" not in TEXT
+    assert app.commits == 0

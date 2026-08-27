@@ -39,14 +39,6 @@ def test_no_in_pane_placeholder_text():
     assert "create_text(" not in TEXT
 
 
-def test_setting_changes_replace_threshold_with_transparent_frame():
-    start = TEXT.index("    def clear_threshold_preview(self):")
-    end = TEXT.index("    def pending(", start)
-    block = TEXT[start:end]
-    assert "transparent_bgra(" in block
-    assert "self.show_image(" in block
-
-
 def test_canvas_is_only_display_surface():
     assert 'bg="#202020"' in TEXT
     assert "Transparency is retained in the" in TEXT

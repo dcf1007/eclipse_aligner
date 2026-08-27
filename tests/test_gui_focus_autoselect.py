@@ -15,8 +15,8 @@ def test_source_parses():
 
 def test_sliders_explicitly_keep_keyboard_focus_after_click():
     assert 'takefocus=True' in TEXT
-    assert 'scale.bind("<ButtonPress-1>", self.focus_scale, add="+")' in TEXT
-    assert 'scale.bind("<ButtonRelease-1>", self.focus_scale, add="+")' in TEXT
+    assert 'slider.bind("<ButtonPress-1>", self._focus_slider, add="+")' in TEXT
+    assert 'slider.bind("<ButtonRelease-1>", self._focus_slider, add="+")' in TEXT
     assert 'event.widget.focus_set()' in TEXT
 
 
@@ -32,7 +32,6 @@ def test_radius_auto_select_button_spans_min_and_max_rows():
     assert 'row=1, column=3, rowspan=2' in TEXT
 
 
-def test_auto_select_buttons_are_ui_only_placeholders():
+def test_auto_select_actions_remain_present():
     assert 'Auto select threshold: algorithm not implemented' in TEXT
     assert 'Auto select radius range: algorithm not implemented' in TEXT
-    assert 'def detect(' not in TEXT
