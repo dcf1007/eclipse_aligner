@@ -467,6 +467,7 @@ class DetectorApp:
         )
 
     def auto_select_threshold(self):
+        self.refresh_preview()
         self.status.set(
             "Auto select threshold: algorithm not implemented in the GUI milestone."
         )
