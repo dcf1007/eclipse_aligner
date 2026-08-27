@@ -1,8 +1,7 @@
 """GUI-first eclipse detector shell.
 
-This milestone intentionally contains the user interface only. Detection,
-threshold candidate generation, ellipse fitting, horizon handling, and image
-centering are not implemented yet. The interface is based on the latest GUI from
+This milestone intentionally contains the user interface only. Detection, ellipse fitting, horizon handling, and image centering are not
+implemented yet. The interface is based on the latest GUI from
 ``refactor/cleanup-performance`` and adds a mutually exclusive centering target:
 light ellipse (default) or dark ellipse. A clicked slider retains keyboard focus
 for arrow-key adjustment until the mouse is clicked anywhere outside that slider.
@@ -302,19 +301,8 @@ class DetectorApp:
             command=self.center_target_changed,
         ).grid(row=0, column=2, sticky="w")
 
-        tk.Label(frame, text="Useful threshold candidates:").grid(
-            row=7, column=0, sticky="nw"
-        )
-        self.palette_frame = tk.Frame(frame)
-        self.palette_frame.grid(row=7, column=1, columnspan=3, sticky="w", pady=(0, 8))
-        tk.Label(
-            self.palette_frame,
-            text="Not implemented yet",
-            fg="#666666",
-        ).grid(row=0, column=0, sticky="w")
-
         button_frame = tk.Frame(frame)
-        button_frame.grid(row=8, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        button_frame.grid(row=7, column=0, columnspan=4, sticky="w", pady=(2, 0))
         self.preview_button = tk.Button(
             button_frame,
             text="Refresh Preview",
@@ -336,7 +324,7 @@ class DetectorApp:
             anchor="w",
             justify="left",
             wraplength=1150,
-        ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
     def add_scale(self, parent, row, text, variable, low, high, resolution, formatter):
         tk.Label(parent, text=text, width=42, anchor="w").grid(
