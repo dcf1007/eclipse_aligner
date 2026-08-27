@@ -5,6 +5,8 @@ import ast
 
 import numpy as np
 
+import circle_arc_detector as cad
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "circle_arc_detector.py"
 TEXT = SOURCE.read_text(encoding="utf-8")
@@ -21,14 +23,9 @@ def test_production_uses_tested_3bin_kernel_and_no_gaussian_sigma():
 
 
 def test_local_peak_signal_only_uses_immediate_neighbor_bins():
-    namespace = {}
-    block = TEXT.split("PEAK_KERNEL =", 1)[1].split("def _local_peaks", 1)[0]
-    exec("PEAK_KERNEL =" + block, {"np": np}, namespace)
-    signal_fn = namespace["local_peak_signal"]
-
     hist = np.zeros(256, dtype=np.float64)
     hist[100] = 4.0
-    signal = signal_fn(hist)
+    signal = cad.local_peak_signal(hist)
 
     expected = np.zeros(256, dtype=np.float64)
     expected[99] = 1.0
