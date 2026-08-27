@@ -1,4 +1,4 @@
-"""Regression checks for alpha-backed previews and stale-preview invalidation."""
+"""Regression checks for alpha-backed previews and refresh event semantics."""
 
 from pathlib import Path
 import ast
@@ -28,20 +28,20 @@ def test_transparency_is_not_faked_by_tk_background_matching():
     assert "Transparency is retained in the" in TEXT
 
 
-def test_setting_changes_invalidate_threshold_preview():
-    assert "def clear_threshold_preview(self):" in TEXT
-    clear = TEXT.split("def clear_threshold_preview(self):", 1)[1].split("def pending", 1)[0]
-    assert "transparent_bgra(" in clear
-    assert "self.show_image(" in clear
+def test_discrete_setting_changes_regenerate_threshold_preview():
     pending = TEXT.split("def pending(self, *_args):", 1)[1].split("def center_target_changed", 1)[0]
-    assert "self.clear_threshold_preview()" in pending
+    assert "self.refresh_preview()" in pending
+    assert "self.clear_threshold_preview()" not in pending
 
 
-def test_center_target_change_also_invalidates_threshold_preview():
+def test_center_target_change_regenerates_threshold_preview():
     block = TEXT.split("def center_target_changed(self):", 1)[1].split("def update_center_preview_label", 1)[0]
-    assert "self.clear_threshold_preview()" in block
+    assert "self.refresh_preview()" in block
+    assert "self.clear_threshold_preview()" not in block
 
 
-def test_refresh_and_apply_remain_explicit_recompute_actions():
-    assert "def refresh_preview(self):" in TEXT
-    assert "def apply_full_resolution(self):" in TEXT
+def test_refresh_and_apply_actions_render_existing_threshold_backend():
+    refresh = TEXT.split("def refresh_preview(self):", 1)[1].split("def apply_full_resolution", 1)[0]
+    apply = TEXT.split("def apply_full_resolution(self):", 1)[1].split("def schedule_redraw", 1)[0]
+    assert "self.render_threshold_preview()" in refresh
+    assert "self.render_threshold_preview()" in apply
