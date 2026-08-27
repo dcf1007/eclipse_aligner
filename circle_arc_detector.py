@@ -9,8 +9,10 @@ GUI-only Auto select buttons are provided for threshold and radius, and a
 Save centered images placeholder is available beside the image-loading control.
 The preview rasters contain no placeholder text. Empty preview regions are stored
 as BGRA image data with alpha=0 rather than simulated with a matching Tk background.
-Any setting change replaces the threshold preview with a fully transparent BGRA
-frame until the next explicit Refresh Preview or Apply Full Resolution action.
+Setting controls request preview refreshes through the existing GUI hook. Slider
+motion only updates the displayed value; preview refresh is deferred until mouse
+release or the final keyboard key release, while checkbox/radio changes refresh
+immediately. This GUI-only milestone does not generate a threshold raster.
 """
 
 from __future__ import annotations
@@ -65,6 +67,13 @@ class DetectorApp:
         self.threshold_photo = None
         self.color_photo = None
         self.resize_job = None
+
+        # Keyboard auto-repeat can emit intermediate release/press pairs on some
+        # Tk platforms. Keep one deferred refresh job so only the final key-up
+        # commits a slider-driven preview refresh.
+        self.scale_key_release_job = None
+        self.scale_key_widget = None
+        self.scale_key_start_value = None
 
         self.threshold = tk.IntVar(value=args.threshold)
         self.min_radius = tk.IntVar(value=round(args.min_radius))
@@ -345,16 +354,21 @@ class DetectorApp:
         scale.grid(row=row, column=1, sticky="ew", pady=2)
 
         # Tk Scale supports precise arrow-key adjustment while it owns keyboard
-        # focus. Explicitly focus the clicked scale and leave focus there after the
-        # mouse interaction, instead of relying on platform-specific focus policy.
+        # focus. Value traces update only the label. Preview refresh is deliberately
+        # deferred until the user finishes the mouse or keyboard interaction.
         scale.bind("<ButtonPress-1>", self.focus_scale, add="+")
+        scale.bind("<ButtonPress-1>", self.begin_scale_mouse_change, add="+")
         scale.bind("<ButtonRelease-1>", self.focus_scale, add="+")
+        scale.bind("<ButtonRelease-1>", self.finish_scale_mouse_change, add="+")
+        scale.bind("<KeyPress>", self.begin_scale_key_change, add="+")
+        scale.bind("<KeyRelease>", self.defer_scale_key_refresh, add="+")
         value_label = tk.Label(parent, width=18, anchor="e")
         value_label.grid(row=row, column=2, pady=2)
 
         def update_value(*_args):
+            # Do not refresh here: this trace fires continuously while the Scale is
+            # dragged or while an arrow key auto-repeats.
             value_label.config(text=formatter(variable.get()))
-            self.pending()
 
         variable.trace_add("write", update_value)
         update_value()
@@ -363,6 +377,45 @@ class DetectorApp:
     def focus_scale(event):
         """Keep a clicked slider focused so arrow keys continue to adjust it."""
         event.widget.focus_set()
+
+    @staticmethod
+    def begin_scale_mouse_change(event):
+        """Remember the value before a mouse slider interaction begins."""
+        event.widget._preview_mouse_start_value = event.widget.get()
+
+    def finish_scale_mouse_change(self, event):
+        """Refresh once after a mouse slider change has actually finished."""
+        start_value = getattr(event.widget, "_preview_mouse_start_value", None)
+        if start_value is not None and event.widget.get() != start_value:
+            self.pending()
+
+    def begin_scale_key_change(self, event):
+        """Start/coalesce a keyboard slider interaction without refreshing."""
+        if self.scale_key_release_job is not None:
+            self.root.after_cancel(self.scale_key_release_job)
+            self.scale_key_release_job = None
+        if self.scale_key_widget is not event.widget:
+            self.scale_key_widget = event.widget
+            self.scale_key_start_value = event.widget.get()
+
+    def defer_scale_key_refresh(self, event):
+        """Refresh after the final KeyRelease, not during key auto-repeat."""
+        if self.scale_key_widget is not event.widget:
+            self.scale_key_widget = event.widget
+            self.scale_key_start_value = event.widget.get()
+        if self.scale_key_release_job is not None:
+            self.root.after_cancel(self.scale_key_release_job)
+        self.scale_key_release_job = self.root.after(45, self.finish_scale_key_change)
+
+    def finish_scale_key_change(self):
+        """Commit one preview refresh after keyboard slider input becomes idle."""
+        self.scale_key_release_job = None
+        widget = self.scale_key_widget
+        start_value = self.scale_key_start_value
+        self.scale_key_widget = None
+        self.scale_key_start_value = None
+        if widget is not None and start_value is not None and widget.get() != start_value:
+            self.pending()
 
     def release_scale_focus_if_outside(self, event):
         """Release slider focus immediately when the mouse clicks elsewhere.
@@ -437,15 +490,13 @@ class DetectorApp:
             )
 
     def pending(self, *_args):
-        self.clear_threshold_preview()
-        self.status.set(
-            "Settings changed. Threshold preview cleared; Refresh Preview or Apply Full Resolution to recompute."
-        )
+        """Request an immediate preview refresh after a discrete setting change."""
+        self.refresh_preview()
 
     def center_target_changed(self):
-        self.clear_threshold_preview()
         self.update_center_preview_label()
         target = "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
+        self.refresh_preview()
         self.status.set(
             f"Centering target set to {target}. Actual centering will be implemented with ellipse detection."
         )
