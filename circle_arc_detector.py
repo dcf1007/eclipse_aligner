@@ -68,7 +68,7 @@ import cv2
 import numpy as np
 
 WORK_MAX_DIM = 1200
-HISTOGRAM_SIGMA = 3.0
+PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 ROI_DILATION_FRACTION = 0.065
 GUARD_DILATION_FRACTION = 0.195
 
@@ -153,18 +153,18 @@ def resize_gray_max_dim(gray: np.ndarray, max_dim: int = WORK_MAX_DIM) -> np.nda
     )
 
 
-def _gaussian_kernel_1d(sigma: float) -> np.ndarray:
-    radius = max(1, int(math.ceil(3.0 * sigma)))
-    x = np.arange(-radius, radius + 1, dtype=np.float64)
-    kernel = np.exp(-0.5 * (x / sigma) ** 2)
-    return kernel / kernel.sum()
+def local_peak_signal(histogram: np.ndarray) -> np.ndarray:
+    """Return a 3-bin [1,2,1]/4 signal for local peak/valley detection."""
+    hist = np.asarray(histogram, dtype=np.float64)
+    if hist.shape != (256,):
+        raise ValueError(f"Expected 256-bin histogram, got shape {hist.shape}")
+    return np.convolve(hist, PEAK_KERNEL, mode="same")
 
 
-def smoothed_histogram(gray: np.ndarray, sigma: float = HISTOGRAM_SIGMA):
-    """Return exact 256-bin histogram plus a peak-finding-only smoothed copy."""
+def histogram_with_peak_signal(gray: np.ndarray):
+    """Return exact histogram plus the local 3-bin peak/valley signal."""
     hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
-    smooth = np.convolve(hist, _gaussian_kernel_1d(sigma), mode="same")
-    return hist, smooth
+    return hist, local_peak_signal(hist)
 
 
 def _local_peaks(values: np.ndarray) -> list[int]:
@@ -187,10 +187,10 @@ def _preceding_valley(values: np.ndarray, peak: int) -> int:
 
 
 def rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
-    """Rightmost smoothed mode and the valley defining its left edge."""
-    _hist, smooth = smoothed_histogram(gray)
-    peak = max(_local_peaks(smooth))
-    return int(peak), int(_preceding_valley(smooth, peak))
+    """Rightmost locally smoothed mode and the valley defining its left edge."""
+    _hist, signal = histogram_with_peak_signal(gray)
+    peak = max(_local_peaks(signal))
+    return int(peak), int(_preceding_valley(signal, peak))
 
 
 def deepest_component_point(component_u8: np.ndarray) -> tuple[int, int]:
