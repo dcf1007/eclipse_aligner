@@ -1,46 +1,57 @@
-"""GUI foundation for the eclipse alignment application.
+"""Eclipse alignment GUI with grayscale automatic threshold selection.
 
-This branch defines the user-interface contract independently from the detector
-backend. It intentionally contains image loading and navigation, control layout,
-preview surfaces, focus behavior, completed-setting event handling, and backend
-hooks, while ellipse fitting, horizon detection, centering, export, automatic
-threshold selection, automatic radius selection, and threshold-raster generation
-remain outside this GUI-only implementation. The interface descends from the
-``refactor/cleanup-performance`` GUI and retains its established layout and
-keyboard interaction model.
+This module combines the application's user-interface foundation with the tested
+image-only automatic threshold finder. The GUI owns image navigation, per-image
+processing settings, control interaction, preview lifecycle, and cached automatic
+threshold results. The threshold finder itself remains independent of GUI state: it accepts the
+authoritative 8-bit grayscale brightness image and returns an
+``AutoThresholdResult`` describing the selected threshold and the topology used
+to obtain it. Color-to-grayscale conversion is an input-stage responsibility and
+is performed before the threshold algorithm is called.
 
-The centering target is represented by one shared Tk ``StringVar`` and two mutually
-exclusive radio buttons: Light ellipse is the default and Dark ellipse is the
-alternative. Sliders retain keyboard focus after a click so arrow keys can make
-precise adjustments; clicking elsewhere releases that focus. A slider's numeric
-label updates continuously while it moves, but setting completion is delayed until
-mouse release or the final keyboard key release. Keyboard auto-repeat may emit
-intermediate release/press pairs on some Tk platforms, so those releases are
-coalesced through a short settling window. Checkboxes, radio buttons, and Auto
-select controls commit immediately because their interaction is already discrete.
+All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
+absolute image path. Each image entry is a normal dictionary with exactly two
+conceptual fields: ``settings`` is an ``ImageSettings`` instance containing only
+sparse overrides from that image's baseline values, while
+``auto_threshold_result`` caches the complete automatic threshold result. Ordinary controls use the application defaults as their baseline;
+the threshold uses the cached automatic threshold as its image-specific baseline.
+Returning a control to its baseline removes that key from ``settings``. Reusing the
+cached automatic result means the threshold algorithm is not rerun when Auto select
+is clicked again for an unchanged loaded image.
 
-Completed setting changes are deliberately separate from explicit preview
-processing. They call ``_commit_setting_change()``, whose only responsibility is
-to invoke the lightweight ``_refresh_threshold_image()`` hook. In a backend-enabled
-branch that hook may rebuild the B/W image from the already-loaded grayscale image
-and the current threshold, but it must not run ellipse, horizon, candidate, or
-other Refresh Preview processing. The full ``refresh_preview()`` action is reserved
-for an explicit Refresh Preview request or for initialization after a readable
-image is loaded. In this GUI-only branch both backend hooks remain placeholders and
-no grayscale or B/W threshold backend is implemented.
+Slider labels update continuously, but a setting is committed only after mouse
+release or the final keyboard key release. Keyboard auto-repeat can emit temporary
+release/press pairs on some Tk platforms, so releases are coalesced through a short
+settling window. Checkboxes and radio buttons commit immediately. A completed
+setting change calls ``_commit_setting_change(setting_name)``; that function updates
+only the changed sparse override and then invokes ``_refresh_threshold_image()``.
+That lightweight path performs only the current-T B/W conversion and threshold-pane
+update. It does not run the broader Refresh Preview processing path.
 
-Preview rasters contain no placeholder text. Empty preview regions are represented
-as real BGRA image data with alpha=0, while loaded source-image pixels are made
-fully opaque. Transparency is retained in the raster itself rather than simulated
-by matching the Tk canvas background. The Save centered images control, threshold
-Auto select, radius Auto select, Refresh Preview, and Apply Full Resolution actions
-remain present as interface/backend boundaries for later implementation.
+``refresh_preview()`` is the explicit preview-processing entry point and is invoked
+when the user clicks Refresh Preview or when a readable image is loaded. At the
+current implementation stage its only image-processing result is still the B/W
+threshold preview, but later ellipse, arc, and horizon preview processing belongs
+there rather than in completed-setting commits. Apply Full Resolution remains a
+separate explicit action. Radius auto-selection, ellipse fitting, horizon handling,
+centering, and export are not implemented yet.
+
+The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
+``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel working
+raster with INTER_AREA, uses the rightmost locally smoothed histogram mode only to
+establish a solar seed, tracks 8-connected component topology, maps the seed back
+to full resolution, constructs rounded 6.5% and 19.5% observation regions, and
+selects the lowest full-resolution threshold whose tracked component is genuinely
+separated. If topology cannot be resolved, the deterministic fallback is the left
+edge of the rightmost histogram peak. No HSV/color thresholding, Otsu thresholding,
+ellipse-fit score, bright-pixel dominance, competitor gain, or horizon special case
+is part of automatic threshold selection.
 """
-
-from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
+import math
 import os
 import tkinter as tk
 from tkinter import filedialog
@@ -72,14 +83,463 @@ def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
     return bgra
 
 
-class DetectorApp:
-    """Own the GUI state, widgets, interaction rules, and preview hooks.
+# ---------------------------------------------------------------------------
+# Per-image processing settings
+# ---------------------------------------------------------------------------
+@dataclass
+class ImageSettings:
+    """Sparse per-image overrides; ``None`` means use that setting's baseline."""
 
-    The class manages the ordered image list, alpha-aware preview rasters, settings,
-    navigation, slider focus, completed-setting commits, and canvas redraws. Public
-    methods correspond to application actions; underscore-prefixed methods are
-    implementation details used by Tk callbacks or rendering internals. Detector
-    work is intentionally represented only by backend hooks in this branch.
+    threshold: int | None = None
+    min_radius: int | None = None
+    max_radius: int | None = None
+    max_error: float | None = None
+    min_coverage: int | None = None
+    morphology: bool | None = None
+    outer_limb_assistance: bool | None = None
+    use_horizon: bool | None = None
+    center_target: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Grayscale automatic threshold finder
+# ---------------------------------------------------------------------------
+WORK_MAX_DIM = 1200
+PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
+ROI_DILATION_FRACTION = 0.065
+GUARD_DILATION_FRACTION = 0.195
+
+
+class ThresholdResolutionError(RuntimeError):
+    """Expected inability to establish/track a separated solar component."""
+
+
+@dataclass(frozen=True)
+class CoarseThresholdResult:
+    histogram_peak: int
+    histogram_left_edge: int
+    seed_threshold: int
+    seed_point: tuple[int, int]
+    seed_mask: np.ndarray
+    threshold: int
+    component_mask: np.ndarray
+    component_area: int
+    component_bbox: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class AutoThresholdResult:
+    threshold: int
+    histogram_peak: int
+    histogram_left_edge: int
+    seed_threshold: int
+    coarse_threshold: int | None
+    roi_seed_threshold: int | None
+    full_seed_point: tuple[int, int] | None
+    used_guard: bool
+    resolved: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ObservationRegion:
+    """Rounded component dilation stored in the smallest useful rectangular crop."""
+    bbox: tuple[int, int, int, int]       # x0, y0, x1, y1 in full image
+    allowed_u8: np.ndarray               # 255 inside rounded dilation, else 0
+    boundary: np.ndarray                 # True on the INNER edge of allowed region
+    gray: np.ndarray                     # view into full-resolution gray image
+    seed_local: tuple[int, int]
+    touches_left_image_edge: bool
+    touches_right_image_edge: bool
+    touches_top_image_edge: bool
+    touches_bottom_image_edge: bool
+
+
+def to_gray(image: np.ndarray) -> np.ndarray:
+    """Convert once to authoritative 8-bit grayscale."""
+    if image.ndim == 2:
+        return image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8)
+    if image.ndim == 3 and image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim == 3 and image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    raise ValueError(f"Unsupported image shape: {image.shape}")
+
+
+def resize_gray_max_dim(gray: np.ndarray, max_dim: int = WORK_MAX_DIM) -> np.ndarray:
+    """Downscale grayscale with area averaging; never upscale."""
+    h, w = gray.shape
+    if max(h, w) <= max_dim:
+        return gray.copy()
+    scale = float(max_dim) / float(max(h, w))
+    return cv2.resize(
+        gray,
+        (max(1, round(w * scale)), max(1, round(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def find_rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
+    """Return the rightmost 3-bin-smoothed mode and its preceding left valley."""
+    histogram = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
+
+    peaks: list[int] = []
+    for index in range(1, len(signal) - 1):
+        if signal[index] >= signal[index - 1] and signal[index] > signal[index + 1]:
+            peaks.append(index)
+    # Saturation itself is allowed to be the rightmost histogram mode.
+    if len(signal) >= 2 and signal[-1] > signal[-2]:
+        peaks.append(len(signal) - 1)
+    peak = max(peaks or [int(np.argmax(signal))])
+
+    left_edge = 0
+    for index in range(peak - 1, 0, -1):
+        if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
+            left_edge = index
+            break
+
+    return int(peak), int(left_edge)
+
+
+def deepest_component_point(component_u8: np.ndarray) -> tuple[int, int]:
+    """Choose an interior seed point; unlike a centroid this stays inside crescents."""
+    source = (component_u8 != 0).astype(np.uint8)
+    if not np.any(source):
+        raise ThresholdResolutionError("Empty component")
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    y, x = np.unravel_index(int(np.argmax(distance)), distance.shape)
+    return int(x), int(y)
+
+
+def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
+    """Return the largest 8-connected bright component enclosed by the raster."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (binary != 0).astype(np.uint8), 8
+    )
+    height, width = binary.shape
+    best = None
+    for label in range(1, count):
+        x, y, component_width, component_height, area = map(int, stats[label])
+        if (
+            x == 0
+            or y == 0
+            or x + component_width >= width
+            or y + component_height >= height
+        ):
+            continue
+        candidate = (area, label)
+        if best is None or candidate > best:
+            best = candidate
+    if best is None:
+        return None
+    return labels == best[1]
+
+
+def _touches_image_border(component: np.ndarray | None) -> bool:
+    """Return whether a tracked component is absent or reaches the image boundary."""
+    if component is None or not np.any(component):
+        return True
+    return bool(
+        np.any(component[0])
+        or np.any(component[-1])
+        or np.any(component[:, 0])
+        or np.any(component[:, -1])
+    )
+
+
+def coarse_threshold_search(work_gray: np.ndarray) -> CoarseThresholdResult:
+    """Establish the solar seed, then track it to the lowest enclosed coarse T."""
+    # Phase 1: histogram identity/start only. Descend from the left edge of the
+    # rightmost mode until the first enclosed bright component identifies the Sun.
+    peak, left_edge = find_rightmost_histogram_peak(work_gray)
+    seed_threshold = None
+    seed_point = None
+    seed_mask = None
+
+    for threshold in range(left_edge, -1, -1):
+        component = largest_enclosed_bright_component(work_gray > threshold)
+        if component is None:
+            continue
+        seed_threshold = int(threshold)
+        seed_mask = np.where(component, 255, 0).astype(np.uint8)
+        seed_point = deepest_component_point(seed_mask)
+        break
+
+    if seed_threshold is None or seed_point is None or seed_mask is None:
+        raise ThresholdResolutionError("No enclosed bright component exists")
+
+    # Phase 2: keep the same seed and lower T. Connectivity is monotone while T is
+    # lowered: pixels are only added, so once this tracked 8-connected component
+    # reaches the image border it cannot become enclosed again at a lower T.
+    lowest_threshold = seed_threshold
+    lowest_component = seed_mask != 0
+    seed_x, seed_y = seed_point
+    height, width = work_gray.shape
+
+    for threshold in range(seed_threshold, -1, -1):
+        binary = work_gray > threshold
+        if not (0 <= seed_x < width and 0 <= seed_y < height) or not bool(binary[seed_y, seed_x]):
+            continue
+
+        flooded = cv2.compare(binary.astype(np.uint8), 0, cv2.CMP_GT)
+        cv2.floodFill(flooded, None, seed_point, 128, flags=8)
+        component = flooded == 128
+        if _touches_image_border(component):
+            break
+
+        lowest_threshold = threshold
+        lowest_component = component
+
+    ys, xs = np.nonzero(lowest_component)
+    if len(xs) == 0:
+        raise ThresholdResolutionError("Empty component")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    component_area = int(len(xs))
+    component_bbox = (x0, y0, x1 - x0, y1 - y0)
+
+    return CoarseThresholdResult(
+        histogram_peak=peak,
+        histogram_left_edge=left_edge,
+        seed_threshold=seed_threshold,
+        seed_point=seed_point,
+        seed_mask=seed_mask,
+        threshold=int(lowest_threshold),
+        component_mask=np.where(lowest_component, 255, 0).astype(np.uint8),
+        component_area=component_area,
+        component_bbox=component_bbox,
+    )
+
+
+def _map_interval(lo: int, hi: int, source_n: int, target_n: int) -> tuple[int, int]:
+    out_lo = int(math.floor(lo * target_n / source_n))
+    out_hi = int(math.ceil(hi * target_n / source_n))
+    return max(0, out_lo), min(target_n, max(out_lo + 1, out_hi))
+
+
+def establish_full_resolution_seed(
+    full_gray: np.ndarray,
+    work_shape: tuple[int, int],
+    coarse_seed_mask: np.ndarray,
+    seed_threshold: int,
+) -> tuple[int, int]:
+    """Map only the coarse seed bbox and pick an actual bright original pixel."""
+    ys, xs = np.nonzero(coarse_seed_mask)
+    if len(xs) == 0:
+        raise ThresholdResolutionError("Coarse seed mask is empty")
+    sh, sw = work_shape
+    fh, fw = full_gray.shape
+    sx0, sx1 = int(xs.min()), int(xs.max()) + 1
+    sy0, sy1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = _map_interval(sx0, sx1, sw, fw)
+    y0, y1 = _map_interval(sy0, sy1, sh, fh)
+
+    coarse_crop = (coarse_seed_mask[sy0:sy1, sx0:sx1] != 0).astype(np.uint8)
+    mapped = cv2.resize(coarse_crop, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST) != 0
+    local_gray = full_gray[y0:y1, x0:x1]
+    candidate = mapped & (local_gray > int(seed_threshold))
+
+    if not np.any(candidate):
+        # This does not choose T; it only recovers an original-resolution coordinate
+        # underneath the known coarse solar seed if area averaging shifted all local
+        # values across Tstart.
+        cy, cx = np.nonzero(mapped)
+        if len(cx) == 0:
+            raise ThresholdResolutionError("Mapped solar seed is empty")
+        values = local_gray[cy, cx]
+        i = int(np.argmax(values))
+        return x0 + int(cx[i]), y0 + int(cy[i])
+
+    local = np.where(candidate, 255, 0).astype(np.uint8)
+    px, py = deepest_component_point(local)
+    return x0 + px, y0 + py
+
+
+def find_full_resolution_enclosed_seed_component(
+    full_gray: np.ndarray,
+    coarse_threshold: int,
+    seed_point: tuple[int, int],
+):
+    """Find an actual enclosed full-resolution component containing the solar seed."""
+    start_threshold = max(0, int(coarse_threshold))
+    seed_x, seed_y = seed_point
+
+    for threshold in range(start_threshold, 256):
+        binary = cv2.compare(full_gray, int(threshold), cv2.CMP_GT)
+        if binary[seed_y, seed_x] == 0:
+            continue
+
+        cv2.floodFill(binary, None, seed_point, 128, flags=8)
+        component = binary == 128
+        if not _touches_image_border(component):
+            return int(threshold), component
+
+        # Usually resolved at the coarse T or one level higher. The loop remains
+        # exhaustive so reduced-resolution mismatch cannot determine the final T.
+
+    raise ThresholdResolutionError(
+        "No enclosed original-resolution solar component"
+    )
+
+
+def _build_observation_region(
+    full_gray: np.ndarray,
+    component: np.ndarray,
+    margin: float,
+    seed_point: tuple[int, int],
+) -> ObservationRegion:
+    """Distance-dilate the actual component by margin and cache its inner boundary."""
+    ys, xs = np.nonzero(component)
+    if len(xs) == 0:
+        raise ThresholdResolutionError("Cannot dilate empty solar component")
+    h, w = full_gray.shape
+    padding = max(0, int(math.ceil(float(margin))))
+    x0 = max(0, int(xs.min()) - padding - 2)
+    x1 = min(w, int(xs.max()) + padding + 3)
+    y0 = max(0, int(ys.min()) - padding - 2)
+    y1 = min(h, int(ys.max()) + padding + 3)
+
+    component_crop = component[y0:y1, x0:x1]
+    outside = np.where(component_crop, 0, 255).astype(np.uint8)
+    distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
+    allowed = distance <= float(margin)
+    allowed_u8 = np.where(allowed, 255, 0).astype(np.uint8)
+
+    # Inner edge of the rounded region. If the tracked component reaches it, the
+    # observation is inconclusive and the caller retries the same T in 19.5% guard.
+    eroded = cv2.erode(allowed_u8, np.ones((3, 3), np.uint8), iterations=1)
+    boundary = allowed & (eroded == 0)
+
+    return ObservationRegion(
+        bbox=(x0, y0, x1, y1),
+        allowed_u8=allowed_u8,
+        boundary=boundary,
+        gray=full_gray[y0:y1, x0:x1],
+        seed_local=(seed_point[0] - x0, seed_point[1] - y0),
+        touches_left_image_edge=x0 == 0,
+        touches_right_image_edge=x1 == w,
+        touches_top_image_edge=y0 == 0,
+        touches_bottom_image_edge=y1 == h,
+    )
+
+
+def _evaluate_observation_region(region: ObservationRegion, threshold: int):
+    """Return (exists, touches_artificial_boundary, touches_true_image_border)."""
+    work = cv2.compare(region.gray, int(threshold), cv2.CMP_GT)
+    cv2.bitwise_and(work, region.allowed_u8, dst=work)
+    sx, sy = region.seed_local
+    if not (0 <= sx < work.shape[1] and 0 <= sy < work.shape[0]) or work[sy, sx] == 0:
+        return False, False, False
+
+    cv2.floodFill(work, None, (sx, sy), 128, flags=8)
+    component = work == 128
+    touches_artificial = bool(np.any(component & region.boundary))
+
+    touches_true = False
+    if region.touches_top_image_edge and np.any(component[0]):
+        touches_true = True
+    if region.touches_bottom_image_edge and np.any(component[-1]):
+        touches_true = True
+    if region.touches_left_image_edge and np.any(component[:, 0]):
+        touches_true = True
+    if region.touches_right_image_edge and np.any(component[:, -1]):
+        touches_true = True
+    return True, touches_artificial, touches_true
+
+
+def find_lowest_full_threshold(
+    full_gray: np.ndarray,
+    seed_point: tuple[int, int],
+    roi_seed_component: np.ndarray,
+):
+    """Scan T upward from zero and return the first genuinely separated threshold.
+
+    The 6.5% * sqrt(pixel_count) dilation is always tried first. Only if that flood
+    reaches its artificial rounded edge is the SAME T retried using 19.5%. A flood
+    that also reaches the 19.5% guard is treated as background-connected at that T.
+    """
+    h, w = full_gray.shape
+    image_scale = math.sqrt(float(w) * float(h))
+    roi = _build_observation_region(
+        full_gray, roi_seed_component, ROI_DILATION_FRACTION * image_scale, seed_point
+    )
+    guard = _build_observation_region(
+        full_gray, roi_seed_component, GUARD_DILATION_FRACTION * image_scale, seed_point
+    )
+
+    used_guard = False
+    for threshold in range(0, 256):
+        exists, touches_roi, touches_true = _evaluate_observation_region(roi, threshold)
+        if not exists or touches_true:
+            continue
+        if not touches_roi:
+            return int(threshold), used_guard
+
+        used_guard = True
+        exists, touches_guard, touches_true = _evaluate_observation_region(guard, threshold)
+        if exists and not touches_true and not touches_guard:
+            return int(threshold), used_guard
+
+    raise ThresholdResolutionError("Tracked solar component never became separated")
+
+
+def auto_threshold(gray: np.ndarray) -> AutoThresholdResult:
+    """Select T from an authoritative 8-bit grayscale brightness image."""
+    work_gray = resize_gray_max_dim(gray)
+    peak, left_edge = find_rightmost_histogram_peak(work_gray)
+
+    try:
+        coarse = coarse_threshold_search(work_gray)
+        full_seed = establish_full_resolution_seed(
+            gray, work_gray.shape, coarse.seed_mask, coarse.seed_threshold
+        )
+        roi_seed_threshold, roi_seed_component = (
+            find_full_resolution_enclosed_seed_component(
+                gray, coarse.threshold, full_seed
+            )
+        )
+        final_threshold, used_guard = find_lowest_full_threshold(
+            gray,
+            full_seed,
+            roi_seed_component,
+        )
+        return AutoThresholdResult(
+            threshold=final_threshold,
+            histogram_peak=coarse.histogram_peak,
+            histogram_left_edge=coarse.histogram_left_edge,
+            seed_threshold=coarse.seed_threshold,
+            coarse_threshold=coarse.threshold,
+            roi_seed_threshold=roi_seed_threshold,
+            full_seed_point=full_seed,
+            used_guard=used_guard,
+            resolved=True,
+        )
+    except ThresholdResolutionError as exc:
+        # Deterministic fallback: if component topology cannot be resolved, use
+        # the left side of the rightmost histogram peak rather than introducing
+        # color, Otsu, fixed-T, or ellipse-dependent heuristics.
+        return AutoThresholdResult(
+            threshold=int(left_edge),
+            histogram_peak=int(peak),
+            histogram_left_edge=int(left_edge),
+            seed_threshold=int(left_edge),
+            coarse_threshold=None,
+            roi_seed_threshold=None,
+            full_seed_point=None,
+            used_guard=False,
+            resolved=False,
+            reason=str(exc),
+        )
+
+
+class DetectorApp:
+    """Own GUI state, per-image settings, cached auto thresholds, and previews.
+
+    Public methods represent application actions. Underscore-prefixed methods are
+    Tk callback or rendering internals. Automatic threshold selection remains a
+    stateless image algorithm outside this class; this class only caches its result
+    per image and manages the effective processing settings shown by the controls.
     """
 
     def __init__(self, root: tk.Tk, image_paths: list[str], args: argparse.Namespace):
@@ -89,7 +549,13 @@ class DetectorApp:
         self.current_index = -1
         self.current_path: str | None = None
         self.color_image = None
+        self.gray_image = None
         self.threshold_preview = transparent_bgra()
+
+        # Per-image state keeps a sparse ImageSettings instance plus the cached
+        # automatic threshold result. No ImageState wrapper class is needed: the
+        # outer dictionary directly expresses the image-to-state hierarchy.
+        self.image_state: dict[str, dict[str, object]] = {}
 
         self.threshold_photo = None
         self.color_photo = None
@@ -116,10 +582,35 @@ class DetectorApp:
         self.center_target = tk.StringVar(value="light")
         self.center_preview_label = tk.StringVar()
 
-        self.status = tk.StringVar(value="GUI foundation. Load images to inspect the interface.")
+        # Every processing control is per-image. Ordinary controls use these values
+        # as their baseline; threshold instead uses the cached automatic T for the
+        # current image. Only deviations from those baselines are stored.
+        self.default_settings = ImageSettings(
+            min_radius=int(self.min_radius.get()),
+            max_radius=int(self.max_radius.get()),
+            max_error=float(self.max_error.get()),
+            min_coverage=int(self.min_coverage.get()),
+            morphology=bool(self.morphology.get()),
+            outer_limb_assistance=bool(self.outer_limb_assistance.get()),
+            use_horizon=bool(self.use_horizon.get()),
+            center_target=self.center_target.get(),
+        )
+        self.setting_variables = {
+            "threshold": self.threshold,
+            "min_radius": self.min_radius,
+            "max_radius": self.max_radius,
+            "max_error": self.max_error,
+            "min_coverage": self.min_coverage,
+            "morphology": self.morphology,
+            "outer_limb_assistance": self.outer_limb_assistance,
+            "use_horizon": self.use_horizon,
+            "center_target": self.center_target,
+        }
+
+        self.status = tk.StringVar(value="Threshold finder integrated. Load images to inspect automatic T selection.")
         self.image_info = tk.StringVar(value="No image loaded")
 
-        root.title("Ellipse / Arc Detector — GUI foundation")
+        root.title("Ellipse / Arc Detector — threshold finder")
         root.minsize(1050, 760)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
@@ -157,6 +648,7 @@ class DetectorApp:
         self.current_index = -1
         self.current_path = None
         self.color_image = None
+        self.gray_image = None
         self.threshold_preview = transparent_bgra()
         self.load_image_at(0)
 
@@ -171,22 +663,59 @@ class DetectorApp:
 
         if image is None:
             self.color_image = None
+            self.gray_image = None
             self.threshold_preview = transparent_bgra()
             self.threshold_photo = None
             self.color_photo = None
             self._redraw_previews()
             self.status.set(f"Could not load image: {path}")
         else:
-            # The preview pipeline is alpha-aware from the start. Source pixels are
-            # opaque; future centered output may use alpha=0 outside image data.
+            # Convert the original image to authoritative grayscale ONCE. The auto
+            # threshold module derives its 1200px INTER_AREA working raster from
+            # this grayscale image; no HSV/color threshold path exists.
             self.color_image = opaque_bgra(image)
-            height, width = image.shape[:2]
-            self.threshold_preview = transparent_bgra(width, height)
-            self._redraw_previews()
+            self.gray_image = to_gray(image)
+
+            restored = path in self.image_state
+            if restored:
+                state = self.image_state[path]
+                result = state["auto_threshold_result"]
+            else:
+                result = auto_threshold(self.gray_image)
+                state = {
+                    "settings": ImageSettings(),
+                    "auto_threshold_result": result,
+                }
+                self.image_state[path] = state
+
+            settings = state["settings"]
+            for setting_name, variable in self.setting_variables.items():
+                if setting_name == "threshold":
+                    baseline = int(result.threshold)
+                else:
+                    baseline = getattr(self.default_settings, setting_name)
+                override = getattr(settings, setting_name)
+                variable.set(baseline if override is None else override)
+
+            self._update_center_preview_label()
             self.refresh_preview()
-            self.status.set(
-                "Image loaded. Detector functionality is intentionally not implemented in the GUI foundation."
-            )
+            selected_threshold = int(self.threshold.get())
+
+            if restored:
+                self.status.set(
+                    f"Image loaded. Restored per-image settings at T={selected_threshold}."
+                )
+            elif result.resolved:
+                self.status.set(
+                    "Image loaded. Automatic grayscale threshold "
+                    f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                    f"histogram start={result.histogram_left_edge})."
+                )
+            else:
+                self.status.set(
+                    "Image loaded. Automatic component tracking was unresolved; "
+                    f"using rightmost-histogram left edge T={selected_threshold}."
+                )
 
         self.update_navigation_state()
 
@@ -257,23 +786,23 @@ class DetectorApp:
         radius_limit = max(1600, round(max(self.args.max_radius, self.args.min_radius) * 1.5))
 
         slider_specs = [
-            ("Brightness threshold (dark <= T, light > T)", self.threshold,
+            ("threshold", "Brightness threshold (dark <= T, light > T)", self.threshold,
              0, 255, 1, lambda v: str(int(float(v)))),
-            ("Minimum FINAL fitted semi-axis radius (px)", self.min_radius,
+            ("min_radius", "Minimum FINAL fitted semi-axis radius (px)", self.min_radius,
              1, radius_limit, 1, lambda v: f"{int(float(v))} px"),
-            ("Maximum FINAL fitted semi-axis radius (px)", self.max_radius,
+            ("max_radius", "Maximum FINAL fitted semi-axis radius (px)", self.max_radius,
              1, radius_limit, 1, lambda v: f"{int(float(v))} px"),
-            ("Maximum average normalized ellipse error (%)", self.max_error,
+            ("max_error", "Maximum average normalized ellipse error (%)", self.max_error,
              0.5, 50, 0.1, lambda v: f"{float(v):.1f}%"),
-            ("Minimum TOTAL supported ellipse arc (%)", self.min_coverage,
+            ("min_coverage", "Minimum TOTAL supported ellipse arc (%)", self.min_coverage,
              0, 100, 1, lambda v: f"{int(float(v))}% (~{float(v) * 3.6:.0f}°)"),
         ]
         for row, spec in enumerate(slider_specs):
             self._add_slider(frame, row, *spec)
 
-        # Auto-select controls are backend boundaries. Threshold has its own
-        # button; radius selection is one operation spanning the paired
-        # minimum/maximum radius rows.
+        # Threshold Auto select is implemented; radius Auto select remains a placeholder. Threshold has
+        # its own button; radius selection is a single operation represented by a
+        # button spanning the paired minimum/maximum radius rows.
         self.threshold_auto_button = tk.Button(
             frame,
             text="Auto select",
@@ -299,19 +828,19 @@ class DetectorApp:
             options,
             text="Morphology cleanup for candidate search",
             variable=self.morphology,
-            command=self._commit_setting_change,
+            command=lambda: self._commit_setting_change("morphology"),
         ).grid(row=0, column=0, sticky="w", padx=(0, 20))
         tk.Checkbutton(
             options,
             text="Outer-limb assistance",
             variable=self.outer_limb_assistance,
-            command=self._commit_setting_change,
+            command=lambda: self._commit_setting_change("outer_limb_assistance"),
         ).grid(row=0, column=1, sticky="w", padx=(0, 20))
         self.horizon_checkbox = tk.Checkbutton(
             options,
             text="Use detected horizon",
             variable=self.use_horizon,
-            command=self._commit_setting_change,
+            command=lambda: self._commit_setting_change("use_horizon"),
             state=tk.DISABLED,
         )
         self.horizon_checkbox.grid(row=0, column=2, sticky="w")
@@ -363,7 +892,7 @@ class DetectorApp:
             wraplength=1150,
         ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
-    def _add_slider(self, parent, row, text, variable, low, high, resolution, formatter):
+    def _add_slider(self, parent, row, setting_name, text, variable, low, high, resolution, formatter):
         tk.Label(parent, text=text, width=42, anchor="w").grid(
             row=row, column=0, sticky="w", padx=(0, 8), pady=2
         )
@@ -380,6 +909,7 @@ class DetectorApp:
             highlightthickness=1,
         )
         slider.grid(row=row, column=1, sticky="ew", pady=2)
+        slider._setting_name = setting_name
 
         # Tk Scale supports precise arrow-key adjustment while it owns keyboard
         # focus. Value traces update only the label. Preview refresh is deliberately
@@ -415,7 +945,7 @@ class DetectorApp:
         """Refresh once after a mouse slider change has actually finished."""
         start_value = getattr(event.widget, "_preview_mouse_start_value", None)
         if start_value is not None and event.widget.get() != start_value:
-            self._commit_setting_change()
+            self._commit_setting_change(event.widget._setting_name)
 
     def _cancel_pending_slider_keyboard_commit(self):
         """Cancel a release callback superseded by continuing keyboard input."""
@@ -448,7 +978,7 @@ class DetectorApp:
         self.slider_keyboard_widget = None
         self.slider_keyboard_start_value = None
         if widget is not None and start_value is not None and widget.get() != start_value:
-            self._commit_setting_change()
+            self._commit_setting_change(widget._setting_name)
 
     def _release_slider_focus_if_clicked_elsewhere(self, event):
         """Release slider focus immediately when the mouse clicks elsewhere.
@@ -492,26 +1022,81 @@ class DetectorApp:
         self.color_canvas.bind("<Configure>", self._schedule_preview_redraw)
 
     # ------------------------------------------------------------------
-    # GUI-only actions
+    # Application actions and threshold preview
     # ------------------------------------------------------------------
     def save_centered_images(self):
         self.status.set(
-            "Save centered images: export functionality is not implemented in the GUI foundation."
+            "Save centered images: export functionality is not implemented in the threshold-finder stage."
         )
 
     def auto_select_threshold(self):
-        self._commit_setting_change()
-        self.status.set(
-            "Auto select threshold: algorithm not implemented in the GUI foundation."
-        )
+        """Restore the cached image-only automatic T and refresh the B/W image."""
+        if self.gray_image is None or self.current_path is None:
+            self.status.set("Auto select threshold: no readable image is loaded.")
+            return
+
+        state = self.image_state[self.current_path]
+        result = state["auto_threshold_result"]
+        if result is None:
+            result = auto_threshold(self.gray_image)
+            state["auto_threshold_result"] = result
+
+        selected_threshold = int(result.threshold)
+        self.threshold.set(selected_threshold)
+        self._commit_setting_change("threshold")
+        if result.resolved:
+            self.status.set(
+                "Automatic grayscale threshold selected: "
+                f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                f"histogram start={result.histogram_left_edge})."
+            )
+        else:
+            self.status.set(
+                "Automatic component tracking unresolved; "
+                f"using rightmost-histogram left edge T={selected_threshold}."
+            )
 
     def auto_select_radius(self):
         self.status.set(
-            "Auto select radius range: algorithm not implemented in the GUI foundation."
+            "Auto select radius range: algorithm not implemented in the threshold-finder stage."
         )
 
-    def _commit_setting_change(self, *_args):
-        """Apply only the lightweight threshold-image consequence of a setting change."""
+    def _refresh_threshold_image(self):
+        """Rebuild and display only the B/W raster for the current threshold T."""
+        if self.gray_image is None:
+            self.threshold_preview = transparent_bgra()
+            self.threshold_photo = None
+        else:
+            # Exact semantics: dark = gray <= T, light = gray > T.
+            light_mask = cv2.compare(
+                self.gray_image,
+                int(self.threshold.get()),
+                cv2.CMP_GT,
+            )
+            preview = cv2.cvtColor(light_mask, cv2.COLOR_GRAY2BGRA)
+            preview[:, :, 3] = 255
+            self.threshold_preview = preview
+            self.threshold_photo = None
+
+        if hasattr(self, "threshold_canvas"):
+            self.threshold_photo = self._show_image_on_canvas(
+                self.threshold_canvas, self.threshold_preview
+            )
+
+    def _commit_setting_change(self, setting_name):
+        """Persist one changed per-image setting, then refresh only the B/W image."""
+        if self.current_path is not None and self.current_path in self.image_state:
+            state = self.image_state[self.current_path]
+            settings = state["settings"]
+            value = self.setting_variables[setting_name].get()
+
+            if setting_name == "threshold":
+                baseline = int(state["auto_threshold_result"].threshold)
+            else:
+                baseline = getattr(self.default_settings, setting_name)
+
+            setattr(settings, setting_name, None if value == baseline else value)
+
         self._refresh_threshold_image()
 
     def _selected_center_target_name(self):
@@ -520,7 +1105,7 @@ class DetectorApp:
 
     def _handle_center_target_change(self):
         self._update_center_preview_label()
-        self._commit_setting_change()
+        self._commit_setting_change("center_target")
         self.status.set(
             f"Centering target set to {self._selected_center_target_name()}. "
             "Actual centering will be implemented with ellipse detection."
@@ -530,19 +1115,29 @@ class DetectorApp:
         target = self._selected_center_target_name()
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
-    def _refresh_threshold_image(self):
-        """Backend hook for rebuilding only the current-threshold B/W image.
-
-        The GUI-only branch intentionally has no grayscale/threshold backend.
-        Backend-enabled branches implement this hook without running the broader
-        Refresh Preview processing pipeline.
-        """
-
     def refresh_preview(self):
-        self.status.set("Refresh Preview: detector backend not implemented in the GUI foundation.")
+        """Run explicit preview processing for the currently loaded image."""
+        if self.gray_image is None:
+            self.status.set("Refresh Preview: no readable image is loaded.")
+            return
+
+        self._refresh_threshold_image()
+        if hasattr(self, "color_canvas"):
+            image = self.color_image if self.color_image is not None else transparent_bgra()
+            self.color_photo = self._show_image_on_canvas(self.color_canvas, image)
+        self.status.set(
+            f"Threshold preview regenerated at T={int(self.threshold.get())}."
+        )
 
     def apply_full_resolution(self):
-        self.status.set("Apply Full Resolution: detector backend not implemented in the GUI foundation.")
+        if self.gray_image is None:
+            self.status.set("Apply Full Resolution: no readable image is loaded.")
+            return
+        self._refresh_threshold_image()
+        self.status.set(
+            "Full-resolution threshold preview applied at "
+            f"T={int(self.threshold.get())}. Ellipse detector backend not implemented yet."
+        )
 
     def _schedule_preview_redraw(self, _event=None):
         if self.preview_redraw_job is not None:
@@ -594,7 +1189,7 @@ class DetectorApp:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="GUI foundation for the eclipse detector rebuild.")
+    parser = argparse.ArgumentParser(description="threshold-finder stage for the eclipse detector rebuild.")
     parser.add_argument(
         "images",
         nargs="*",

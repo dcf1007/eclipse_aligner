@@ -14,7 +14,6 @@ def test_source_parses():
 def test_threshold_candidate_palette_is_absent():
     assert "Useful threshold candidates:" not in TEXT
     assert "self.palette_frame" not in TEXT
-    assert "threshold candidate generation" not in TEXT
 
 
 def test_control_rows_close_gap_after_palette_removal():

@@ -32,6 +32,16 @@ def test_radius_auto_select_button_spans_min_and_max_rows():
     assert 'row=1, column=3, rowspan=2' in TEXT
 
 
-def test_auto_select_actions_remain_present():
-    assert 'Auto select threshold: algorithm not implemented' in TEXT
+def test_threshold_auto_select_reuses_cached_result_and_commits_threshold():
+    block = TEXT.split("def auto_select_threshold(self):", 1)[1].split(
+        "def auto_select_radius", 1
+    )[0]
+    assert 'state["auto_threshold_result"]' in block
+    assert "self.threshold.set(selected_threshold)" in block
+    assert 'self._commit_setting_change("threshold")' in block
+    assert "self.refresh_preview()" not in block
+
+
+def test_radius_auto_select_remains_placeholder_for_later_branch_work():
     assert 'Auto select radius range: algorithm not implemented' in TEXT
+    assert 'def detect(' not in TEXT

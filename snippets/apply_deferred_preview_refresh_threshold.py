@@ -1,18 +1,18 @@
-"""Apply deferred preview-refresh event semantics to the GUI-only milestone.
+"""Propagate deferred preview-refresh GUI event semantics into threshold branch.
 
-This is intentionally GUI-only. It does not add grayscale conversion, threshold
-raster generation, detection, or any other image-processing backend. It changes
-only when the existing ``refresh_preview`` hook is called:
+This preserves the tested GUI interaction contract while keeping the existing
+threshold finder and threshold raster backend intact:
 
-* slider variable traces update only their numeric labels;
-* mouse slider changes refresh once after ButtonRelease;
+* slider traces update only their numeric labels;
+* mouse slider changes refresh once on ButtonRelease;
 * keyboard slider changes coalesce auto-repeat and refresh after final KeyRelease;
-* checkbox/radio setting changes refresh immediately.
+* checkbox/radio state changes refresh immediately;
+* Auto select threshold keeps its explicit no-preview-regeneration behavior.
 """
 from pathlib import Path
 
 SOURCE = Path("circle_arc_detector.py")
-TEST = Path("tests/test_gui_preview_clear.py")
+PREVIEW_TEST = Path("tests/test_gui_preview_clear.py")
 text = SOURCE.read_text(encoding="utf-8")
 
 old_doc = '''The preview rasters contain no placeholder text. Empty preview regions are stored
@@ -22,10 +22,10 @@ frame until the next explicit Refresh Preview or Apply Full Resolution action.
 '''
 new_doc = '''The preview rasters contain no placeholder text. Empty preview regions are stored
 as BGRA image data with alpha=0 rather than simulated with a matching Tk background.
-Setting controls request preview refreshes through the existing GUI hook. Slider
+Setting controls regenerate the threshold preview after discrete changes. Slider
 motion only updates the displayed value; preview refresh is deferred until mouse
 release or the final keyboard key release, while checkbox/radio changes refresh
-immediately. This GUI-only milestone does not generate a threshold raster.
+immediately. Threshold Auto select remains an explicit no-preview-regeneration action.
 '''
 assert old_doc in text
 text = text.replace(old_doc, new_doc, 1)
@@ -47,6 +47,17 @@ new_state = '''        self.threshold_photo = None
 '''
 assert old_state in text
 text = text.replace(old_state, new_state, 1)
+
+old_load_comment = '''            # Setting the Tk variable may clear an older preview through its trace;
+            # image loading is one of the explicit operations that immediately
+            # regenerates the black/white threshold raster afterward.
+'''
+new_load_comment = '''            # Setting the Tk variable updates the displayed slider value only.
+            # Image loading explicitly regenerates the black/white threshold raster
+            # immediately after restoring or automatically selecting T.
+'''
+assert old_load_comment in text
+text = text.replace(old_load_comment, new_load_comment, 1)
 
 old_scale = '''        # Tk Scale supports precise arrow-key adjustment while it owns keyboard
         # focus. Explicitly focus the clicked scale and leave focus there after the
@@ -140,7 +151,20 @@ new_focus = '''    @staticmethod
 assert old_focus in text
 text = text.replace(old_focus, new_focus, 1)
 
+old_auto_comment = '''        # The threshold variable trace deliberately clears any stale preview. Per
+        # user requirement, Auto select itself DOES NOT regenerate that preview;
+        # Refresh Preview / Apply Full Resolution remain explicit preview actions.
+'''
+new_auto_comment = '''        # The threshold variable trace updates only the displayed slider value.
+        # Per explicit user requirement, Auto select itself DOES NOT regenerate the
+        # preview; Refresh Preview / Apply Full Resolution remain available actions.
+'''
+assert old_auto_comment in text
+text = text.replace(old_auto_comment, new_auto_comment, 1)
+
 old_pending = '''    def pending(self, *_args):
+        if self.current_path is not None and self.gray_image is not None:
+            self.image_thresholds[self.current_path] = int(self.threshold.get())
         self.clear_threshold_preview()
         self.status.set(
             "Settings changed. Threshold preview cleared; Refresh Preview or Apply Full Resolution to recompute."
@@ -148,7 +172,9 @@ old_pending = '''    def pending(self, *_args):
 
 '''
 new_pending = '''    def pending(self, *_args):
-        """Request an immediate preview refresh after a discrete setting change."""
+        """Store the current T and refresh after a completed/discrete setting change."""
+        if self.current_path is not None and self.gray_image is not None:
+            self.image_thresholds[self.current_path] = int(self.threshold.get())
         self.refresh_preview()
 
 '''
@@ -174,17 +200,16 @@ new_center = '''    def center_target_changed(self):
 assert old_center in text
 text = text.replace(old_center, new_center, 1)
 
-# Guard the user's explicit constraint: this GUI-only change must not introduce a
-# grayscale/BW thresholding backend.
-assert "cv2.COLOR_BGR2GRAY" not in text
-assert "cv2.COLOR_BGRA2GRAY" not in text
-assert "cv2.threshold(" not in text
+# Threshold backend invariants must remain present and unchanged in semantics.
+assert "def auto_threshold_from_gray(" in text
+assert "PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)" in text
+assert "ROI_DILATION_FRACTION = 0.065" in text
+assert "GUARD_DILATION_FRACTION = 0.195" in text
+assert "cv2.CMP_GT" in text
 
 SOURCE.write_text(text, encoding="utf-8")
 
-# Replace the stale-preview-invalidating expectations with the new approved event
-# contract. This remains a headless/static regression test.
-TEST.write_text('''"""Regression checks for alpha-backed previews and refresh event semantics."""
+PREVIEW_TEST.write_text('''"""Regression checks for alpha-backed previews and refresh event semantics."""
 
 from pathlib import Path
 import ast
@@ -214,21 +239,23 @@ def test_transparency_is_not_faked_by_tk_background_matching():
     assert "Transparency is retained in the" in TEXT
 
 
-def test_discrete_setting_changes_request_preview_refresh():
+def test_discrete_setting_changes_regenerate_threshold_preview():
     pending = TEXT.split("def pending(self, *_args):", 1)[1].split("def center_target_changed", 1)[0]
     assert "self.refresh_preview()" in pending
     assert "self.clear_threshold_preview()" not in pending
 
 
-def test_center_target_change_requests_preview_refresh():
+def test_center_target_change_regenerates_threshold_preview():
     block = TEXT.split("def center_target_changed(self):", 1)[1].split("def update_center_preview_label", 1)[0]
     assert "self.refresh_preview()" in block
     assert "self.clear_threshold_preview()" not in block
 
 
-def test_refresh_and_apply_actions_remain_present():
-    assert "def refresh_preview(self):" in TEXT
-    assert "def apply_full_resolution(self):" in TEXT
+def test_refresh_and_apply_actions_render_existing_threshold_backend():
+    refresh = TEXT.split("def refresh_preview(self):", 1)[1].split("def apply_full_resolution", 1)[0]
+    apply = TEXT.split("def apply_full_resolution(self):", 1)[1].split("def schedule_redraw", 1)[0]
+    assert "self.render_threshold_preview()" in refresh
+    assert "self.render_threshold_preview()" in apply
 ''', encoding="utf-8")
 
-print("Applied deferred preview-refresh GUI event semantics")
+print("Applied deferred preview-refresh semantics to threshold branch")

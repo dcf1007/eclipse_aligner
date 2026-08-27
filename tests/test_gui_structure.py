@@ -25,3 +25,9 @@ def test_center_controls_are_mutually_exclusive_radiobuttons():
     assert 'variable=self.center_target' in TEXT
     assert 'value="light"' in TEXT
     assert 'value="dark"' in TEXT
+
+
+def test_detection_is_not_implemented_in_gui_milestone():
+    assert "def detect(" not in TEXT
+    assert "def fit_ellipse" not in TEXT
+    assert "detector backend not implemented" in TEXT
