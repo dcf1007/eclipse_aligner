@@ -3,15 +3,17 @@
 This module combines the application's user-interface foundation with the tested
 image-only automatic threshold finder. The GUI owns image navigation, per-image
 processing settings, control interaction, preview lifecycle, and cached automatic
-threshold results. The threshold finder itself remains independent of GUI state:
-it accepts image data and returns an ``AutoThresholdResult`` describing the
-selected threshold and the topology used to obtain it.
+threshold results. The threshold finder itself remains independent of GUI state: it accepts the
+authoritative 8-bit grayscale brightness image and returns an
+``AutoThresholdResult`` describing the selected threshold and the topology used
+to obtain it. Color-to-grayscale conversion is an input-stage responsibility and
+is performed before the threshold algorithm is called.
 
 All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
 absolute image path. Each image entry is a normal dictionary with exactly two
-conceptual fields: ``settings`` contains only sparse overrides from that image's
-baseline values, while ``auto_threshold_result`` caches the complete automatic
-threshold result. Ordinary controls use the application defaults as their baseline;
+conceptual fields: ``settings`` is an ``ImageSettings`` instance containing only
+sparse overrides from that image's baseline values, while
+``auto_threshold_result`` caches the complete automatic threshold result. Ordinary controls use the application defaults as their baseline;
 the threshold uses the cached automatic threshold as its image-specific baseline.
 Returning a control to its baseline removes that key from ``settings``. Reusing the
 cached automatic result means the threshold algorithm is not rerun when Auto select
@@ -82,6 +84,24 @@ def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Per-image processing settings
+# ---------------------------------------------------------------------------
+@dataclass
+class ImageSettings:
+    """Sparse per-image overrides; ``None`` means use that setting's baseline."""
+
+    threshold: int | None = None
+    min_radius: int | None = None
+    max_radius: int | None = None
+    max_error: float | None = None
+    min_coverage: int | None = None
+    morphology: bool | None = None
+    outer_limb_assistance: bool | None = None
+    use_horizon: bool | None = None
+    center_target: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Grayscale automatic threshold finder
 # ---------------------------------------------------------------------------
 WORK_MAX_DIM = 1200
@@ -92,17 +112,6 @@ GUARD_DILATION_FRACTION = 0.195
 
 class ThresholdResolutionError(RuntimeError):
     """Expected inability to establish/track a separated solar component."""
-
-
-@dataclass(frozen=True)
-class HistogramSeed:
-    peak: int
-    left_edge: int
-    threshold: int
-    point: tuple[int, int]
-    mask: np.ndarray
-    area: int
-    bbox: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -170,44 +179,27 @@ def resize_gray_max_dim(gray: np.ndarray, max_dim: int = WORK_MAX_DIM) -> np.nda
     )
 
 
-def local_peak_signal(histogram: np.ndarray) -> np.ndarray:
-    """Return a 3-bin [1,2,1]/4 signal for local peak/valley detection."""
-    hist = np.asarray(histogram, dtype=np.float64)
-    if hist.shape != (256,):
-        raise ValueError(f"Expected 256-bin histogram, got shape {hist.shape}")
-    return np.convolve(hist, PEAK_KERNEL, mode="same")
+def find_rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
+    """Return the rightmost 3-bin-smoothed mode and its preceding left valley."""
+    histogram = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
 
-
-def histogram_with_peak_signal(gray: np.ndarray):
-    """Return exact histogram plus the local 3-bin peak/valley signal."""
-    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
-    return hist, local_peak_signal(hist)
-
-
-def _local_peaks(values: np.ndarray) -> list[int]:
     peaks: list[int] = []
-    for i in range(1, len(values) - 1):
-        if values[i] >= values[i - 1] and values[i] > values[i + 1]:
-            peaks.append(i)
-    # Saturation itself is allowed to be the rightmost mode.
-    if len(values) >= 2 and values[-1] > values[-2]:
-        peaks.append(len(values) - 1)
-    return peaks or [int(np.argmax(values))]
+    for index in range(1, len(signal) - 1):
+        if signal[index] >= signal[index - 1] and signal[index] > signal[index + 1]:
+            peaks.append(index)
+    # Saturation itself is allowed to be the rightmost histogram mode.
+    if len(signal) >= 2 and signal[-1] > signal[-2]:
+        peaks.append(len(signal) - 1)
+    peak = max(peaks or [int(np.argmax(signal))])
 
+    left_edge = 0
+    for index in range(peak - 1, 0, -1):
+        if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
+            left_edge = index
+            break
 
-def _preceding_valley(values: np.ndarray, peak: int) -> int:
-    """Nearest local histogram minimum on the left; zero is deterministic fallback."""
-    for i in range(peak - 1, 0, -1):
-        if values[i] <= values[i - 1] and values[i] < values[i + 1]:
-            return i
-    return 0
-
-
-def rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
-    """Rightmost locally smoothed mode and the valley defining its left edge."""
-    _hist, signal = histogram_with_peak_signal(gray)
-    peak = max(_local_peaks(signal))
-    return int(peak), int(_preceding_valley(signal, peak))
+    return int(peak), int(left_edge)
 
 
 def deepest_component_point(component_u8: np.ndarray) -> tuple[int, int]:
@@ -220,25 +212,21 @@ def deepest_component_point(component_u8: np.ndarray) -> tuple[int, int]:
     return int(x), int(y)
 
 
-def _component_metadata(component: np.ndarray):
-    ys, xs = np.nonzero(component)
-    if len(xs) == 0:
-        raise ThresholdResolutionError("Empty component")
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    return int(len(xs)), (x0, y0, x1 - x0, y1 - y0)
-
-
-def largest_nonborder_component(binary: np.ndarray) -> np.ndarray | None:
-    """Largest 8-connected bright component enclosed by the current raster."""
+def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
+    """Return the largest 8-connected bright component enclosed by the raster."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         (binary != 0).astype(np.uint8), 8
     )
-    h, w = binary.shape
+    height, width = binary.shape
     best = None
     for label in range(1, count):
-        x, y, cw, ch, area = map(int, stats[label])
-        if x == 0 or y == 0 or x + cw >= w or y + ch >= h:
+        x, y, component_width, component_height, area = map(int, stats[label])
+        if (
+            x == 0
+            or y == 0
+            or x + component_width >= width
+            or y + component_height >= height
+        ):
             continue
         candidate = (area, label)
         if best is None or candidate > best:
@@ -248,75 +236,79 @@ def largest_nonborder_component(binary: np.ndarray) -> np.ndarray | None:
     return labels == best[1]
 
 
-def establish_histogram_seed(work_gray: np.ndarray) -> HistogramSeed:
-    """Start at the left edge of the rightmost peak and descend until Sun appears."""
-    peak, left_edge = rightmost_histogram_peak(work_gray)
-    for threshold in range(left_edge, -1, -1):
-        component = largest_nonborder_component(work_gray > threshold)
-        if component is None:
-            continue
-        mask = np.where(component, 255, 0).astype(np.uint8)
-        area, bbox = _component_metadata(component)
-        return HistogramSeed(
-            peak=peak,
-            left_edge=left_edge,
-            threshold=int(threshold),
-            point=deepest_component_point(mask),
-            mask=mask,
-            area=area,
-            bbox=bbox,
-        )
-    raise ThresholdResolutionError("No enclosed bright component exists")
-
-
-def _flood_component_bool(binary: np.ndarray, seed: tuple[int, int]) -> np.ndarray | None:
-    x, y = map(int, seed)
-    h, w = binary.shape
-    if not (0 <= x < w and 0 <= y < h) or not bool(binary[y, x]):
-        return None
-    work = cv2.compare(binary.astype(np.uint8), 0, cv2.CMP_GT)
-    cv2.floodFill(work, None, (x, y), 128, flags=8)
-    return work == 128
-
-
-def _touches_border(component: np.ndarray | None) -> bool:
+def _touches_image_border(component: np.ndarray | None) -> bool:
+    """Return whether a tracked component is absent or reaches the image boundary."""
     if component is None or not np.any(component):
         return True
     return bool(
-        np.any(component[0]) or np.any(component[-1])
-        or np.any(component[:, 0]) or np.any(component[:, -1])
+        np.any(component[0])
+        or np.any(component[-1])
+        or np.any(component[:, 0])
+        or np.any(component[:, -1])
     )
 
 
 def coarse_threshold_search(work_gray: np.ndarray) -> CoarseThresholdResult:
-    """Track the same high-T seed downward; lowest enclosed T defines coarse ROI."""
-    seed = establish_histogram_seed(work_gray)
-    lowest_t = seed.threshold
-    lowest_component = seed.mask != 0
+    """Establish the solar seed, then track it to the lowest enclosed coarse T."""
+    # Phase 1: histogram identity/start only. Descend from the left edge of the
+    # rightmost mode until the first enclosed bright component identifies the Sun.
+    peak, left_edge = find_rightmost_histogram_peak(work_gray)
+    seed_threshold = None
+    seed_point = None
+    seed_mask = None
 
-    # Connectivity is monotone while T is lowered: pixels are only added, so once
-    # this tracked component reaches the image border it cannot become enclosed at
-    # any still-lower threshold. It is therefore safe to stop at first contact.
-    for threshold in range(seed.threshold, -1, -1):
-        component = _flood_component_bool(work_gray > threshold, seed.point)
+    for threshold in range(left_edge, -1, -1):
+        component = largest_enclosed_bright_component(work_gray > threshold)
         if component is None:
             continue
-        if _touches_border(component):
+        seed_threshold = int(threshold)
+        seed_mask = np.where(component, 255, 0).astype(np.uint8)
+        seed_point = deepest_component_point(seed_mask)
+        break
+
+    if seed_threshold is None or seed_point is None or seed_mask is None:
+        raise ThresholdResolutionError("No enclosed bright component exists")
+
+    # Phase 2: keep the same seed and lower T. Connectivity is monotone while T is
+    # lowered: pixels are only added, so once this tracked 8-connected component
+    # reaches the image border it cannot become enclosed again at a lower T.
+    lowest_threshold = seed_threshold
+    lowest_component = seed_mask != 0
+    seed_x, seed_y = seed_point
+    height, width = work_gray.shape
+
+    for threshold in range(seed_threshold, -1, -1):
+        binary = work_gray > threshold
+        if not (0 <= seed_x < width and 0 <= seed_y < height) or not bool(binary[seed_y, seed_x]):
+            continue
+
+        flooded = cv2.compare(binary.astype(np.uint8), 0, cv2.CMP_GT)
+        cv2.floodFill(flooded, None, seed_point, 128, flags=8)
+        component = flooded == 128
+        if _touches_image_border(component):
             break
-        lowest_t = threshold
+
+        lowest_threshold = threshold
         lowest_component = component
 
-    area, bbox = _component_metadata(lowest_component)
+    ys, xs = np.nonzero(lowest_component)
+    if len(xs) == 0:
+        raise ThresholdResolutionError("Empty component")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    component_area = int(len(xs))
+    component_bbox = (x0, y0, x1 - x0, y1 - y0)
+
     return CoarseThresholdResult(
-        histogram_peak=seed.peak,
-        histogram_left_edge=seed.left_edge,
-        seed_threshold=seed.threshold,
-        seed_point=seed.point,
-        seed_mask=seed.mask,
-        threshold=int(lowest_t),
+        histogram_peak=peak,
+        histogram_left_edge=left_edge,
+        seed_threshold=seed_threshold,
+        seed_point=seed_point,
+        seed_mask=seed_mask,
+        threshold=int(lowest_threshold),
         component_mask=np.where(lowest_component, 255, 0).astype(np.uint8),
-        component_area=area,
-        component_bbox=bbox,
+        component_area=component_area,
+        component_bbox=component_bbox,
     )
 
 
@@ -326,7 +318,7 @@ def _map_interval(lo: int, hi: int, source_n: int, target_n: int) -> tuple[int, 
     return max(0, out_lo), min(target_n, max(out_lo + 1, out_hi))
 
 
-def establish_full_seed(
+def establish_full_resolution_seed(
     full_gray: np.ndarray,
     work_shape: tuple[int, int],
     coarse_seed_mask: np.ndarray,
@@ -364,29 +356,31 @@ def establish_full_seed(
     return x0 + px, y0 + py
 
 
-def _full_flood_component(gray: np.ndarray, threshold: int, seed: tuple[int, int]):
-    binary = cv2.compare(gray, int(threshold), cv2.CMP_GT)
-    x, y = seed
-    if binary[y, x] == 0:
-        return None
-    cv2.floodFill(binary, None, seed, 128, flags=8)
-    return binary == 128
-
-
-def full_roi_seed_component(
+def find_full_resolution_enclosed_seed_component(
     full_gray: np.ndarray,
     coarse_threshold: int,
     seed_point: tuple[int, int],
 ):
-    """Obtain an ACTUAL full-resolution enclosed component for ROI dilation."""
-    start = max(0, int(coarse_threshold))
-    for threshold in range(start, 256):
-        component = _full_flood_component(full_gray, threshold, seed_point)
-        if component is not None and not _touches_border(component):
+    """Find an actual enclosed full-resolution component containing the solar seed."""
+    start_threshold = max(0, int(coarse_threshold))
+    seed_x, seed_y = seed_point
+
+    for threshold in range(start_threshold, 256):
+        binary = cv2.compare(full_gray, int(threshold), cv2.CMP_GT)
+        if binary[seed_y, seed_x] == 0:
+            continue
+
+        cv2.floodFill(binary, None, seed_point, 128, flags=8)
+        component = binary == 128
+        if not _touches_image_border(component):
             return int(threshold), component
-        # Usually resolved at coarse T or one level higher. The loop remains
-        # exhaustive/defensive so a reduced-resolution mismatch cannot fail T.
-    raise ThresholdResolutionError("No enclosed original-resolution solar component")
+
+        # Usually resolved at the coarse T or one level higher. The loop remains
+        # exhaustive so reduced-resolution mismatch cannot determine the final T.
+
+    raise ThresholdResolutionError(
+        "No enclosed original-resolution solar component"
+    )
 
 
 def _build_observation_region(
@@ -430,7 +424,7 @@ def _build_observation_region(
     )
 
 
-def _region_status(region: ObservationRegion, threshold: int):
+def _evaluate_observation_region(region: ObservationRegion, threshold: int):
     """Return (exists, touches_artificial_boundary, touches_true_image_border)."""
     work = cv2.compare(region.gray, int(threshold), cv2.CMP_GT)
     cv2.bitwise_and(work, region.allowed_u8, dst=work)
@@ -476,54 +470,55 @@ def find_lowest_full_threshold(
 
     used_guard = False
     for threshold in range(0, 256):
-        exists, touches_roi, touches_true = _region_status(roi, threshold)
+        exists, touches_roi, touches_true = _evaluate_observation_region(roi, threshold)
         if not exists or touches_true:
             continue
         if not touches_roi:
             return int(threshold), used_guard
 
         used_guard = True
-        exists, touches_guard, touches_true = _region_status(guard, threshold)
+        exists, touches_guard, touches_true = _evaluate_observation_region(guard, threshold)
         if exists and not touches_true and not touches_guard:
             return int(threshold), used_guard
 
     raise ThresholdResolutionError("Tracked solar component never became separated")
 
 
-def auto_threshold_from_gray(full_gray: np.ndarray) -> AutoThresholdResult:
-    """Run complete two-resolution threshold selection, with histogram-left fallback."""
-    full_gray = to_gray(full_gray)
-    work_gray = resize_gray_max_dim(full_gray)
-    peak, left_edge = rightmost_histogram_peak(work_gray)
+def auto_threshold(gray: np.ndarray) -> AutoThresholdResult:
+    """Select T from an authoritative 8-bit grayscale brightness image."""
+    work_gray = resize_gray_max_dim(gray)
+    peak, left_edge = find_rightmost_histogram_peak(work_gray)
 
     try:
         coarse = coarse_threshold_search(work_gray)
-        full_seed = establish_full_seed(
-            full_gray, work_gray.shape, coarse.seed_mask, coarse.seed_threshold
+        full_seed = establish_full_resolution_seed(
+            gray, work_gray.shape, coarse.seed_mask, coarse.seed_threshold
         )
-        roi_seed_t, roi_seed_component = full_roi_seed_component(
-            full_gray, coarse.threshold, full_seed
+        roi_seed_threshold, roi_seed_component = (
+            find_full_resolution_enclosed_seed_component(
+                gray, coarse.threshold, full_seed
+            )
         )
-        final_t, used_guard = find_lowest_full_threshold(
-            full_gray,
+        final_threshold, used_guard = find_lowest_full_threshold(
+            gray,
             full_seed,
             roi_seed_component,
         )
         return AutoThresholdResult(
-            threshold=final_t,
+            threshold=final_threshold,
             histogram_peak=coarse.histogram_peak,
             histogram_left_edge=coarse.histogram_left_edge,
             seed_threshold=coarse.seed_threshold,
             coarse_threshold=coarse.threshold,
-            roi_seed_threshold=roi_seed_t,
+            roi_seed_threshold=roi_seed_threshold,
             full_seed_point=full_seed,
             used_guard=used_guard,
             resolved=True,
         )
     except ThresholdResolutionError as exc:
-        # User-selected deterministic fallback: histogram always has a mode, so if
-        # component topology cannot be resolved we still return the left side of
-        # the rightmost peak instead of reintroducing color/Otsu/fixed-T heuristics.
+        # Deterministic fallback: if component topology cannot be resolved, use
+        # the left side of the rightmost histogram peak rather than introducing
+        # color, Otsu, fixed-T, or ellipse-dependent heuristics.
         return AutoThresholdResult(
             threshold=int(left_edge),
             histogram_peak=int(peak),
@@ -536,10 +531,6 @@ def auto_threshold_from_gray(full_gray: np.ndarray) -> AutoThresholdResult:
             resolved=False,
             reason=str(exc),
         )
-
-
-def auto_threshold(image: np.ndarray) -> AutoThresholdResult:
-    return auto_threshold_from_gray(to_gray(image))
 
 
 class DetectorApp:
@@ -561,9 +552,9 @@ class DetectorApp:
         self.gray_image = None
         self.threshold_preview = transparent_bgra()
 
-        # Per-image state keeps sparse setting overrides plus the cached automatic
-        # threshold result. No additional ImageState class is needed: the nested
-        # dictionaries directly express the state hierarchy.
+        # Per-image state keeps a sparse ImageSettings instance plus the cached
+        # automatic threshold result. No ImageState wrapper class is needed: the
+        # outer dictionary directly expresses the image-to-state hierarchy.
         self.image_state: dict[str, dict[str, object]] = {}
 
         self.threshold_photo = None
@@ -594,16 +585,16 @@ class DetectorApp:
         # Every processing control is per-image. Ordinary controls use these values
         # as their baseline; threshold instead uses the cached automatic T for the
         # current image. Only deviations from those baselines are stored.
-        self.default_settings = {
-            "min_radius": int(self.min_radius.get()),
-            "max_radius": int(self.max_radius.get()),
-            "max_error": float(self.max_error.get()),
-            "min_coverage": int(self.min_coverage.get()),
-            "morphology": bool(self.morphology.get()),
-            "outer_limb_assistance": bool(self.outer_limb_assistance.get()),
-            "use_horizon": bool(self.use_horizon.get()),
-            "center_target": self.center_target.get(),
-        }
+        self.default_settings = ImageSettings(
+            min_radius=int(self.min_radius.get()),
+            max_radius=int(self.max_radius.get()),
+            max_error=float(self.max_error.get()),
+            min_coverage=int(self.min_coverage.get()),
+            morphology=bool(self.morphology.get()),
+            outer_limb_assistance=bool(self.outer_limb_assistance.get()),
+            use_horizon=bool(self.use_horizon.get()),
+            center_target=self.center_target.get(),
+        )
         self.setting_variables = {
             "threshold": self.threshold,
             "min_radius": self.min_radius,
@@ -690,9 +681,9 @@ class DetectorApp:
                 state = self.image_state[path]
                 result = state["auto_threshold_result"]
             else:
-                result = auto_threshold_from_gray(self.gray_image)
+                result = auto_threshold(self.gray_image)
                 state = {
-                    "settings": {},
+                    "settings": ImageSettings(),
                     "auto_threshold_result": result,
                 }
                 self.image_state[path] = state
@@ -702,8 +693,9 @@ class DetectorApp:
                 if setting_name == "threshold":
                     baseline = int(result.threshold)
                 else:
-                    baseline = self.default_settings[setting_name]
-                variable.set(settings.get(setting_name, baseline))
+                    baseline = getattr(self.default_settings, setting_name)
+                override = getattr(settings, setting_name)
+                variable.set(baseline if override is None else override)
 
             self._update_center_preview_label()
             self.refresh_preview()
@@ -1046,7 +1038,7 @@ class DetectorApp:
         state = self.image_state[self.current_path]
         result = state["auto_threshold_result"]
         if result is None:
-            result = auto_threshold_from_gray(self.gray_image)
+            result = auto_threshold(self.gray_image)
             state["auto_threshold_result"] = result
 
         selected_threshold = int(result.threshold)
@@ -1101,12 +1093,9 @@ class DetectorApp:
             if setting_name == "threshold":
                 baseline = int(state["auto_threshold_result"].threshold)
             else:
-                baseline = self.default_settings[setting_name]
+                baseline = getattr(self.default_settings, setting_name)
 
-            if value == baseline:
-                settings.pop(setting_name, None)
-            else:
-                settings[setting_name] = value
+            setattr(settings, setting_name, None if value == baseline else value)
 
         self._refresh_threshold_image()
 

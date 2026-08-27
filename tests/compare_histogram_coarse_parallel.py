@@ -23,7 +23,7 @@ def calc(item):
  g,sp=item; tf=loadtf(); im=cv2.imread(sp);gray=tf.to_gray(im);work=tf.resize_gray_max_dim(gray);h=np.bincount(work.ravel(),minlength=256).astype(float)
  pairs={m:pv(h,m) for m in ('raw','3bin','sigma3')};cache={}
  for pair in set(pairs.values()):
-  tf.rightmost_histogram_peak=lambda _gray,pair=pair:pair
+  tf.find_rightmost_histogram_peak=lambda _gray,pair=pair:pair
   try:
    c=tf.coarse_threshold_search(work); cache[pair]=(1,int(c.threshold),int(c.seed_threshold),int(c.component_area),int(np.count_nonzero(c.seed_mask)),str(c.component_bbox),str(c.seed_point))
   except tf.ThresholdResolutionError as e: cache[pair]=(0,None,None,None,0,None,None)

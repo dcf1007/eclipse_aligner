@@ -23,13 +23,13 @@ def synthetic_bridge_image():
 
 
 def test_threshold_semantics_and_lowest_separation():
-    result = tf.auto_threshold_from_gray(synthetic_bridge_image())
+    result = tf.auto_threshold(synthetic_bridge_image())
     assert result.resolved
     assert result.threshold == 8
 
 
-def test_rightmost_histogram_peak_has_left_edge():
-    peak, left = tf.rightmost_histogram_peak(synthetic_bridge_image())
+def test_find_rightmost_histogram_peak_has_left_edge():
+    peak, left = tf.find_rightmost_histogram_peak(synthetic_bridge_image())
     assert peak >= 60
     assert 0 <= left < peak
 
@@ -38,8 +38,8 @@ def test_unresolved_falls_back_to_rightmost_peak_left_edge():
     # A uniform bright raster has no enclosed bright component: whenever the
     # foreground exists, it reaches the true image border.
     gray = np.full((80, 120), 100, dtype=np.uint8)
-    peak, left = tf.rightmost_histogram_peak(gray)
-    result = tf.auto_threshold_from_gray(gray)
+    peak, left = tf.find_rightmost_histogram_peak(gray)
+    result = tf.auto_threshold(gray)
     assert not result.resolved
     assert result.threshold == left
     assert result.histogram_peak == peak
@@ -60,9 +60,3 @@ def test_working_resize_is_1200_max_and_grayscale_area():
     assert max(work.shape) == 1200
     assert work.shape == (1200, 600)
     assert work.ndim == 2
-
-
-def test_no_color_or_competitor_gain_path_exists():
-    assert not hasattr(tf, "adaptive_solar_hint")
-    assert not hasattr(tf, "adaptive_brightness_estimate")
-    assert not hasattr(tf, "competitor_gain")

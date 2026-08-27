@@ -30,8 +30,8 @@ for p in selected:
  im=cv2.imread(str(p));gray=cv2.cvtColor(im,cv2.COLOR_BGR2GRAY);sc=1200/max(gray.shape);work=cv2.resize(gray,(round(gray.shape[1]*sc),round(gray.shape[0]*sc)),interpolation=cv2.INTER_AREA);h=np.bincount(work.ravel(),minlength=256).astype(float)
  row={'file':p.name}
  for m in ('3bin','sigma3'):
-  pair=pv(h,m);tf=loadtf('tf_'+m+'_'+p.stem.replace(' ','_'));tf.rightmost_histogram_peak=lambda _gray,pair=pair:pair
-  t=time.time();r=tf.auto_threshold_from_gray(gray);dt=time.time()-t
+  pair=pv(h,m);tf=loadtf('tf_'+m+'_'+p.stem.replace(' ','_'));tf.find_rightmost_histogram_peak=lambda _gray,pair=pair:pair
+  t=time.time();r=tf.auto_threshold(gray);dt=time.time()-t
   row.update({f'{m}_peak':pair[0],f'{m}_left':pair[1],f'{m}_T':int(r.threshold),f'{m}_resolved':int(r.resolved),f'{m}_coarse_T':r.coarse_threshold,f'{m}_sec':round(dt,3)})
   print(p.name,m,pair,'T',r.threshold,'resolved',r.resolved,'sec',round(dt,2),flush=True)
  rows.append(row)
