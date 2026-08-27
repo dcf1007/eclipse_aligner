@@ -34,14 +34,14 @@ def test_first_image_load_runs_auto_and_generates_preview():
     assert "self.render_threshold_preview()" in block
 
 
-def test_auto_select_recomputes_threshold_without_regenerating_preview():
+def test_auto_select_recomputes_threshold_and_regenerates_preview():
     block = TEXT.split("def auto_select_threshold(self):", 1)[1].split(
         "def auto_select_radius", 1
     )[0]
     assert "auto_threshold_from_gray(self.gray_image)" in block
     assert "self.threshold.set(selected_threshold)" in block
-    assert "self.render_threshold_preview()" not in block
-    assert "Preview not regenerated." in block
+    assert "self.refresh_preview()" in block
+    assert "Preview not regenerated." not in block
 
 
 def test_manual_threshold_is_stored_per_image():

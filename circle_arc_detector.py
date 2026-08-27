@@ -12,8 +12,8 @@ The preview rasters contain no placeholder text. Empty preview regions are store
 as BGRA image data with alpha=0 rather than simulated with a matching Tk background.
 Setting controls regenerate the threshold preview after discrete changes. Slider
 motion only updates the displayed value; preview refresh is deferred until mouse
-release or the final keyboard key release, while checkbox/radio changes refresh
-immediately. Threshold Auto select remains an explicit no-preview-regeneration action.
+release or the final keyboard key release, while checkbox/radio and threshold
+Auto select changes refresh immediately.
 """
 
 
@@ -990,7 +990,7 @@ class DetectorApp:
         )
 
     def auto_select_threshold(self):
-        """Rerun image-only automatic T selection without regenerating the preview."""
+        """Rerun image-only automatic T selection and regenerate the preview."""
         if self.gray_image is None:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
@@ -1002,21 +1002,20 @@ class DetectorApp:
             self.image_auto_results[self.current_path] = result
 
         # The threshold variable trace updates only the displayed slider value.
-        # Per explicit user requirement, Auto select itself DOES NOT regenerate the
-        # preview; Refresh Preview / Apply Full Resolution remain available actions.
+        # Auto select is a completed setting change, so regenerate through the same
+        # refresh path used by the other controls after storing the new T.
         self.threshold.set(selected_threshold)
+        self.refresh_preview()
         if result.resolved:
             self.status.set(
                 "Automatic grayscale threshold selected: "
                 f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                f"histogram start={result.histogram_left_edge}). "
-                "Preview not regenerated."
+                f"histogram start={result.histogram_left_edge})."
             )
         else:
             self.status.set(
                 "Automatic component tracking unresolved; "
-                f"using rightmost-histogram left edge T={selected_threshold}. "
-                "Preview not regenerated."
+                f"using rightmost-histogram left edge T={selected_threshold}."
             )
 
     def auto_select_radius(self):

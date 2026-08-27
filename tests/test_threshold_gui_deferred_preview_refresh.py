@@ -58,13 +58,13 @@ def test_radio_setting_change_refreshes_immediately():
     assert "self.clear_threshold_preview()" not in center
 
 
-def test_auto_select_keeps_explicit_no_preview_regeneration_rule():
+def test_auto_select_refreshes_preview_immediately_after_selecting_t():
     auto = block("    def auto_select_threshold(self):", "    def auto_select_radius")
     assert "auto_threshold_from_gray(self.gray_image)" in auto
     assert "self.threshold.set(selected_threshold)" in auto
-    assert "self.render_threshold_preview()" not in auto
-    assert "self.refresh_preview()" not in auto
-    assert "Preview not regenerated." in auto
+    assert "self.refresh_preview()" in auto
+    assert auto.index("self.threshold.set(selected_threshold)") < auto.index("self.refresh_preview()")
+    assert "Preview not regenerated." not in auto
 
 
 def test_threshold_backend_invariants_are_preserved():
