@@ -1,24 +1,55 @@
-"""GUI-first eclipse detector shell.
+"""Eclipse alignment GUI with grayscale automatic threshold selection.
 
-This milestone contains the rebuilt interface plus the grayscale-only automatic
-threshold finder. Ellipse fitting, horizon handling, radius auto-selection, image
-centering, and export are not implemented yet. The interface is based on the latest GUI from
-``refactor/cleanup-performance`` and adds a mutually exclusive centering target:
-light ellipse (default) or dark ellipse. A clicked slider retains keyboard focus
-for arrow-key adjustment until the mouse is clicked anywhere outside that slider.
-GUI-only Auto select buttons are provided for threshold and radius, and a
-Save centered images placeholder is available beside the image-loading control.
-The preview rasters contain no placeholder text. Empty preview regions are stored
-as BGRA image data with alpha=0 rather than simulated with a matching Tk background.
-Setting controls regenerate the threshold preview after discrete changes. Slider
-motion only updates the displayed value; preview refresh is deferred until mouse
-release or the final keyboard key release, while checkbox/radio and threshold
-Auto select changes refresh immediately.
+This module combines the application's user-interface foundation with the tested
+image-only automatic threshold finder. The GUI owns image navigation, per-image
+processing settings, control interaction, preview lifecycle, and cached automatic
+threshold results. The threshold finder itself remains independent of GUI state:
+it accepts image data and returns an ``AutoThresholdResult`` describing the
+selected threshold and the topology used to obtain it.
+
+All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
+absolute image path. Each image entry is a normal dictionary with exactly two
+conceptual fields: ``settings`` contains only sparse overrides from that image's
+baseline values, while ``auto_threshold_result`` caches the complete automatic
+threshold result. Ordinary controls use the application defaults as their baseline;
+the threshold uses the cached automatic threshold as its image-specific baseline.
+Returning a control to its baseline removes that key from ``settings``. Reusing the
+cached automatic result means the threshold algorithm is not rerun when Auto select
+is clicked again for an unchanged loaded image.
+
+Slider labels update continuously, but a setting is committed only after mouse
+release or the final keyboard key release. Keyboard auto-repeat can emit temporary
+release/press pairs on some Tk platforms, so releases are coalesced through a short
+settling window. Checkboxes and radio buttons commit immediately. A completed
+setting change calls ``_commit_setting_change(setting_name)``; that function updates
+only the changed sparse override and then invokes ``_refresh_threshold_image()``.
+That lightweight path performs only the current-T B/W conversion and threshold-pane
+update. It does not run the broader Refresh Preview processing path.
+
+``refresh_preview()`` is the explicit preview-processing entry point and is invoked
+when the user clicks Refresh Preview or when a readable image is loaded. At the
+current implementation stage its only image-processing result is still the B/W
+threshold preview, but later ellipse, arc, and horizon preview processing belongs
+there rather than in completed-setting commits. Apply Full Resolution remains a
+separate explicit action. Radius auto-selection, ellipse fitting, horizon handling,
+centering, and export are not implemented yet.
+
+The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
+``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel working
+raster with INTER_AREA, uses the rightmost locally smoothed histogram mode only to
+establish a solar seed, tracks 8-connected component topology, maps the seed back
+to full resolution, constructs rounded 6.5% and 19.5% observation regions, and
+selects the lowest full-resolution threshold whose tracked component is genuinely
+separated. If topology cannot be resolved, the deterministic fallback is the left
+edge of the rightmost histogram peak. No HSV/color thresholding, Otsu thresholding,
+ellipse-fit score, bright-pixel dominance, competitor gain, or horizon special case
+is part of automatic threshold selection.
 """
-
 
 import argparse
 import base64
+from dataclasses import dataclass
+import math
 import os
 import tkinter as tk
 from tkinter import filedialog
@@ -27,11 +58,13 @@ import cv2
 import numpy as np
 
 
-
 IMAGE_FILE_TYPES = (
     ("Image files", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"),
     ("All files", "*.*"),
 )
+
+SLIDER_KEY_RELEASE_SETTLE_MS = 45
+PREVIEW_REDRAW_DELAY_MS = 60
 
 
 def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
@@ -49,26 +82,8 @@ def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Grayscale-only automatic threshold finder (tested implementation)
+# Grayscale automatic threshold finder
 # ---------------------------------------------------------------------------
-"""Optimized grayscale-only eclipse automatic threshold finder candidate.
-
-The algorithm intentionally uses only grayscale histogram modes and 8-connected
-component topology. Threshold semantics are fixed:
-
-    dark  = gray <= T
-    light = gray > T
-
-No HSV/color interpretation, Otsu thresholding, morphology, ellipse fitting,
-bright-pixel dominance, competitor gain, or horizon logic is used here.
-"""
-
-from dataclasses import dataclass
-import math
-
-import cv2
-import numpy as np
-
 WORK_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 ROI_DILATION_FRACTION = 0.065
@@ -361,7 +376,6 @@ def _full_flood_component(gray: np.ndarray, threshold: int, seed: tuple[int, int
 def full_roi_seed_component(
     full_gray: np.ndarray,
     coarse_threshold: int,
-    seed_threshold: int,
     seed_point: tuple[int, int],
 ):
     """Obtain an ACTUAL full-resolution enclosed component for ROI dilation."""
@@ -444,7 +458,6 @@ def find_lowest_full_threshold(
     full_gray: np.ndarray,
     seed_point: tuple[int, int],
     roi_seed_component: np.ndarray,
-    histogram_upper_hint: int,
 ):
     """Scan T upward from zero and return the first genuinely separated threshold.
 
@@ -462,10 +475,7 @@ def find_lowest_full_threshold(
     )
 
     used_guard = False
-    upper = max(0, min(255, int(histogram_upper_hint)))
     for threshold in range(0, 256):
-        # The histogram upper hint is diagnostic rather than a hard limit. We keep
-        # scanning defensively above it if original-resolution topology requires it.
         exists, touches_roi, touches_true = _region_status(roi, threshold)
         if not exists or touches_true:
             continue
@@ -492,13 +502,12 @@ def auto_threshold_from_gray(full_gray: np.ndarray) -> AutoThresholdResult:
             full_gray, work_gray.shape, coarse.seed_mask, coarse.seed_threshold
         )
         roi_seed_t, roi_seed_component = full_roi_seed_component(
-            full_gray, coarse.threshold, coarse.seed_threshold, full_seed
+            full_gray, coarse.threshold, full_seed
         )
         final_t, used_guard = find_lowest_full_threshold(
             full_gray,
             full_seed,
             roi_seed_component,
-            histogram_upper_hint=max(coarse.seed_threshold, roi_seed_t),
         )
         return AutoThresholdResult(
             threshold=final_t,
@@ -534,11 +543,12 @@ def auto_threshold(image: np.ndarray) -> AutoThresholdResult:
 
 
 class DetectorApp:
-    """GUI shell for the eclipse detector rebuild.
+    """Own GUI state, per-image settings, cached auto thresholds, and previews.
 
-    Only interface behavior is implemented here: image loading/navigation,
-    controls, preview panes, and the centering-target selector. Detector buttons
-    deliberately report that backend functionality has not yet been implemented.
+    Public methods represent application actions. Underscore-prefixed methods are
+    Tk callback or rendering internals. Automatic threshold selection remains a
+    stateless image algorithm outside this class; this class only caches its result
+    per image and manages the effective processing settings shown by the controls.
     """
 
     def __init__(self, root: tk.Tk, image_paths: list[str], args: argparse.Namespace):
@@ -551,22 +561,21 @@ class DetectorApp:
         self.gray_image = None
         self.threshold_preview = transparent_bgra()
 
-        # Threshold is stored per image so a manual override survives navigation.
-        # Automatic selection runs on first load and only reruns when Auto select is
-        # explicitly clicked for that image.
-        self.image_thresholds: dict[str, int] = {}
-        self.image_auto_results = {}
+        # Per-image state keeps sparse setting overrides plus the cached automatic
+        # threshold result. No additional ImageState class is needed: the nested
+        # dictionaries directly express the state hierarchy.
+        self.image_state: dict[str, dict[str, object]] = {}
 
         self.threshold_photo = None
         self.color_photo = None
-        self.resize_job = None
+        self.preview_redraw_job = None
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
         # Tk platforms. Keep one deferred refresh job so only the final key-up
         # commits a slider-driven preview refresh.
-        self.scale_key_release_job = None
-        self.scale_key_widget = None
-        self.scale_key_start_value = None
+        self.slider_keyboard_commit_job = None
+        self.slider_keyboard_widget = None
+        self.slider_keyboard_start_value = None
 
         self.threshold = tk.IntVar(value=args.threshold)
         self.min_radius = tk.IntVar(value=round(args.min_radius))
@@ -582,24 +591,49 @@ class DetectorApp:
         self.center_target = tk.StringVar(value="light")
         self.center_preview_label = tk.StringVar()
 
-        self.status = tk.StringVar(value="GUI-only milestone. Load images to inspect the interface.")
+        # Every processing control is per-image. Ordinary controls use these values
+        # as their baseline; threshold instead uses the cached automatic T for the
+        # current image. Only deviations from those baselines are stored.
+        self.default_settings = {
+            "min_radius": int(self.min_radius.get()),
+            "max_radius": int(self.max_radius.get()),
+            "max_error": float(self.max_error.get()),
+            "min_coverage": int(self.min_coverage.get()),
+            "morphology": bool(self.morphology.get()),
+            "outer_limb_assistance": bool(self.outer_limb_assistance.get()),
+            "use_horizon": bool(self.use_horizon.get()),
+            "center_target": self.center_target.get(),
+        }
+        self.setting_variables = {
+            "threshold": self.threshold,
+            "min_radius": self.min_radius,
+            "max_radius": self.max_radius,
+            "max_error": self.max_error,
+            "min_coverage": self.min_coverage,
+            "morphology": self.morphology,
+            "outer_limb_assistance": self.outer_limb_assistance,
+            "use_horizon": self.use_horizon,
+            "center_target": self.center_target,
+        }
+
+        self.status = tk.StringVar(value="Threshold finder integrated. Load images to inspect automatic T selection.")
         self.image_info = tk.StringVar(value="No image loaded")
 
-        root.title("Ellipse / Arc Detector — GUI milestone")
+        root.title("Ellipse / Arc Detector — threshold finder")
         root.minsize(1050, 760)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.build_navigation()
-        self.build_controls()
-        self.build_previews()
-        self.update_center_preview_label()
+        self._build_navigation_bar()
+        self._build_settings_panel()
+        self._build_preview_panes()
+        self._update_center_preview_label()
 
         # Tk's toplevel bindtag receives mouse events from every child widget.
         # Use it to clear slider keyboard focus as soon as the user clicks
         # anywhere outside the currently focused slider.
-        root.bind("<ButtonPress-1>", self.release_scale_focus_if_outside, add="+")
+        root.bind("<ButtonPress-1>", self._release_slider_focus_if_clicked_elsewhere, add="+")
         root.bind("<Return>", lambda _event: self.apply_full_resolution())
         root.bind("<Escape>", lambda _event: self.close())
 
@@ -642,7 +676,7 @@ class DetectorApp:
             self.threshold_preview = transparent_bgra()
             self.threshold_photo = None
             self.color_photo = None
-            self.redraw()
+            self._redraw_previews()
             self.status.set(f"Could not load image: {path}")
         else:
             # Convert the original image to authoritative grayscale ONCE. The auto
@@ -651,25 +685,33 @@ class DetectorApp:
             self.color_image = opaque_bgra(image)
             self.gray_image = to_gray(image)
 
-            restored = path in self.image_thresholds
+            restored = path in self.image_state
             if restored:
-                selected_threshold = int(self.image_thresholds[path])
+                state = self.image_state[path]
+                result = state["auto_threshold_result"]
             else:
                 result = auto_threshold_from_gray(self.gray_image)
-                selected_threshold = int(result.threshold)
-                self.image_thresholds[path] = selected_threshold
-                self.image_auto_results[path] = result
+                state = {
+                    "settings": {},
+                    "auto_threshold_result": result,
+                }
+                self.image_state[path] = state
 
-            # Setting the Tk variable updates the displayed slider value only.
-            # Image loading explicitly regenerates the black/white threshold raster
-            # immediately after restoring or automatically selecting T.
-            self.threshold.set(selected_threshold)
-            self.render_threshold_preview()
-            self.redraw()
+            settings = state["settings"]
+            for setting_name, variable in self.setting_variables.items():
+                if setting_name == "threshold":
+                    baseline = int(result.threshold)
+                else:
+                    baseline = self.default_settings[setting_name]
+                variable.set(settings.get(setting_name, baseline))
+
+            self._update_center_preview_label()
+            self.refresh_preview()
+            selected_threshold = int(self.threshold.get())
 
             if restored:
                 self.status.set(
-                    f"Image loaded. Restored stored threshold T={selected_threshold}."
+                    f"Image loaded. Restored per-image settings at T={selected_threshold}."
                 )
             elif result.resolved:
                 self.status.set(
@@ -717,7 +759,7 @@ class DetectorApp:
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
-    def build_navigation(self):
+    def _build_navigation_bar(self):
         frame = tk.Frame(self.root, padx=10)
         frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
         frame.columnconfigure(4, weight=1)
@@ -744,29 +786,29 @@ class DetectorApp:
             row=0, column=4, sticky="ew"
         )
 
-    def build_controls(self):
+    def _build_settings_panel(self):
         frame = tk.Frame(self.root, padx=10, pady=8)
         frame.grid(row=1, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
 
         radius_limit = max(1600, round(max(self.args.max_radius, self.args.min_radius) * 1.5))
 
-        rows = [
-            ("Brightness threshold (dark <= T, light > T)", self.threshold,
+        slider_specs = [
+            ("threshold", "Brightness threshold (dark <= T, light > T)", self.threshold,
              0, 255, 1, lambda v: str(int(float(v)))),
-            ("Minimum FINAL fitted semi-axis radius (px)", self.min_radius,
+            ("min_radius", "Minimum FINAL fitted semi-axis radius (px)", self.min_radius,
              1, radius_limit, 1, lambda v: f"{int(float(v))} px"),
-            ("Maximum FINAL fitted semi-axis radius (px)", self.max_radius,
+            ("max_radius", "Maximum FINAL fitted semi-axis radius (px)", self.max_radius,
              1, radius_limit, 1, lambda v: f"{int(float(v))} px"),
-            ("Maximum average normalized ellipse error (%)", self.max_error,
+            ("max_error", "Maximum average normalized ellipse error (%)", self.max_error,
              0.5, 50, 0.1, lambda v: f"{float(v):.1f}%"),
-            ("Minimum TOTAL supported ellipse arc (%)", self.min_coverage,
+            ("min_coverage", "Minimum TOTAL supported ellipse arc (%)", self.min_coverage,
              0, 100, 1, lambda v: f"{int(float(v))}% (~{float(v) * 3.6:.0f}°)"),
         ]
-        for row, spec in enumerate(rows):
-            self.add_scale(frame, row, *spec)
+        for row, spec in enumerate(slider_specs):
+            self._add_slider(frame, row, *spec)
 
-        # Selection buttons are GUI placeholders at this milestone. Threshold has
+        # Threshold Auto select is implemented; radius Auto select remains a placeholder. Threshold has
         # its own button; radius selection is a single operation represented by a
         # button spanning the paired minimum/maximum radius rows.
         self.threshold_auto_button = tk.Button(
@@ -794,19 +836,19 @@ class DetectorApp:
             options,
             text="Morphology cleanup for candidate search",
             variable=self.morphology,
-            command=self.pending,
+            command=lambda: self._commit_setting_change("morphology"),
         ).grid(row=0, column=0, sticky="w", padx=(0, 20))
         tk.Checkbutton(
             options,
             text="Outer-limb assistance",
             variable=self.outer_limb_assistance,
-            command=self.pending,
+            command=lambda: self._commit_setting_change("outer_limb_assistance"),
         ).grid(row=0, column=1, sticky="w", padx=(0, 20))
         self.horizon_checkbox = tk.Checkbutton(
             options,
             text="Use detected horizon",
             variable=self.use_horizon,
-            command=self.pending,
+            command=lambda: self._commit_setting_change("use_horizon"),
             state=tk.DISABLED,
         )
         self.horizon_checkbox.grid(row=0, column=2, sticky="w")
@@ -823,14 +865,14 @@ class DetectorApp:
             text="Light ellipse",
             variable=self.center_target,
             value="light",
-            command=self.center_target_changed,
+            command=self._handle_center_target_change,
         ).grid(row=0, column=1, sticky="w", padx=(0, 14))
         tk.Radiobutton(
             center_frame,
             text="Dark ellipse",
             variable=self.center_target,
             value="dark",
-            command=self.center_target_changed,
+            command=self._handle_center_target_change,
         ).grid(row=0, column=2, sticky="w")
 
         button_frame = tk.Frame(frame)
@@ -858,11 +900,11 @@ class DetectorApp:
             wraplength=1150,
         ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
 
-    def add_scale(self, parent, row, text, variable, low, high, resolution, formatter):
+    def _add_slider(self, parent, row, setting_name, text, variable, low, high, resolution, formatter):
         tk.Label(parent, text=text, width=42, anchor="w").grid(
             row=row, column=0, sticky="w", padx=(0, 8), pady=2
         )
-        scale = tk.Scale(
+        slider = tk.Scale(
             parent,
             from_=low,
             to=high,
@@ -874,17 +916,18 @@ class DetectorApp:
             takefocus=True,
             highlightthickness=1,
         )
-        scale.grid(row=row, column=1, sticky="ew", pady=2)
+        slider.grid(row=row, column=1, sticky="ew", pady=2)
+        slider._setting_name = setting_name
 
         # Tk Scale supports precise arrow-key adjustment while it owns keyboard
         # focus. Value traces update only the label. Preview refresh is deliberately
         # deferred until the user finishes the mouse or keyboard interaction.
-        scale.bind("<ButtonPress-1>", self.focus_scale, add="+")
-        scale.bind("<ButtonPress-1>", self.begin_scale_mouse_change, add="+")
-        scale.bind("<ButtonRelease-1>", self.focus_scale, add="+")
-        scale.bind("<ButtonRelease-1>", self.finish_scale_mouse_change, add="+")
-        scale.bind("<KeyPress>", self.begin_scale_key_change, add="+")
-        scale.bind("<KeyRelease>", self.defer_scale_key_refresh, add="+")
+        slider.bind("<ButtonPress-1>", self._focus_slider, add="+")
+        slider.bind("<ButtonPress-1>", self._begin_slider_mouse_change, add="+")
+        slider.bind("<ButtonRelease-1>", self._focus_slider, add="+")
+        slider.bind("<ButtonRelease-1>", self._finish_slider_mouse_change, add="+")
+        slider.bind("<KeyPress>", self._begin_slider_keyboard_change, add="+")
+        slider.bind("<KeyRelease>", self._schedule_slider_keyboard_commit, add="+")
         value_label = tk.Label(parent, width=18, anchor="e")
         value_label.grid(row=row, column=2, pady=2)
 
@@ -897,50 +940,55 @@ class DetectorApp:
         update_value()
 
     @staticmethod
-    def focus_scale(event):
+    def _focus_slider(event):
         """Keep a clicked slider focused so arrow keys continue to adjust it."""
         event.widget.focus_set()
 
     @staticmethod
-    def begin_scale_mouse_change(event):
+    def _begin_slider_mouse_change(event):
         """Remember the value before a mouse slider interaction begins."""
         event.widget._preview_mouse_start_value = event.widget.get()
 
-    def finish_scale_mouse_change(self, event):
+    def _finish_slider_mouse_change(self, event):
         """Refresh once after a mouse slider change has actually finished."""
         start_value = getattr(event.widget, "_preview_mouse_start_value", None)
         if start_value is not None and event.widget.get() != start_value:
-            self.pending()
+            self._commit_setting_change(event.widget._setting_name)
 
-    def begin_scale_key_change(self, event):
-        """Start/coalesce a keyboard slider interaction without refreshing."""
-        if self.scale_key_release_job is not None:
-            self.root.after_cancel(self.scale_key_release_job)
-            self.scale_key_release_job = None
-        if self.scale_key_widget is not event.widget:
-            self.scale_key_widget = event.widget
-            self.scale_key_start_value = event.widget.get()
+    def _cancel_pending_slider_keyboard_commit(self):
+        """Cancel a release callback superseded by continuing keyboard input."""
+        if self.slider_keyboard_commit_job is not None:
+            self.root.after_cancel(self.slider_keyboard_commit_job)
+            self.slider_keyboard_commit_job = None
 
-    def defer_scale_key_refresh(self, event):
-        """Refresh after the final KeyRelease, not during key auto-repeat."""
-        if self.scale_key_widget is not event.widget:
-            self.scale_key_widget = event.widget
-            self.scale_key_start_value = event.widget.get()
-        if self.scale_key_release_job is not None:
-            self.root.after_cancel(self.scale_key_release_job)
-        self.scale_key_release_job = self.root.after(45, self.finish_scale_key_change)
+    def _begin_slider_keyboard_change(self, event):
+        """Begin or continue one keyboard slider interaction."""
+        self._cancel_pending_slider_keyboard_commit()
+        if self.slider_keyboard_widget is not event.widget:
+            self.slider_keyboard_widget = event.widget
+            self.slider_keyboard_start_value = event.widget.get()
 
-    def finish_scale_key_change(self):
+    def _schedule_slider_keyboard_commit(self, event):
+        """Schedule completion after a KeyRelease survives the repeat window."""
+        if self.slider_keyboard_widget is not event.widget:
+            self.slider_keyboard_widget = event.widget
+            self.slider_keyboard_start_value = event.widget.get()
+        self._cancel_pending_slider_keyboard_commit()
+        self.slider_keyboard_commit_job = self.root.after(
+            SLIDER_KEY_RELEASE_SETTLE_MS, self._finish_slider_keyboard_change
+        )
+
+    def _finish_slider_keyboard_change(self):
         """Commit one preview refresh after keyboard slider input becomes idle."""
-        self.scale_key_release_job = None
-        widget = self.scale_key_widget
-        start_value = self.scale_key_start_value
-        self.scale_key_widget = None
-        self.scale_key_start_value = None
+        self.slider_keyboard_commit_job = None
+        widget = self.slider_keyboard_widget
+        start_value = self.slider_keyboard_start_value
+        self.slider_keyboard_widget = None
+        self.slider_keyboard_start_value = None
         if widget is not None and start_value is not None and widget.get() != start_value:
-            self.pending()
+            self._commit_setting_change(widget._setting_name)
 
-    def release_scale_focus_if_outside(self, event):
+    def _release_slider_focus_if_clicked_elsewhere(self, event):
         """Release slider focus immediately when the mouse clicks elsewhere.
 
         Clicking the focused slider itself keeps focus. Clicking a different slider
@@ -952,7 +1000,7 @@ class DetectorApp:
         if isinstance(focused, tk.Scale) and event.widget is not focused:
             self.root.focus_set()
 
-    def build_previews(self):
+    def _build_preview_panes(self):
         frame = tk.Frame(self.root, padx=10)
         frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         frame.rowconfigure(1, weight=1)
@@ -978,34 +1026,32 @@ class DetectorApp:
         )
         self.threshold_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         self.color_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-        self.threshold_canvas.bind("<Configure>", self.schedule_redraw)
-        self.color_canvas.bind("<Configure>", self.schedule_redraw)
+        self.threshold_canvas.bind("<Configure>", self._schedule_preview_redraw)
+        self.color_canvas.bind("<Configure>", self._schedule_preview_redraw)
 
     # ------------------------------------------------------------------
-    # GUI-only actions
+    # Application actions and threshold preview
     # ------------------------------------------------------------------
     def save_centered_images(self):
         self.status.set(
-            "Save centered images: export functionality is not implemented in the GUI milestone."
+            "Save centered images: export functionality is not implemented in the threshold-finder stage."
         )
 
     def auto_select_threshold(self):
-        """Rerun image-only automatic T selection and regenerate the preview."""
-        if self.gray_image is None:
+        """Restore the cached image-only automatic T and refresh the B/W image."""
+        if self.gray_image is None or self.current_path is None:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
 
-        result = auto_threshold_from_gray(self.gray_image)
-        selected_threshold = int(result.threshold)
-        if self.current_path is not None:
-            self.image_thresholds[self.current_path] = selected_threshold
-            self.image_auto_results[self.current_path] = result
+        state = self.image_state[self.current_path]
+        result = state["auto_threshold_result"]
+        if result is None:
+            result = auto_threshold_from_gray(self.gray_image)
+            state["auto_threshold_result"] = result
 
-        # The threshold variable trace updates only the displayed slider value.
-        # Auto select is a completed setting change, so regenerate through the same
-        # refresh path used by the other controls after storing the new T.
+        selected_threshold = int(result.threshold)
         self.threshold.set(selected_threshold)
-        self.refresh_preview()
+        self._commit_setting_change("threshold")
         if result.resolved:
             self.status.set(
                 "Automatic grayscale threshold selected: "
@@ -1020,64 +1066,76 @@ class DetectorApp:
 
     def auto_select_radius(self):
         self.status.set(
-            "Auto select radius range: algorithm not implemented in the GUI milestone."
+            "Auto select radius range: algorithm not implemented in the threshold-finder stage."
         )
 
-    def render_threshold_preview(self):
-        """Render authoritative black/white mask for the currently selected T."""
+    def _refresh_threshold_image(self):
+        """Rebuild and display only the B/W raster for the current threshold T."""
         if self.gray_image is None:
             self.threshold_preview = transparent_bgra()
             self.threshold_photo = None
-            return
-
-        # Exact threshold semantics: dark = gray <= T, light = gray > T.
-        light_mask = cv2.compare(
-            self.gray_image,
-            int(self.threshold.get()),
-            cv2.CMP_GT,
-        )
-        preview = cv2.cvtColor(light_mask, cv2.COLOR_GRAY2BGRA)
-        preview[:, :, 3] = 255
-        self.threshold_preview = preview
-        self.threshold_photo = None
-
-    def clear_threshold_preview(self):
-        """Replace stale threshold output with a fully transparent BGRA frame."""
-        if self.color_image is not None:
-            height, width = self.color_image.shape[:2]
-            self.threshold_preview = transparent_bgra(width, height)
         else:
-            self.threshold_preview = transparent_bgra()
-        self.threshold_photo = None
+            # Exact semantics: dark = gray <= T, light = gray > T.
+            light_mask = cv2.compare(
+                self.gray_image,
+                int(self.threshold.get()),
+                cv2.CMP_GT,
+            )
+            preview = cv2.cvtColor(light_mask, cv2.COLOR_GRAY2BGRA)
+            preview[:, :, 3] = 255
+            self.threshold_preview = preview
+            self.threshold_photo = None
+
         if hasattr(self, "threshold_canvas"):
-            self.threshold_photo = self.show_image(
+            self.threshold_photo = self._show_image_on_canvas(
                 self.threshold_canvas, self.threshold_preview
             )
 
-    def pending(self, *_args):
-        """Store the current T and refresh after a completed/discrete setting change."""
-        if self.current_path is not None and self.gray_image is not None:
-            self.image_thresholds[self.current_path] = int(self.threshold.get())
-        self.refresh_preview()
+    def _commit_setting_change(self, setting_name):
+        """Persist one changed per-image setting, then refresh only the B/W image."""
+        if self.current_path is not None and self.current_path in self.image_state:
+            state = self.image_state[self.current_path]
+            settings = state["settings"]
+            value = self.setting_variables[setting_name].get()
 
-    def center_target_changed(self):
-        self.update_center_preview_label()
-        target = "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
-        self.refresh_preview()
+            if setting_name == "threshold":
+                baseline = int(state["auto_threshold_result"].threshold)
+            else:
+                baseline = self.default_settings[setting_name]
+
+            if value == baseline:
+                settings.pop(setting_name, None)
+            else:
+                settings[setting_name] = value
+
+        self._refresh_threshold_image()
+
+    def _selected_center_target_name(self):
+        """Return the user-facing name of the selected centering target."""
+        return "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
+
+    def _handle_center_target_change(self):
+        self._update_center_preview_label()
+        self._commit_setting_change("center_target")
         self.status.set(
-            f"Centering target set to {target}. Actual centering will be implemented with ellipse detection."
+            f"Centering target set to {self._selected_center_target_name()}. "
+            "Actual centering will be implemented with ellipse detection."
         )
 
-    def update_center_preview_label(self):
-        target = "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
+    def _update_center_preview_label(self):
+        target = self._selected_center_target_name()
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
     def refresh_preview(self):
+        """Run explicit preview processing for the currently loaded image."""
         if self.gray_image is None:
             self.status.set("Refresh Preview: no readable image is loaded.")
             return
-        self.render_threshold_preview()
-        self.redraw()
+
+        self._refresh_threshold_image()
+        if hasattr(self, "color_canvas"):
+            image = self.color_image if self.color_image is not None else transparent_bgra()
+            self.color_photo = self._show_image_on_canvas(self.color_canvas, image)
         self.status.set(
             f"Threshold preview regenerated at T={int(self.threshold.get())}."
         )
@@ -1086,34 +1144,31 @@ class DetectorApp:
         if self.gray_image is None:
             self.status.set("Apply Full Resolution: no readable image is loaded.")
             return
-        self.render_threshold_preview()
-        self.redraw()
+        self._refresh_threshold_image()
         self.status.set(
             "Full-resolution threshold preview applied at "
             f"T={int(self.threshold.get())}. Ellipse detector backend not implemented yet."
         )
 
-    def schedule_redraw(self, _event=None):
-        if self.resize_job is not None:
-            self.root.after_cancel(self.resize_job)
-        self.resize_job = self.root.after(60, self.redraw)
+    def _schedule_preview_redraw(self, _event=None):
+        if self.preview_redraw_job is not None:
+            self.root.after_cancel(self.preview_redraw_job)
+        self.preview_redraw_job = self.root.after(
+            PREVIEW_REDRAW_DELAY_MS, self._redraw_previews
+        )
 
-    def redraw(self):
-        self.resize_job = None
+    def _redraw_previews(self):
+        self.preview_redraw_job = None
         if hasattr(self, "threshold_canvas"):
-            self.threshold_photo = self.show_image(
+            self.threshold_photo = self._show_image_on_canvas(
                 self.threshold_canvas, self.threshold_preview
             )
         if hasattr(self, "color_canvas"):
-            if self.color_image is None:
-                self.color_photo = self.show_image(
-                    self.color_canvas, transparent_bgra()
-                )
-            else:
-                self.color_photo = self.show_image(self.color_canvas, self.color_image)
+            image = self.color_image if self.color_image is not None else transparent_bgra()
+            self.color_photo = self._show_image_on_canvas(self.color_canvas, image)
 
     @staticmethod
-    def show_image(canvas, image):
+    def _show_image_on_canvas(canvas, image):
         canvas_width = max(2, canvas.winfo_width() - 2)
         canvas_height = max(2, canvas.winfo_height() - 2)
         image_height, image_width = image.shape[:2]
@@ -1145,7 +1200,7 @@ class DetectorApp:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="GUI milestone for the eclipse detector rebuild.")
+    parser = argparse.ArgumentParser(description="threshold-finder stage for the eclipse detector rebuild.")
     parser.add_argument(
         "images",
         nargs="*",

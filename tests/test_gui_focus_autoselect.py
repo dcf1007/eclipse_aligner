@@ -15,8 +15,8 @@ def test_source_parses():
 
 def test_sliders_explicitly_keep_keyboard_focus_after_click():
     assert 'takefocus=True' in TEXT
-    assert 'scale.bind("<ButtonPress-1>", self.focus_scale, add="+")' in TEXT
-    assert 'scale.bind("<ButtonRelease-1>", self.focus_scale, add="+")' in TEXT
+    assert 'slider.bind("<ButtonPress-1>", self._focus_slider, add="+")' in TEXT
+    assert 'slider.bind("<ButtonRelease-1>", self._focus_slider, add="+")' in TEXT
     assert 'event.widget.focus_set()' in TEXT
 
 
@@ -32,14 +32,14 @@ def test_radius_auto_select_button_spans_min_and_max_rows():
     assert 'row=1, column=3, rowspan=2' in TEXT
 
 
-def test_threshold_auto_select_is_implemented_and_refreshes_preview():
+def test_threshold_auto_select_reuses_cached_result_and_commits_threshold():
     block = TEXT.split("def auto_select_threshold(self):", 1)[1].split(
         "def auto_select_radius", 1
     )[0]
-    assert "auto_threshold_from_gray(self.gray_image)" in block
+    assert 'state["auto_threshold_result"]' in block
     assert "self.threshold.set(selected_threshold)" in block
-    assert "self.refresh_preview()" in block
-    assert "Preview not regenerated." not in block
+    assert 'self._commit_setting_change("threshold")' in block
+    assert "self.refresh_preview()" not in block
 
 
 def test_radius_auto_select_remains_placeholder_for_later_branch_work():

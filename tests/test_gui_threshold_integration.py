@@ -1,71 +1,95 @@
-"""Regression checks for the final single-file threshold/UI integration.
+"""Behavioral integration checks for threshold state and preview routing."""
 
-These preserve the assertions exercised by the successful integration CI run,
-updated only to reflect that the tested finder is now in circle_arc_detector.py.
-"""
+from types import SimpleNamespace
 
-from pathlib import Path
-import ast
+import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "circle_arc_detector.py"
-TEXT = SOURCE.read_text(encoding="utf-8")
+import circle_arc_detector as appmod
 
 
-def test_source_parses():
-    ast.parse(TEXT)
+class FakeVariable:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
 
 
-def test_tested_threshold_algorithm_is_integrated_inline():
-    assert "from threshold_finder import" not in TEXT
-    assert "def rightmost_histogram_peak(" in TEXT
-    assert "def auto_threshold_from_gray(" in TEXT
-    assert "WORK_MAX_DIM = 1200" in TEXT
-    assert "ROI_DILATION_FRACTION = 0.065" in TEXT
-    assert "GUARD_DILATION_FRACTION = 0.195" in TEXT
+def make_state_app():
+    app = object.__new__(appmod.DetectorApp)
+    app.current_path = "/tmp/image.jpg"
+    app.gray_image = np.array([[0, 9, 10, 255]], dtype=np.uint8)
+    app.threshold = FakeVariable(10)
+    app.min_radius = FakeVariable(1000)
+    app.max_radius = FakeVariable(1500)
+    app.max_error = FakeVariable(8.0)
+    app.min_coverage = FakeVariable(8)
+    app.morphology = FakeVariable(False)
+    app.outer_limb_assistance = FakeVariable(False)
+    app.use_horizon = FakeVariable(True)
+    app.center_target = FakeVariable("light")
+    app.default_settings = {
+        "min_radius": 1000, "max_radius": 1500, "max_error": 8.0,
+        "min_coverage": 8, "morphology": False,
+        "outer_limb_assistance": False, "use_horizon": True,
+        "center_target": "light",
+    }
+    app.setting_variables = {
+        "threshold": app.threshold, "min_radius": app.min_radius,
+        "max_radius": app.max_radius, "max_error": app.max_error,
+        "min_coverage": app.min_coverage, "morphology": app.morphology,
+        "outer_limb_assistance": app.outer_limb_assistance,
+        "use_horizon": app.use_horizon, "center_target": app.center_target,
+    }
+    result = appmod.AutoThresholdResult(
+        threshold=10, histogram_peak=20, histogram_left_edge=10, seed_threshold=15,
+        coarse_threshold=12, roi_seed_threshold=12, full_seed_point=(1, 1),
+        used_guard=False, resolved=True,
+    )
+    app.image_state = {app.current_path: {"settings": {}, "auto_threshold_result": result}}
+    app.refresh_count = 0
+    app._refresh_threshold_image = lambda: setattr(app, "refresh_count", app.refresh_count + 1)
+    return app
 
 
-def test_first_image_load_runs_auto_and_generates_preview():
-    block = TEXT.split("def load_image_at(self, index: int):", 1)[1].split(
-        "def previous_image", 1
-    )[0]
-    assert "self.gray_image = to_gray(image)" in block
-    assert "auto_threshold_from_gray(self.gray_image)" in block
-    assert "self.render_threshold_preview()" in block
+def test_changed_setting_is_stored_sparsely_and_refreshes_bw_once():
+    app = make_state_app()
+    app.min_radius.set(900)
+    app._commit_setting_change("min_radius")
+    assert app.image_state[app.current_path]["settings"] == {"min_radius": 900}
+    assert app.refresh_count == 1
 
 
-def test_auto_select_recomputes_threshold_and_regenerates_preview():
-    block = TEXT.split("def auto_select_threshold(self):", 1)[1].split(
-        "def auto_select_radius", 1
-    )[0]
-    assert "auto_threshold_from_gray(self.gray_image)" in block
-    assert "self.threshold.set(selected_threshold)" in block
-    assert "self.refresh_preview()" in block
-    assert "Preview not regenerated." not in block
+def test_setting_returned_to_default_removes_override():
+    app = make_state_app()
+    app.image_state[app.current_path]["settings"]["min_radius"] = 900
+    app.min_radius.set(1000)
+    app._commit_setting_change("min_radius")
+    assert "min_radius" not in app.image_state[app.current_path]["settings"]
 
 
-def test_manual_threshold_is_stored_per_image():
-    assert "self.image_thresholds: dict[str, int] = {}" in TEXT
-    pending = TEXT.split("def pending(self, *_args):", 1)[1].split(
-        "def center_target_changed", 1
-    )[0]
-    assert "self.image_thresholds[self.current_path] = int(self.threshold.get())" in pending
+def test_threshold_uses_cached_auto_result_as_its_baseline():
+    app = make_state_app()
+    app.threshold.set(14)
+    app._commit_setting_change("threshold")
+    assert app.image_state[app.current_path]["settings"]["threshold"] == 14
+    app.threshold.set(10)
+    app._commit_setting_change("threshold")
+    assert "threshold" not in app.image_state[app.current_path]["settings"]
 
 
-def test_explicit_preview_actions_render_threshold_output():
-    refresh = TEXT.split("def refresh_preview(self):", 1)[1].split(
-        "def apply_full_resolution", 1
-    )[0]
-    apply = TEXT.split("def apply_full_resolution(self):", 1)[1].split(
-        "def schedule_redraw", 1
-    )[0]
-    assert "self.render_threshold_preview()" in refresh
-    assert "self.render_threshold_preview()" in apply
-
-
-def test_preview_uses_exact_threshold_semantics():
-    renderer = TEXT.split("def render_threshold_preview(self):", 1)[1].split(
-        "def clear_threshold_preview", 1
-    )[0]
-    assert "cv2.CMP_GT" in renderer
-    assert "dark = gray <= T, light = gray > T" in renderer
+def test_bw_renderer_uses_exact_gray_greater_than_t_semantics():
+    app = make_state_app()
+    app.threshold_preview = appmod.transparent_bgra()
+    app.threshold_photo = None
+    app._refresh_threshold_image = appmod.DetectorApp._refresh_threshold_image.__get__(app)
+    app._refresh_threshold_image()
+    assert app.threshold_preview.shape == (1, 4, 4)
+    assert app.threshold_preview[0, 0, 0] == 0
+    assert app.threshold_preview[0, 1, 0] == 0
+    assert app.threshold_preview[0, 2, 0] == 0
+    assert app.threshold_preview[0, 3, 0] == 255
+    assert np.all(app.threshold_preview[:, :, 3] == 255)
