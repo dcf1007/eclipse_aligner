@@ -10,22 +10,22 @@ to obtain it. Color-to-grayscale conversion is an input-stage responsibility and
 is performed before the threshold algorithm is called.
 
 All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
-absolute image path. Each image entry is a normal dictionary with three conceptual fields:
-``settings`` stores sparse ``ImageSettings`` overrides,
-``auto_threshold_result`` caches the complete automatic threshold result, and
-``solar_data`` caches post-threshold full-resolution solar geometry when it has
-been established for a specific T. Ordinary controls use the application defaults as their baseline;
-the threshold uses the cached automatic threshold as its image-specific baseline.
-Returning a control to its baseline removes that key from ``settings``. Reusing the
-cached automatic result means the threshold algorithm is not rerun when Auto select
-is clicked again for an unchanged loaded image.
+absolute image path. Each image entry keeps ``settings``, the cached
+``auto_threshold_result``, post-threshold ``solar_data``, and an optional cached
+``auto_radius_bounds`` result derived from that SolarData. Radius bounds are batch
+defaults until the user explicitly chooses a per-image minimum or maximum radius;
+once chosen, those radius values remain explicit in ``ImageSettings`` even if they
+happen to equal the current batch default. The threshold continues to use the cached
+automatic threshold as its image-specific baseline. Reusing cached automatic results
+means neither threshold selection nor the relatively expensive radius-bound contour
+fits are rerun unnecessarily.
 
 Slider labels update continuously, but a setting is committed only after mouse
 release or the final keyboard key release. Keyboard auto-repeat can emit temporary
 release/press pairs on some Tk platforms, so releases are coalesced through a short
 settling window. Checkboxes and radio buttons commit immediately. A completed
 setting change calls ``_commit_setting_change(setting_name)``; that function updates
-only the changed sparse override and then invokes ``_refresh_threshold_image()``.
+only the changed setting state and then invokes ``_refresh_threshold_image()``.
 That lightweight path performs only the current-T B/W conversion and threshold-pane
 update. It does not run the broader Refresh Preview processing path.
 
@@ -36,7 +36,8 @@ after ``AutoThresholdResult`` has already been returned. If automatic thresholdi
 is unresolved, image load stops after the fallback B/W preview and waits for an
 explicit Refresh Preview. Later ellipse, arc, and horizon preview processing belongs
 behind that same explicit boundary. Apply Full Resolution remains a
-separate explicit action. Radius auto-selection, ellipse fitting, horizon handling,
+separate explicit action. Radius auto-selection is implemented only as a coarse
+batch search-range initializer from SolarData; final ellipse fitting, horizon handling,
 centering, and export are not implemented yet.
 
 The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
@@ -583,6 +584,162 @@ class SolarData:
     component_contour: np.ndarray
 
 
+@dataclass(frozen=True)
+class AutoRadiusBounds:
+    """Cached coarse radius-range evidence derived from one SolarData threshold."""
+
+    threshold: int
+    min_radius: int | None
+    max_radius: int | None
+    contracted_fit_count: int
+    expanded_fit_count: int
+
+
+def _normalize_coarse_radius_ellipse(raw):
+    """Normalize an OpenCV ellipse into semi-axis radii for coarse range finding."""
+    try:
+        (cx, cy), (width, height), angle = raw
+    except (TypeError, ValueError):
+        return None
+    values = (cx, cy, width, height, angle)
+    if not np.all(np.isfinite(values)) or width <= 0 or height <= 0:
+        return None
+
+    semi_x = width * 0.5
+    semi_y = height * 0.5
+    if semi_x >= semi_y:
+        major, minor, major_angle = semi_x, semi_y, angle
+    else:
+        major, minor, major_angle = semi_y, semi_x, angle + 90.0
+    major_angle %= 180.0
+    equivalent_radius = math.sqrt(major * minor)
+    if equivalent_radius <= 0 or not np.isfinite(equivalent_radius):
+        return None
+    return {
+        "center": (float(cx), float(cy)),
+        "major": float(major),
+        "minor": float(minor),
+        "angle": float(major_angle),
+        "equivalent_radius": float(equivalent_radius),
+    }
+
+
+def _fit_coarse_radius_circle(points):
+    """Least-squares circle used only as one coarse radius-range witness."""
+    points = np.asarray(points, np.float64)
+    if len(points) < 3:
+        return None
+    x = points[:, 0]
+    y = points[:, 1]
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    u = x - x_mean
+    v = y - y_mean
+    squared_distance = u * u + v * v
+    suu = np.dot(u, u)
+    svv = np.dot(v, v)
+    suv = np.dot(u, v)
+    suz = np.dot(u, squared_distance)
+    svz = np.dot(v, squared_distance)
+    determinant = suu * svv - suv * suv
+    if abs(determinant) <= 1e-12 * (suu * svv + 1.0):
+        return None
+    u_center = 0.5 * (suz * svv - svz * suv) / determinant
+    v_center = 0.5 * (svz * suu - suz * suv) / determinant
+    cx = x_mean + u_center
+    cy = y_mean + v_center
+    radius_sq = float(squared_distance.mean()) + u_center**2 + v_center**2
+    if radius_sq <= 0 or not np.isfinite(radius_sq):
+        return None
+    radius = math.sqrt(radius_sq)
+    return {
+        "center": (float(cx), float(cy)),
+        "major": radius,
+        "minor": radius,
+        "angle": 0.0,
+        "equivalent_radius": radius,
+    }
+
+
+def _fit_coarse_radius_options(points):
+    """Try the recovered circle, Direct, AMS and standard coarse fit family."""
+    points = np.asarray(points, np.float32)
+    if len(points) < 5:
+        return []
+
+    options = []
+    circle = _fit_coarse_radius_circle(points)
+    if circle is not None:
+        options.append(circle)
+
+    shaped = points.reshape(-1, 1, 2)
+    for fitter in (cv2.fitEllipseDirect, cv2.fitEllipseAMS, cv2.fitEllipse):
+        try:
+            ellipse = _normalize_coarse_radius_ellipse(fitter(shaped))
+        except cv2.error:
+            ellipse = None
+        if ellipse is not None:
+            options.append(ellipse)
+    return options
+
+
+def _external_mask_contour_points(mask):
+    """Return the largest external CHAIN_APPROX_NONE contour as float XY points."""
+    u8 = np.where(mask, 255, 0).astype(np.uint8)
+    contours, _ = cv2.findContours(u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return np.empty((0, 2), np.float32)
+    return max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+
+
+def _contract_mask_by_distance(mask, margin):
+    """Euclidean contraction by the exact 19.5%-guard distance; empty is valid."""
+    u8 = np.asarray(mask, dtype=np.uint8)
+    if not np.any(u8):
+        return np.zeros(u8.shape, bool)
+    distance = cv2.distanceTransform(u8, cv2.DIST_L2, 5)
+    return distance > float(margin)
+
+
+def _coarse_axis_radii_from_mask(mask):
+    """Collect both semi-axis radii from every valid coarse circle/ellipse fit."""
+    points = _external_mask_contour_points(mask)
+    fits = _fit_coarse_radius_options(points)
+    radii = []
+    for fit in fits:
+        radii.extend((float(fit["minor"]), float(fit["major"])))
+    return tuple(r for r in radii if np.isfinite(r) and r > 0)
+
+
+def derive_auto_radius_bounds(solar_data: SolarData, image_shape: tuple[int, int]) -> AutoRadiusBounds:
+    """Derive cached min/max radius witnesses from contracted/expanded SolarData.
+
+    Minimum evidence comes from an exact Euclidean contraction of the solar
+    component by the same absolute distance used for the stored 19.5% guard.
+    Maximum evidence comes from the already stored 19.5% expanded guard itself.
+    Every semi-axis from every coarse fit contributes: the minimum of all
+    contracted-fit radii is the image's minimum witness and the maximum of all
+    expanded-fit radii is its maximum witness.  A late/occluded component may
+    disappear under contraction; that legitimately yields no minimum witness.
+    """
+    component = decompress_full_mask(solar_data.component_mask, image_shape)
+    guard = decompress_full_mask(solar_data.guard_19_5_mask, image_shape)
+    height, width = map(int, image_shape)
+    margin = GUARD_DILATION_FRACTION * math.sqrt(float(width) * float(height))
+
+    contracted = _contract_mask_by_distance(component, margin)
+    min_radii = _coarse_axis_radii_from_mask(contracted)
+    max_radii = _coarse_axis_radii_from_mask(guard)
+
+    return AutoRadiusBounds(
+        threshold=int(solar_data.threshold),
+        min_radius=math.floor(min(min_radii)) if min_radii else None,
+        max_radius=math.ceil(max(max_radii)) if max_radii else None,
+        contracted_fit_count=len(min_radii) // 2,
+        expanded_fit_count=len(max_radii) // 2,
+    )
+
+
 def compress_full_mask(mask: np.ndarray) -> bytes:
     """Pack a full-resolution boolean mask to one bit/pixel, then zlib level 1."""
     mask_bool = np.asarray(mask, dtype=bool)
@@ -789,6 +946,10 @@ class DetectorApp:
         # expresses the image-to-state hierarchy.
         self.image_state: dict[str, dict[str, object]] = {}
 
+        # Slider widgets are retained so an automatically derived batch radius
+        # maximum can expand the UI range without recreating the controls.
+        self.setting_sliders: dict[str, tk.Scale] = {}
+
         self.threshold_photo = None
         self.color_photo = None
         self.preview_redraw_job = None
@@ -877,6 +1038,13 @@ class DetectorApp:
         if not selected:
             return
         self.image_paths = [os.path.abspath(path) for path in selected]
+
+        # Radius Auto values are defaults for one loaded batch. Selecting a new
+        # batch restores the configured defaults; explicit per-image radius choices
+        # already present in image_state remain attached to those image paths.
+        self.default_settings.min_radius = int(round(self.args.min_radius))
+        self.default_settings.max_radius = int(round(self.args.max_radius))
+
         self.current_index = -1
         self.current_path = None
         self.color_image = None
@@ -914,6 +1082,7 @@ class DetectorApp:
                 state = self.image_state[path]
                 result = state["auto_threshold_result"]
                 state.setdefault("solar_data", None)
+                state.setdefault("auto_radius_bounds", None)
             else:
                 # Stage 1 completes fully before post-threshold solar persistence starts.
                 result = auto_threshold(self.gray_image)
@@ -938,6 +1107,7 @@ class DetectorApp:
                     "settings": ImageSettings(),
                     "auto_threshold_result": result,
                     "solar_data": solar_data,
+                    "auto_radius_bounds": None,
                 }
                 self.image_state[path] = state
 
@@ -1069,8 +1239,8 @@ class DetectorApp:
         for row, spec in enumerate(slider_specs):
             self._add_slider(frame, row, *spec)
 
-        # Threshold Auto select is implemented; radius Auto select remains a placeholder. Threshold has
-        # its own button; radius selection is a single operation represented by a
+        # Threshold and radius Auto select are separate operations. Threshold has
+        # its own button; radius selection is a single batch-default operation represented by a
         # button spanning the paired minimum/maximum radius rows.
         self.threshold_auto_button = tk.Button(
             frame,
@@ -1179,6 +1349,7 @@ class DetectorApp:
         )
         slider.grid(row=row, column=1, sticky="ew", pady=2)
         slider._setting_name = setting_name
+        self.setting_sliders[setting_name] = slider
 
         # Tk Scale supports precise arrow-key adjustment while it owns keyboard
         # focus. Value traces update only the label. Preview refresh is deliberately
@@ -1325,9 +1496,192 @@ class DetectorApp:
                 f"using rightmost-histogram left edge T={selected_threshold}."
             )
 
+    def _effective_threshold_for_state(self, state) -> int:
+        """Return one state's selected T without requiring that image to be current."""
+        result = state["auto_threshold_result"]
+        selected = state["settings"].threshold
+        return int(result.threshold if selected is None else selected)
+
+    def _ensure_solar_data_for_state(self, gray, state, threshold: int) -> tuple[SolarData, bool]:
+        """Ensure one arbitrary image state has SolarData at exactly ``threshold``."""
+        existing = state.get("solar_data")
+        if isinstance(existing, SolarData) and existing.threshold == int(threshold):
+            return existing, False
+
+        result = state["auto_threshold_result"]
+        preferred_seed = None
+        if result.resolved and result.full_seed_point is not None and int(threshold) == int(result.threshold):
+            preferred_seed = result.full_seed_point
+        elif isinstance(existing, SolarData):
+            preferred_seed = existing.seed_point
+        elif result.resolved and result.full_seed_point is not None:
+            preferred_seed = result.full_seed_point
+
+        seed_point, component = establish_solar_component_at_threshold(
+            gray,
+            int(threshold),
+            preferred_seed=preferred_seed,
+        )
+        solar_data = build_solar_data(
+            gray,
+            int(threshold),
+            seed_point,
+            component,
+        )
+        state["solar_data"] = solar_data
+        # Radius bounds are derived from SolarData at exactly one T. Any SolarData
+        # rebuild invalidates a previously cached bound object.
+        state["auto_radius_bounds"] = None
+        return solar_data, True
+
+    def _radius_auto_witness_for_path(self, path: str):
+        """Return one batch image's min/max witness, reusing explicit/cache state first."""
+        state = self.image_state.get(path)
+        if state is not None:
+            state.setdefault("auto_radius_bounds", None)
+            settings = state["settings"]
+            # Explicitly chosen per-image radii are already valid radius-range
+            # evidence and can avoid any image read or contour refit.
+            if settings.min_radius is not None and settings.max_radius is not None:
+                return int(settings.min_radius), int(settings.max_radius), "selected"
+
+            effective_t = self._effective_threshold_for_state(state)
+            cached = state.get("auto_radius_bounds")
+            solar_data = state.get("solar_data")
+            if (
+                isinstance(cached, AutoRadiusBounds)
+                and cached.threshold == effective_t
+                and isinstance(solar_data, SolarData)
+                and solar_data.threshold == effective_t
+            ):
+                min_witness = (
+                    int(settings.min_radius)
+                    if settings.min_radius is not None
+                    else cached.min_radius
+                )
+                max_witness = (
+                    int(settings.max_radius)
+                    if settings.max_radius is not None
+                    else cached.max_radius
+                )
+                return min_witness, max_witness, "cached"
+
+        # This is the expensive path. It is reached once for an unprepared image,
+        # or again only after that image's selected T has changed.
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ThresholdResolutionError(f"Could not read image: {path}")
+        gray = to_gray(image)
+
+        if state is None:
+            result = auto_threshold(gray)
+            solar_data = None
+            if result.resolved and result.full_seed_point is not None:
+                component = solar_component_from_seed_at_threshold(
+                    gray,
+                    result.threshold,
+                    result.full_seed_point,
+                )
+                solar_data = build_solar_data(
+                    gray,
+                    result.threshold,
+                    result.full_seed_point,
+                    component,
+                )
+            state = {
+                "settings": ImageSettings(),
+                "auto_threshold_result": result,
+                "solar_data": solar_data,
+                "auto_radius_bounds": None,
+            }
+            self.image_state[path] = state
+        else:
+            state.setdefault("auto_radius_bounds", None)
+
+        effective_t = self._effective_threshold_for_state(state)
+        solar_data, _rebuilt = self._ensure_solar_data_for_state(gray, state, effective_t)
+        bounds = derive_auto_radius_bounds(solar_data, gray.shape)
+        state["auto_radius_bounds"] = bounds
+
+        settings = state["settings"]
+        min_witness = (
+            int(settings.min_radius)
+            if settings.min_radius is not None
+            else bounds.min_radius
+        )
+        max_witness = (
+            int(settings.max_radius)
+            if settings.max_radius is not None
+            else bounds.max_radius
+        )
+        return min_witness, max_witness, "computed"
+
     def auto_select_radius(self):
+        """Set batch radius defaults from cached/derived per-image coarse evidence."""
+        if not self.image_paths:
+            self.status.set("Auto select radius range: no image batch is loaded.")
+            return
+
+        minimum_witnesses = []
+        maximum_witnesses = []
+        source_counts = {"selected": 0, "cached": 0, "computed": 0}
+        skipped = 0
+
+        for path in self.image_paths:
+            try:
+                min_witness, max_witness, source = self._radius_auto_witness_for_path(path)
+            except (ThresholdResolutionError, ValueError, cv2.error):
+                skipped += 1
+                continue
+
+            source_counts[source] += 1
+            if min_witness is not None:
+                minimum_witnesses.append(int(min_witness))
+            if max_witness is not None:
+                maximum_witnesses.append(int(max_witness))
+
+        # The requested extrema are data-derived. If the batch supplies no valid
+        # contracted minimum or no expanded maximum, do not invent the missing end.
+        if not minimum_witnesses or not maximum_witnesses:
+            self.status.set(
+                "Auto select radius range could not establish both bounds: "
+                f"minimum witnesses={len(minimum_witnesses)}, "
+                f"maximum witnesses={len(maximum_witnesses)}, skipped={skipped}."
+            )
+            return
+
+        batch_min = int(min(minimum_witnesses))
+        batch_max = int(max(maximum_witnesses))
+        if batch_max < batch_min:
+            self.status.set(
+                f"Auto select radius range produced inconsistent bounds {batch_min}..{batch_max}; "
+                "defaults were not changed."
+            )
+            return
+
+        self.default_settings.min_radius = batch_min
+        self.default_settings.max_radius = batch_max
+
+        # Existing explicit choices survive. Only controls still following the
+        # batch baseline move to the new defaults.
+        if self.current_path is not None and self.current_path in self.image_state:
+            current_settings = self.image_state[self.current_path]["settings"]
+            if current_settings.min_radius is None:
+                self.min_radius.set(batch_min)
+            if current_settings.max_radius is None:
+                self.max_radius.set(batch_max)
+
+        # Ensure the newly derived maximum is reachable in the existing slider UI.
+        for setting_name, value in (("min_radius", batch_min), ("max_radius", batch_max)):
+            slider = self.setting_sliders.get(setting_name) if hasattr(self, "setting_sliders") else None
+            if slider is not None and float(slider.cget("to")) < value:
+                slider.configure(to=max(value, int(math.ceil(value * 1.05))))
+
         self.status.set(
-            "Auto select radius range: algorithm not implemented in the threshold-finder stage."
+            f"Automatic batch radius defaults: {batch_min}..{batch_max} px. "
+            f"Evidence: {source_counts['selected']} selected, {source_counts['cached']} cached, "
+            f"{source_counts['computed']} computed; {skipped} skipped. "
+            "Existing per-image radius choices were preserved."
         )
 
     def _refresh_threshold_image(self):
@@ -1366,32 +1720,7 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         threshold = int(self.threshold.get())
-        existing = state.get("solar_data")
-        if isinstance(existing, SolarData) and existing.threshold == threshold:
-            return existing, False
-
-        result = state["auto_threshold_result"]
-        preferred_seed = None
-        if result.resolved and result.full_seed_point is not None and threshold == int(result.threshold):
-            preferred_seed = result.full_seed_point
-        elif isinstance(existing, SolarData):
-            preferred_seed = existing.seed_point
-        elif result.resolved and result.full_seed_point is not None:
-            preferred_seed = result.full_seed_point
-
-        seed_point, component = establish_solar_component_at_threshold(
-            self.gray_image,
-            threshold,
-            preferred_seed=preferred_seed,
-        )
-        solar_data = build_solar_data(
-            self.gray_image,
-            threshold,
-            seed_point,
-            component,
-        )
-        state["solar_data"] = solar_data
-        return solar_data, True
+        return self._ensure_solar_data_for_state(self.gray_image, state, threshold)
 
     def _commit_setting_change(self, setting_name):
         """Persist one changed setting; completed control changes stay lightweight."""
@@ -1400,12 +1729,17 @@ class DetectorApp:
             settings = state["settings"]
             value = self.setting_variables[setting_name].get()
 
-            if setting_name == "threshold":
-                baseline = int(state["auto_threshold_result"].threshold)
+            if setting_name in ("min_radius", "max_radius"):
+                # Once a radius has been explicitly chosen for an image, preserve
+                # it even if it equals today's batch default. Future Radius Auto
+                # operations may change defaults but must not erase this choice.
+                setattr(settings, setting_name, int(value))
             else:
-                baseline = getattr(self.default_settings, setting_name)
-
-            setattr(settings, setting_name, None if value == baseline else value)
+                if setting_name == "threshold":
+                    baseline = int(state["auto_threshold_result"].threshold)
+                else:
+                    baseline = getattr(self.default_settings, setting_name)
+                setattr(settings, setting_name, None if value == baseline else value)
 
         self._refresh_threshold_image()
 
