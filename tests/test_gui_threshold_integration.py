@@ -74,7 +74,7 @@ def make_state_app():
     return app
 
 
-def test_each_processing_setting_is_stored_only_when_it_differs_from_baseline():
+def test_processing_settings_commit_with_explicit_radius_choices():
     app = make_state_app()
     changes = {
         "threshold": 14,
@@ -97,7 +97,7 @@ def test_each_processing_setting_is_stored_only_when_it_differs_from_baseline():
     assert app.refresh_count == len(changes)
 
 
-def test_returning_settings_to_their_baselines_clears_the_sparse_overrides():
+def test_radius_choices_remain_explicit_but_other_baseline_overrides_clear():
     app = make_state_app()
     settings = app.image_state[app.current_path]["settings"]
 
@@ -106,7 +106,8 @@ def test_returning_settings_to_their_baselines_clears_the_sparse_overrides():
     assert settings.min_radius == 900
     app.min_radius.set(1000)
     app._commit_setting_change("min_radius")
-    assert settings.min_radius is None
+    # Radius values are explicit once chosen, even when equal to the batch default.
+    assert settings.min_radius == 1000
 
     app.threshold.set(14)
     app._commit_setting_change("threshold")
