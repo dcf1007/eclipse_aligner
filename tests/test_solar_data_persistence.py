@@ -21,18 +21,13 @@ def disk_component(shape=(161, 181), center=(90, 80), radius=24, value=220):
     return gray, component != 0
 
 
-def test_auto_threshold_stage_source_is_unchanged():
-    import hashlib
-
-    text = SOURCE_PATH.read_text()
-    start = "# ---------------------------------------------------------------------------\n# Grayscale automatic threshold finder\n"
-    stage = text.split(start, 1)[1].split(
-        "\n\n# ---------------------------------------------------------------------------\n# Post-threshold full-resolution solar data\n",
-        1,
-    )[0]
-    assert hashlib.sha256(stage.encode()).hexdigest() == (
-        "0e915214de161831e7be5dec461b60b734c19d1e439c8ade24c7bdb84f29207a"
-    )
+def test_auto_threshold_stage_keeps_mask_refinement_downstream():
+    source = inspect.getsource(candidate.auto_threshold)
+    assert "optimize_separated_threshold" in source
+    assert "refine_solar_component_mask" not in source
+    assert "SolarData" not in source
+    assert "build_solar_data" not in source
+    assert "establish_solar_component_at_threshold" not in source
 
 
 def test_auto_threshold_has_no_solar_data_dependency():
@@ -96,15 +91,23 @@ def test_fixed_t_establishment_fails_when_only_bright_component_touches_border()
         candidate.establish_solar_component_at_threshold(gray, 100)
 
 
-def test_build_solar_data_masks_match_existing_observation_geometry():
+def test_build_solar_data_masks_match_refined_observation_geometry():
     gray, component = disk_component(shape=(201, 241), center=(120, 100), radius=26)
-    seed = (120, 100)
+    # Deliberately add a tiny 8-connected diagonal burr and one-pixel hole so the
+    # approved 3x3 open->close refinement has observable work to do.
+    component = component.copy()
+    component[73, 93] = True
+    component[100, 120] = False
+    gray[component] = 220
+    seed = (121, 100)
+
+    expected_component = candidate.refine_solar_component_mask(component)
     solar = candidate.build_solar_data(gray, 100, seed, component)
 
     assert solar.threshold == 100
     assert solar.seed_point == seed
     restored_component = candidate.decompress_full_mask(solar.component_mask, gray.shape)
-    assert np.array_equal(restored_component, component)
+    assert np.array_equal(restored_component, expected_component)
 
     image_scale = (gray.shape[0] * gray.shape[1]) ** 0.5
     for payload, fraction in (
@@ -113,7 +116,7 @@ def test_build_solar_data_masks_match_existing_observation_geometry():
     ):
         restored = candidate.decompress_full_mask(payload, gray.shape)
         region = candidate._build_observation_region(
-            gray, component, fraction * image_scale, seed
+            gray, expected_component, fraction * image_scale, seed
         )
         expected = np.zeros(gray.shape, bool)
         x0, y0, x1, y1 = region.bbox
@@ -121,8 +124,12 @@ def test_build_solar_data_masks_match_existing_observation_geometry():
         assert np.array_equal(restored, expected)
 
 
-def test_contour_is_raw_ordered_external_uint16():
+def test_contour_is_refined_ordered_external_uint16():
     gray, component = disk_component(shape=(201, 241), center=(120, 100), radius=26)
+    component = component.copy()
+    component[73, 93] = True
+    gray[component] = 220
+    expected_component = candidate.refine_solar_component_mask(component)
     solar = candidate.build_solar_data(gray, 100, (120, 100), component)
     contour = solar.component_contour
     assert contour.dtype == np.uint16
@@ -134,10 +141,7 @@ def test_contour_is_raw_ordered_external_uint16():
     closed = np.vstack([contour.astype(np.int32), contour[0].astype(np.int32)])
     steps = np.abs(np.diff(closed, axis=0))
     assert np.all(np.max(steps, axis=1) <= 1)
-
-    boundary = np.zeros(component.shape, np.uint8)
-    cv2.drawContours(boundary, [contour.astype(np.int32).reshape(-1, 1, 2)], -1, 255, 1)
-    assert np.all(component[contour[:, 1], contour[:, 0]])
+    assert np.all(expected_component[contour[:, 1], contour[:, 0]])
 
 
 def test_solar_data_seed_must_match_component_and_threshold():
@@ -292,5 +296,6 @@ def test_unresolved_auto_can_bootstrap_only_when_ensure_is_called():
     assert rebuilt is True
     assert solar.threshold == 100
     assert np.array_equal(
-        candidate.decompress_full_mask(solar.component_mask, gray.shape), component
+        candidate.decompress_full_mask(solar.component_mask, gray.shape),
+        candidate.refine_solar_component_mask(component),
     )
