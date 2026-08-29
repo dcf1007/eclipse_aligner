@@ -806,9 +806,46 @@ def auto_threshold(gray: np.ndarray) -> AutoThresholdResult:
 # ---------------------------------------------------------------------------
 # Post-threshold full-resolution solar data
 # ---------------------------------------------------------------------------
+REFINEMENT_KERNEL_SIZE = 3
+REFINEMENT_ITERATIONS = 1
+
+
+def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
+    """Return a conservatively smoothed boolean solar-component mask.
+
+    The opening suppresses one-pixel/thin outward burrs.  The following closing
+    fills comparably small inward notches/holes.  No thresholding, ellipse, radius,
+    horizon, EXIF, or cross-image information participates.
+    """
+    component = np.asarray(component, dtype=bool)
+    if component.ndim != 2:
+        raise ValueError("component mask must be two-dimensional")
+    if not np.any(component):
+        raise ValueError("component mask is empty")
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (REFINEMENT_KERNEL_SIZE, REFINEMENT_KERNEL_SIZE),
+    )
+    u8 = np.where(component, 255, 0).astype(np.uint8)
+    opened = cv2.morphologyEx(
+        u8,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=REFINEMENT_ITERATIONS,
+    )
+    refined = cv2.morphologyEx(
+        opened,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=REFINEMENT_ITERATIONS,
+    )
+    return refined != 0
+
+
 @dataclass(frozen=True)
 class SolarData:
-    """Solar geometry established at exactly one full-resolution threshold T."""
+    """Refined solar geometry established at exactly one full-resolution threshold T."""
 
     threshold: int
     seed_point: tuple[int, int]
@@ -977,6 +1014,14 @@ def build_solar_data(
         raise ThresholdResolutionError("SolarData seed is outside the solar component")
     if int(full_gray[seed_y, seed_x]) <= threshold:
         raise ThresholdResolutionError("SolarData seed is not light at its threshold")
+
+    # Threshold selection and seeded identity are complete before this point.
+    # Refine only the finalized component used for persistent SolarData geometry.
+    component = refine_solar_component_mask(component)
+    if not component[seed_y, seed_x]:
+        raise ThresholdResolutionError(
+            "Refined SolarData component no longer contains the solar seed"
+        )
 
     image_scale = math.sqrt(float(width) * float(height))
     roi_6_5 = _full_mask_from_observation_region(
