@@ -1,0 +1,49 @@
+name: Promote solar mask refinement
+
+on:
+  push:
+    branches:
+      - rebuild/overhaul
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: ${{ !contains(github.event.head_commit.message, 'Apply refined SolarData masks') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check pytest numpy opencv-python-headless
+      - name: Apply exact tested patch
+        run: python snippets/apply_solar_mask_refinement.py circle_arc_detector.py
+      - name: Verify production blob
+        run: |
+          actual="$(git hash-object circle_arc_detector.py)"
+          expected="23bd6e74dceef114d995ed98e8ca3b44d1b952e0"
+          echo "production blob: $actual"
+          test "$actual" = "$expected"
+      - name: Run focused regression suite
+        run: |
+          python -m pytest -q \
+            tests/test_refine_solar_component_mask.py \
+            tests/test_solar_mask_refinement_integration.py \
+            tests/test_solar_data_persistence.py \
+            tests/test_threshold_finder.py \
+            tests/test_gui_threshold_integration.py \
+            tests/test_threshold_gui_deferred_preview_refresh.py \
+            tests/test_threshold_topology_integration.py \
+            tests/test_topology_threshold_optimizer.py
+      - name: Commit exact validated production source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add circle_arc_detector.py
+          git commit -m "Apply refined SolarData masks"
+          git push origin HEAD:rebuild/overhaul
