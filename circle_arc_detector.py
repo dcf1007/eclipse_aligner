@@ -806,14 +806,14 @@ def auto_threshold(gray: np.ndarray) -> AutoThresholdResult:
 # ---------------------------------------------------------------------------
 # Post-threshold full-resolution solar data
 # ---------------------------------------------------------------------------
-REFINEMENT_KERNEL_SIZE = 3
+REFINEMENT_KERNEL_SIZE = 7
 REFINEMENT_ITERATIONS = 1
 
 
 def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
     """Return a conservatively smoothed boolean solar-component mask.
 
-    The opening suppresses one-pixel/thin outward burrs.  The following closing
+    The opening suppresses small/thin outward burrs.  The following closing
     fills comparably small inward notches/holes.  No thresholding, ellipse, radius,
     horizon, EXIF, or cross-image information participates.
     """
