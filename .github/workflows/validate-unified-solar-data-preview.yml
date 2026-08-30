@@ -27,17 +27,21 @@ jobs:
         run: python -m pip install --disable-pip-version-check numpy opencv-python-headless pytest
 
       - name: Apply preserved implementation
-        run: python snippets/apply_unified_solar_data_preview_flow.py
+        run: |
+          python snippets/apply_unified_solar_data_preview_flow.py
+          python snippets/inline_auto_threshold_separated_component.py
 
       - name: Verify source structure
         run: |
           python -m py_compile circle_arc_detector.py
           python -m py_compile snippets/apply_unified_solar_data_preview_flow.py
+          python -m py_compile snippets/inline_auto_threshold_separated_component.py
           git diff --check
           grep -q 'def build_solar_data_at_threshold(' circle_arc_detector.py
           grep -q 'def display_on_canvas(' circle_arc_detector.py
           grep -q 'image_state\["solar_data"\] = solar_data' circle_arc_detector.py
           grep -q 'self.root.update_idletasks()' circle_arc_detector.py
+          grep -q 'separated_binary = cv2.compare' circle_arc_detector.py
           ! grep -q 'def solar_component_from_seed_at_threshold(' circle_arc_detector.py
           ! grep -q 'def establish_solar_component_at_threshold(' circle_arc_detector.py
           ! grep -q 'def build_solar_data(' circle_arc_detector.py
