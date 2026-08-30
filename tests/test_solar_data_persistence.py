@@ -156,7 +156,7 @@ def test_refinement_seed_survival_is_hard_invariant():
     gray[raw] = 220
     state = make_state(threshold=100, seed=(24, 24))
 
-    with pytest.raises(candidate.ThresholdResolutionError, match="no longer contains the solar seed"):
+    with pytest.raises(candidate.ThresholdResolutionError, match="no longer contains the Auto-T solar seed"):
         candidate.build_solar_data_at_threshold(gray, 100, state)
     assert state["solar_data"] is None
 
