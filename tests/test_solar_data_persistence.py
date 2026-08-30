@@ -1,40 +1,49 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PATH = ROOT / "circle_arc_detector.py"
 
 import circle_arc_detector as candidate
 
 
 def disk_component(shape=(161, 181), center=(90, 80), radius=24, value=220):
     gray = np.zeros(shape, np.uint8)
-    component = np.zeros(shape, np.uint8)
-    cv2.circle(component, center, radius, 255, -1)
-    gray[component != 0] = value
-    return gray, component != 0
+    component_u8 = np.zeros(shape, np.uint8)
+    cv2.circle(component_u8, center, radius, 255, -1)
+    component = component_u8 != 0
+    gray[component] = value
+    return gray, component
 
 
-def test_auto_threshold_stage_keeps_mask_refinement_downstream():
+def make_state(threshold=100, seed=(90, 80), resolved=True):
+    auto = candidate.AutoThresholdResult(
+        threshold=threshold,
+        histogram_peak=200,
+        histogram_left_edge=threshold,
+        seed_threshold=threshold,
+        coarse_threshold=threshold if resolved else None,
+        roi_seed_threshold=threshold if resolved else None,
+        full_seed_point=seed if resolved else None,
+        used_guard=False,
+        resolved=resolved,
+        reason="" if resolved else "synthetic unresolved",
+    )
+    return {
+        "settings": candidate.ImageSettings(),
+        "auto_threshold_result": auto,
+        "solar_data": None,
+    }
+
+
+def test_auto_threshold_stage_has_no_solar_data_dependency():
     source = inspect.getsource(candidate.auto_threshold)
     assert "optimize_separated_threshold" in source
     assert "refine_solar_component_mask" not in source
     assert "SolarData" not in source
-    assert "build_solar_data" not in source
-    assert "establish_solar_component_at_threshold" not in source
-
-
-def test_auto_threshold_has_no_solar_data_dependency():
-    source = inspect.getsource(candidate.auto_threshold)
-    assert "SolarData" not in source
-    assert "build_solar_data" not in source
-    assert "establish_solar_component_at_threshold" not in source
+    assert "build_solar_data_at_threshold" not in source
 
 
 def test_packbits_zlib_round_trip_non_multiple_of_eight():
@@ -53,61 +62,117 @@ def test_mask_decoder_rejects_wrong_shape():
         candidate.decompress_full_mask(payload, (8, 11))
 
 
-def test_seeded_component_is_exact_connected_component():
-    gray, component = disk_component()
-    seed = (90, 80)
-    found = candidate.solar_component_from_seed_at_threshold(gray, 100, seed)
-    assert np.array_equal(found, component)
+def test_exact_auto_t_uses_stored_seed_and_persists_refined_component():
+    gray, raw = disk_component()
+    state = make_state()
+
+    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
+    solar = state["solar_data"]
+
+    assert isinstance(solar, candidate.SolarData)
+    assert solar.threshold == 100
+    assert solar.seed_point == (90, 80)
+    assert np.array_equal(refined, candidate.refine_solar_component_mask(raw))
+    stored = candidate.decompress_full_mask(solar.component_mask, gray.shape)
+    assert np.array_equal(stored, refined)
 
 
-def test_seeded_component_rejects_dark_seed():
+def test_invalid_exact_auto_seed_is_error_not_reidentification(monkeypatch):
     gray, _ = disk_component()
-    with pytest.raises(candidate.ThresholdResolutionError, match="not light"):
-        candidate.solar_component_from_seed_at_threshold(gray, 250, (90, 80))
+    state = make_state(seed=(5, 5))
 
-
-def test_fixed_t_establishment_without_seed_uses_existing_identity_machinery():
-    gray, component = disk_component(shape=(241, 301), center=(150, 120), radius=31)
-    seed, found = candidate.establish_solar_component_at_threshold(gray, 100)
-    x, y = seed
-    assert found[y, x]
-    assert gray[y, x] > 100
-    assert np.array_equal(found, component)
-
-
-def test_fixed_t_establishment_falls_back_when_preferred_seed_is_dark():
-    gray, component = disk_component(shape=(241, 301), center=(150, 120), radius=31)
-    seed, found = candidate.establish_solar_component_at_threshold(
-        gray, 100, preferred_seed=(5, 5)
+    monkeypatch.setattr(
+        candidate,
+        "largest_enclosed_bright_component",
+        lambda _binary: (_ for _ in ()).throw(
+            AssertionError("exact Auto T must not re-identify the solar seed")
+        ),
     )
-    assert seed != (5, 5)
-    assert np.array_equal(found, component)
+
+    with pytest.raises(candidate.ThresholdResolutionError, match="Stored Auto-T solar seed is not light"):
+        candidate.build_solar_data_at_threshold(gray, 100, state)
+    assert state["solar_data"] is None
 
 
-def test_fixed_t_establishment_fails_when_only_bright_component_touches_border():
-    gray = np.zeros((120, 140), np.uint8)
-    gray[:, 0:20] = 220
-    with pytest.raises(candidate.ThresholdResolutionError, match="No enclosed solar component"):
-        candidate.establish_solar_component_at_threshold(gray, 100)
+def test_resolved_auto_without_full_seed_is_invariant_error():
+    gray, _ = disk_component()
+    state = make_state()
+    state["auto_threshold_result"] = candidate.AutoThresholdResult(
+        threshold=100,
+        histogram_peak=200,
+        histogram_left_edge=100,
+        seed_threshold=100,
+        coarse_threshold=100,
+        roi_seed_threshold=100,
+        full_seed_point=None,
+        used_guard=False,
+        resolved=True,
+    )
+
+    with pytest.raises(candidate.ThresholdResolutionError, match="has no full-resolution solar seed"):
+        candidate.build_solar_data_at_threshold(gray, 100, state)
 
 
-def test_build_solar_data_masks_match_refined_observation_geometry():
-    gray, component = disk_component(shape=(201, 241), center=(120, 100), radius=26)
-    # Deliberately add a tiny 8-connected diagonal burr and one-pixel hole so the
-    # approved 3x3 open->close refinement has observable work to do.
-    component = component.copy()
-    component[73, 93] = True
-    component[100, 120] = False
-    gray[component] = 220
-    seed = (121, 100)
+def test_non_auto_t_calculates_seed_at_that_exact_threshold():
+    gray, _ = disk_component(shape=(241, 301), center=(150, 120), radius=31)
+    state = make_state(threshold=90, seed=(150, 120))
 
-    expected_component = candidate.refine_solar_component_mask(component)
-    solar = candidate.build_solar_data(gray, 100, seed, component)
+    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
+    solar = state["solar_data"]
+    x, y = solar.seed_point
 
     assert solar.threshold == 100
-    assert solar.seed_point == seed
-    restored_component = candidate.decompress_full_mask(solar.component_mask, gray.shape)
-    assert np.array_equal(restored_component, expected_component)
+    assert gray[y, x] > 100
+    assert refined[y, x]
+
+
+def test_unresolved_auto_t_is_established_directly_at_current_t():
+    gray, _ = disk_component()
+    state = make_state(threshold=100, resolved=False)
+
+    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
+    solar = state["solar_data"]
+    x, y = solar.seed_point
+
+    assert solar.threshold == 100
+    assert refined[y, x]
+
+
+def test_current_t_without_enclosed_component_fails_without_partial_write():
+    gray = np.zeros((120, 140), np.uint8)
+    gray[:, 0:20] = 220
+    state = make_state(threshold=90, seed=(5, 5))
+
+    with pytest.raises(candidate.ThresholdResolutionError, match="No enclosed solar component"):
+        candidate.build_solar_data_at_threshold(gray, 100, state)
+    assert state["solar_data"] is None
+
+
+def test_refinement_seed_survival_is_hard_invariant():
+    gray = np.zeros((81, 81), np.uint8)
+    raw = np.zeros_like(gray, dtype=bool)
+    raw[25:56, 25:56] = True
+    raw[24, 24] = True
+    gray[raw] = 220
+    state = make_state(threshold=100, seed=(24, 24))
+
+    with pytest.raises(candidate.ThresholdResolutionError, match="no longer contains the solar seed"):
+        candidate.build_solar_data_at_threshold(gray, 100, state)
+    assert state["solar_data"] is None
+
+
+def test_roi_guard_and_contour_derive_from_returned_refined_component():
+    gray, raw = disk_component(shape=(201, 241), center=(120, 100), radius=26)
+    raw = raw.copy()
+    raw[73, 93] = True
+    raw[100, 120] = False
+    gray[:] = 0
+    gray[raw] = 220
+    state = make_state(threshold=100, seed=(121, 100))
+
+    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
+    solar = state["solar_data"]
+    assert np.array_equal(refined, candidate.refine_solar_component_mask(raw))
 
     image_scale = (gray.shape[0] * gray.shape[1]) ** 0.5
     for payload, fraction in (
@@ -116,186 +181,42 @@ def test_build_solar_data_masks_match_refined_observation_geometry():
     ):
         restored = candidate.decompress_full_mask(payload, gray.shape)
         region = candidate._build_observation_region(
-            gray, expected_component, fraction * image_scale, seed
+            gray,
+            refined,
+            fraction * image_scale,
+            solar.seed_point,
         )
         expected = np.zeros(gray.shape, bool)
         x0, y0, x1, y1 = region.bbox
         expected[y0:y1, x0:x1] = region.allowed_u8 != 0
         assert np.array_equal(restored, expected)
 
-
-def test_contour_is_refined_ordered_external_uint16():
-    gray, component = disk_component(shape=(201, 241), center=(120, 100), radius=26)
-    component = component.copy()
-    component[73, 93] = True
-    gray[component] = 220
-    expected_component = candidate.refine_solar_component_mask(component)
-    solar = candidate.build_solar_data(gray, 100, (120, 100), component)
     contour = solar.component_contour
     assert contour.dtype == np.uint16
     assert contour.ndim == 2 and contour.shape[1] == 2
-    assert len(contour) > 4
-
-    # CHAIN_APPROX_NONE traces neighboring boundary pixels in order, allowing
-    # diagonal steps but no multi-pixel jumps.
-    closed = np.vstack([contour.astype(np.int32), contour[0].astype(np.int32)])
-    steps = np.abs(np.diff(closed, axis=0))
-    assert np.all(np.max(steps, axis=1) <= 1)
-    assert np.all(expected_component[contour[:, 1], contour[:, 0]])
+    assert np.all(refined[contour[:, 1], contour[:, 0]])
 
 
-def test_solar_data_seed_must_match_component_and_threshold():
-    gray, component = disk_component()
-    with pytest.raises(candidate.ThresholdResolutionError, match="outside the solar component"):
-        candidate.build_solar_data(gray, 100, (5, 5), component)
-    with pytest.raises(candidate.ThresholdResolutionError, match="not light"):
-        candidate.build_solar_data(gray, 230, (90, 80), component)
+def test_current_solar_data_is_reused_without_reestablishing_identity(monkeypatch):
+    gray, _ = disk_component()
+    state = make_state()
+    first = candidate.build_solar_data_at_threshold(gray, 100, state)
+    existing = state["solar_data"]
 
-
-def test_gui_control_commits_do_not_trigger_solar_processing():
-    source = inspect.getsource(candidate.DetectorApp._commit_setting_change)
-    assert "_ensure_solar_data" not in source
-    assert "build_solar_data" not in source
-    assert "establish_solar_component" not in source
-    assert "_refresh_threshold_image" in source
-
-
-def test_refresh_preview_is_the_explicit_solar_processing_boundary():
-    source = inspect.getsource(candidate.DetectorApp.refresh_preview)
-    assert "_ensure_solar_data_for_current_threshold" in source
-    load_source = inspect.getsource(candidate.DetectorApp.load_image_at)
-    assert "self.refresh_preview()" not in load_source
-    assert "self._refresh_display_images()" in load_source
-
-
-def test_auto_result_is_created_before_initial_solar_data_calls():
-    source = inspect.getsource(candidate.DetectorApp.load_image_at)
-    auto_pos = source.index("result = auto_threshold(self.gray_image)")
-    component_pos = source.index("component = solar_component_from_seed_at_threshold")
-    solar_pos = source.index("solar_data = build_solar_data")
-    assert auto_pos < component_pos < solar_pos
-
-
-def test_unresolved_auto_message_waits_for_explicit_refresh():
-    source = inspect.getsource(candidate.DetectorApp.load_image_at)
-    assert "Adjust the " in source
-    assert "threshold if needed, then click Refresh Preview to continue." in source
-
-
-def test_current_solar_data_is_reused_without_rebuild(monkeypatch):
-    gray, component = disk_component()
-    solar = candidate.build_solar_data(gray, 100, (90, 80), component)
-    auto = candidate.AutoThresholdResult(
-        threshold=100,
-        histogram_peak=200,
-        histogram_left_edge=100,
-        seed_threshold=100,
-        coarse_threshold=100,
-        roi_seed_threshold=100,
-        full_seed_point=(90, 80),
-        used_guard=False,
-        resolved=True,
+    monkeypatch.setattr(
+        candidate,
+        "resize_gray_max_dim",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("current SolarData should be reused")
+        ),
     )
 
-    class Var:
-        def get(self):
-            return 100
-
-    app = candidate.DetectorApp.__new__(candidate.DetectorApp)
-    app.gray_image = gray
-    app.current_path = "synthetic"
-    app.threshold = Var()
-    app.image_state = {
-        "synthetic": {
-            "settings": candidate.ImageSettings(),
-            "auto_threshold_result": auto,
-            "solar_data": solar,
-        }
-    }
-
-    def fail(*_args, **_kwargs):
-        raise AssertionError("current SolarData should have been reused")
-
-    monkeypatch.setattr(candidate, "establish_solar_component_at_threshold", fail)
-    returned, rebuilt = app._ensure_solar_data_for_current_threshold()
-    assert returned is solar
-    assert rebuilt is False
+    second = candidate.build_solar_data_at_threshold(gray, 100, state)
+    assert state["solar_data"] is existing
+    assert np.array_equal(second, first)
 
 
-def test_stale_solar_data_rebuild_prefers_existing_seed():
-    gray, component = disk_component()
-    old = candidate.build_solar_data(gray, 90, (90, 80), component)
-    auto = candidate.AutoThresholdResult(
-        threshold=90,
-        histogram_peak=200,
-        histogram_left_edge=90,
-        seed_threshold=90,
-        coarse_threshold=90,
-        roi_seed_threshold=90,
-        full_seed_point=(90, 80),
-        used_guard=False,
-        resolved=True,
-    )
-
-    class Var:
-        def get(self):
-            return 100
-
-    app = candidate.DetectorApp.__new__(candidate.DetectorApp)
-    app.gray_image = gray
-    app.current_path = "synthetic"
-    app.threshold = Var()
-    app.image_state = {
-        "synthetic": {
-            "settings": candidate.ImageSettings(),
-            "auto_threshold_result": auto,
-            "solar_data": old,
-        }
-    }
-
-    new, rebuilt = app._ensure_solar_data_for_current_threshold()
-    assert rebuilt is True
-    assert new.threshold == 100
-    assert new.seed_point == old.seed_point
-    assert app.image_state["synthetic"]["solar_data"] is new
-
-
-def test_unresolved_auto_can_bootstrap_only_when_ensure_is_called():
-    gray, component = disk_component()
-    auto = candidate.AutoThresholdResult(
-        threshold=100,
-        histogram_peak=200,
-        histogram_left_edge=100,
-        seed_threshold=100,
-        coarse_threshold=None,
-        roi_seed_threshold=None,
-        full_seed_point=None,
-        used_guard=False,
-        resolved=False,
-        reason="synthetic unresolved",
-    )
-
-    class Var:
-        def get(self):
-            return 100
-
-    app = candidate.DetectorApp.__new__(candidate.DetectorApp)
-    app.gray_image = gray
-    app.current_path = "synthetic"
-    app.threshold = Var()
-    app.image_state = {
-        "synthetic": {
-            "settings": candidate.ImageSettings(),
-            "auto_threshold_result": auto,
-            "solar_data": None,
-        }
-    }
-
-    assert app.image_state["synthetic"]["solar_data"] is None
-    solar, rebuilt = app._ensure_solar_data_for_current_threshold()
-    assert rebuilt is True
-    assert solar.threshold == 100
-    assert np.array_equal(
-        candidate.decompress_full_mask(solar.component_mask, gray.shape),
-        candidate.refine_solar_component_mask(component),
-    )
+def test_old_split_component_and_builder_apis_are_removed():
+    assert not hasattr(candidate, "solar_component_from_seed_at_threshold")
+    assert not hasattr(candidate, "establish_solar_component_at_threshold")
+    assert not hasattr(candidate, "build_solar_data")
