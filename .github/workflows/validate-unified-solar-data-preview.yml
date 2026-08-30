@@ -5,6 +5,11 @@ on:
     branches:
       - rebuild/threshold_finder
     paths:
+      - snippets/apply_unified_solar_data_preview_flow.py
+      - snippets/inline_auto_threshold_separated_component.py
+      - tests/test_gui_threshold_integration.py
+      - tests/test_solar_data_persistence.py
+      - tests/test_solar_mask_refinement_integration.py
       - .github/workflows/validate-unified-solar-data-preview.yml
 
 permissions:
