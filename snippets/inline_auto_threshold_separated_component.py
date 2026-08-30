@@ -11,7 +11,7 @@ old = '''        separated_component = solar_component_from_seed_at_threshold(
 '''
 new = '''        # The Auto-T seed is already authoritative here. Flood its exact
         # full-resolution component directly for topology-knee optimization rather
-        # than routing through the post-T SolarData establishment stage.
+        # than routing through any later post-T geometry-establishment stage.
         separated_binary = cv2.compare(gray, int(final_threshold), cv2.CMP_GT)
         seed_x, seed_y = map(int, full_seed)
         if separated_binary[seed_y, seed_x] == 0:
