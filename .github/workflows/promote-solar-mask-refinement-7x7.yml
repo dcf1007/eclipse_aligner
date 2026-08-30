@@ -37,7 +37,7 @@ jobs:
         run: |
           git diff --check
           git diff -- circle_arc_detector.py
-          test "$(git diff --numstat -- circle_arc_detector.py | awk '{print $1+$2}')" -eq 3
+          test "$(git diff --numstat -- circle_arc_detector.py | awk '{print $1+$2}')" -eq 4
 
       - name: Run combined regression
         run: >-

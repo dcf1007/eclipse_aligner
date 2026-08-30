@@ -1,6 +1,6 @@
 """Conservative binary refinement for a finalized seeded solar-component mask.
 
-This operates only after automatic threshold selection is complete. It performs
+This operates only after automatic threshold selection is complete.  It performs
 one 7x7 elliptical opening followed by one 7x7 elliptical closing, exactly as the
 visually approved mask-refinement experiment.
 """
@@ -16,8 +16,8 @@ REFINEMENT_ITERATIONS = 1
 def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
     """Return a conservatively smoothed boolean solar-component mask.
 
-    The opening suppresses small/thin outward burrs. The following closing fills
-    comparably small inward notches/holes. No thresholding, ellipse, radius,
+    The opening suppresses small/thin outward burrs.  The following closing
+    fills comparably small inward notches/holes.  No thresholding, ellipse, radius,
     horizon, EXIF, or cross-image information participates.
     """
     component = np.asarray(component, dtype=bool)

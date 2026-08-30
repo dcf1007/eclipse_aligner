@@ -23,14 +23,6 @@ def apply(path: Path = SOURCE) -> None:
         )
     text = text.replace(old_constant, new_constant, 1)
 
-    old_doc = "one 3x3 elliptical opening followed by one 3x3 elliptical closing"
-    new_doc = "one 7x7 elliptical opening followed by one 7x7 elliptical closing"
-    if text.count(old_doc) != 1:
-        raise RuntimeError(
-            f"Expected exactly one current 3x3 refinement description; found {text.count(old_doc)}"
-        )
-    text = text.replace(old_doc, new_doc, 1)
-
     old_burr = "The opening suppresses one-pixel/thin outward burrs.  The following closing"
     new_burr = "The opening suppresses small/thin outward burrs.  The following closing"
     if text.count(old_burr) != 1:
