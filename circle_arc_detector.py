@@ -1228,51 +1228,12 @@ class DetectorApp:
                 variable.set(baseline if override is None else override)
 
             self._update_center_preview_label()
-            selected_threshold = int(self.threshold.get())
 
-            # Stage 1: show the pure threshold result immediately.
-            self.threshold_preview = self.gray_image > selected_threshold
-            self._refresh_display_images()
-
-            # Stage 2: establish the seed/component/SolarData at this exact T and
-            # leave the final refined component as the persistent threshold canvas.
-            try:
-                refined_component = build_solar_data_at_threshold(
-                    self.gray_image,
-                    selected_threshold,
-                    state,
-                )
-            except (ThresholdResolutionError, ValueError) as exc:
-                self.status.set(
-                    f"Threshold T={selected_threshold} is visible, but SolarData could not "
-                    f"be established ({exc}). Adjust T if needed."
-                )
-            else:
-                self.threshold_preview = refined_component
-                if hasattr(self, "threshold_canvas"):
-                    self.display_on_canvas(
-                        self.threshold_canvas,
-                        self.threshold_preview,
-                    )
-
-                if restored:
-                    self.status.set(
-                        f"Image loaded. Restored per-image settings at T={selected_threshold}; "
-                        "final refined SolarData mask is current."
-                    )
-                elif not result.resolved:
-                    self.status.set(
-                        "Automatic component tracking was unresolved; using "
-                        f"rightmost-histogram left edge T={selected_threshold}. SolarData was "
-                        "established directly at that T and the refined component is displayed."
-                    )
-                else:
-                    self.status.set(
-                        "Image loaded. Automatic grayscale threshold "
-                        f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                        f"histogram start={result.histogram_left_edge}); final refined SolarData "
-                        "mask displayed."
-                    )
+            # Use the same explicit two-turn preview path as a completed control
+            # change: raw gray > T is painted now, and finalized SolarData replaces
+            # it only from the queued refinement callback. This keeps image loading
+            # from being the one remaining path that hides the raw threshold frame.
+            self.refresh_preview(changed_setting="image load")
 
         self.update_navigation_state()
 
