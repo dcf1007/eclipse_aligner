@@ -24,19 +24,16 @@ Slider labels update continuously, but a setting is committed only after mouse
 release or the final keyboard key release. Keyboard auto-repeat can emit temporary
 release/press pairs on some Tk platforms, so releases are coalesced through a short
 settling window. Checkboxes and radio buttons commit immediately. A completed
-setting change calls ``_commit_setting_change(setting_name)``; that function updates
-only the changed sparse override and then invokes ``_refresh_threshold_image()``.
-That lightweight path performs only the current-T B/W conversion and threshold-pane
-update. It does not run the broader Refresh Preview processing path.
+setting change calls ``_commit_setting_change(setting_name)``. Non-threshold controls
+only persist their sparse override. A completed threshold change first displays the
+pure ``gray > T`` raster, then immediately establishes full-resolution SolarData at
+that exact T and replaces the threshold canvas with the finalized refined component.
 
-``refresh_preview()`` is the explicit processing boundary invoked by the user. A
-readable image load only draws the image panes after automatic thresholding; if
-automatic thresholding resolves, SolarData is built as a separate downstream stage
-after ``AutoThresholdResult`` has already been returned. If automatic thresholding
-is unresolved, image load stops after the fallback B/W preview and waits for an
-explicit Refresh Preview. Later ellipse, arc, and horizon preview processing belongs
-behind that same explicit boundary. Apply Full Resolution remains a
-separate explicit action. Radius auto-selection, ellipse fitting, horizon handling,
+``refresh_preview()`` remains the explicit boundary for later ellipse, arc, and
+horizon processing, but threshold/SolarData establishment is already complete before
+those later stages begin. Image load follows the same two-stage threshold display:
+pure threshold first, finalized refined component second. Apply Full Resolution remains
+a separate explicit action. Radius auto-selection, ellipse fitting, horizon handling,
 centering, and export are not implemented yet.
 
 The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
@@ -763,11 +760,21 @@ def auto_threshold(gray: np.ndarray) -> AutoThresholdResult:
             full_seed,
             roi_seed_component,
         )
-        separated_component = solar_component_from_seed_at_threshold(
-            gray,
-            final_threshold,
-            full_seed,
-        )
+        # The Auto-T seed is already authoritative here. Flood its exact
+        # full-resolution component directly for topology-knee optimization rather
+        # than routing through any later post-T geometry-establishment stage.
+        separated_binary = cv2.compare(gray, int(final_threshold), cv2.CMP_GT)
+        seed_x, seed_y = map(int, full_seed)
+        if separated_binary[seed_y, seed_x] == 0:
+            raise ThresholdResolutionError(
+                f"Auto-T solar seed is not light at separated T={final_threshold}"
+            )
+        cv2.floodFill(separated_binary, None, (seed_x, seed_y), 128, flags=8)
+        separated_component = separated_binary == 128
+        if _touches_image_border(separated_component):
+            raise ThresholdResolutionError(
+                f"Auto-T solar component touches the image border at T={final_threshold}"
+            )
         topology_selection = optimize_separated_threshold(
             gray,
             final_threshold,
@@ -887,78 +894,6 @@ def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
     return bits.reshape((height, width)).astype(bool)
 
 
-def solar_component_from_seed_at_threshold(
-    full_gray: np.ndarray,
-    threshold: int,
-    seed_point: tuple[int, int],
-) -> np.ndarray:
-    """Flood the enclosed full-resolution light component containing ``seed_point``."""
-    threshold = int(threshold)
-    seed_x, seed_y = map(int, seed_point)
-    height, width = full_gray.shape
-    if not (0 <= seed_x < width and 0 <= seed_y < height):
-        raise ThresholdResolutionError("Solar seed lies outside the image")
-
-    binary = cv2.compare(full_gray, threshold, cv2.CMP_GT)
-    if binary[seed_y, seed_x] == 0:
-        raise ThresholdResolutionError(
-            f"Solar seed is not light at threshold T={threshold}"
-        )
-
-    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-    component = binary == 128
-    if _touches_image_border(component):
-        raise ThresholdResolutionError(
-            f"Seeded solar component touches the image border at T={threshold}"
-        )
-    return component
-
-
-def establish_solar_component_at_threshold(
-    full_gray: np.ndarray,
-    threshold: int,
-    preferred_seed: tuple[int, int] | None = None,
-) -> tuple[tuple[int, int], np.ndarray]:
-    """Establish solar identity at one caller-selected T; never search for another T.
-
-    A known solar seed is tried first. If it no longer identifies an enclosed light
-    component, use the existing work-resolution enclosed-component machinery at the
-    same T, map that identity to full resolution, and flood from the mapped seed.
-    """
-    threshold = int(threshold)
-
-    if preferred_seed is not None:
-        try:
-            component = solar_component_from_seed_at_threshold(
-                full_gray, threshold, preferred_seed
-            )
-            seed = tuple(map(int, preferred_seed))
-            return seed, component
-        except ThresholdResolutionError:
-            pass
-
-    work_gray = resize_gray_max_dim(full_gray)
-    work_component = largest_enclosed_bright_component(work_gray > threshold)
-    if work_component is None:
-        raise ThresholdResolutionError(
-            f"No enclosed solar component exists at selected T={threshold}"
-        )
-
-    work_mask = np.where(work_component, 255, 0).astype(np.uint8)
-    full_seed = establish_full_resolution_seed(
-        full_gray,
-        work_gray.shape,
-        work_mask,
-        threshold,
-    )
-    component = solar_component_from_seed_at_threshold(
-        full_gray,
-        threshold,
-        full_seed,
-    )
-    return full_seed, component
-
-
 def _full_mask_from_observation_region(
     full_gray: np.ndarray,
     component: np.ndarray,
@@ -992,60 +927,115 @@ def _ordered_external_component_contour(component: np.ndarray) -> np.ndarray:
     return contour.astype(np.uint16, copy=False)
 
 
-def build_solar_data(
+def build_solar_data_at_threshold(
     full_gray: np.ndarray,
     threshold: int,
-    seed_point: tuple[int, int],
-    component: np.ndarray,
-) -> SolarData:
-    """Build persistent full-resolution solar geometry after thresholding is complete."""
+    image_state: dict[str, object],
+) -> np.ndarray:
+    """Establish, refine, and persist SolarData at exactly one already-selected T.
+
+    If this is the resolved automatic threshold, its full-resolution seed is an
+    invariant and is validated rather than recalculated. At any other T, establish
+    the solar identity at that exact threshold and calculate a new full-resolution
+    seed before extracting the component. The raw seeded component is internal only;
+    the returned mask and every persisted SolarData geometry derive from the same
+    7x7 open-then-close refined component.
+    """
     threshold = int(threshold)
-    component = np.asarray(component, dtype=bool)
-    if component.shape != full_gray.shape:
-        raise ValueError("solar component and grayscale image must have identical shapes")
-    if not np.any(component):
-        raise ThresholdResolutionError("Cannot build SolarData from an empty component")
+    if full_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
 
-    seed_x, seed_y = map(int, seed_point)
+    existing = image_state.get("solar_data")
+    if isinstance(existing, SolarData) and existing.threshold == threshold:
+        return decompress_full_mask(existing.component_mask, full_gray.shape)
+
+    auto_result = image_state.get("auto_threshold_result")
+    if not isinstance(auto_result, AutoThresholdResult):
+        raise ValueError("image state has no AutoThresholdResult")
+
     height, width = full_gray.shape
-    if not (0 <= seed_x < width and 0 <= seed_y < height):
-        raise ThresholdResolutionError("SolarData seed lies outside the image")
-    if not component[seed_y, seed_x]:
-        raise ThresholdResolutionError("SolarData seed is outside the solar component")
-    if int(full_gray[seed_y, seed_x]) <= threshold:
-        raise ThresholdResolutionError("SolarData seed is not light at its threshold")
 
-    # Threshold selection and seeded identity are complete before this point.
-    # Refine only the finalized component used for persistent SolarData geometry.
-    component = refine_solar_component_mask(component)
-    if not component[seed_y, seed_x]:
+    # T is already known. Establish its seed first. The exact resolved Auto T owns
+    # an authoritative seed calculated during auto thresholding; every other T
+    # establishes its identity and calculates a new seed at that exact threshold.
+    if auto_result.resolved and threshold == int(auto_result.threshold):
+        if auto_result.full_seed_point is None:
+            raise ThresholdResolutionError(
+                "Resolved Auto T has no full-resolution solar seed"
+            )
+        seed_x, seed_y = map(int, auto_result.full_seed_point)
+        if not (0 <= seed_x < width and 0 <= seed_y < height):
+            raise ThresholdResolutionError(
+                "Stored Auto-T solar seed lies outside the image"
+            )
+        if int(full_gray[seed_y, seed_x]) <= threshold:
+            raise ThresholdResolutionError(
+                "Stored Auto-T solar seed is not light at its Auto T"
+            )
+    else:
+        work_gray = resize_gray_max_dim(full_gray)
+        work_component = largest_enclosed_bright_component(work_gray > threshold)
+        if work_component is None:
+            raise ThresholdResolutionError(
+                f"No enclosed solar component exists at selected T={threshold}"
+            )
+        work_mask = np.where(work_component, 255, 0).astype(np.uint8)
+        seed_x, seed_y = establish_full_resolution_seed(
+            full_gray,
+            work_gray.shape,
+            work_mask,
+            threshold,
+        )
+        if not (0 <= seed_x < width and 0 <= seed_y < height):
+            raise ThresholdResolutionError(
+                "Calculated solar seed lies outside the image"
+            )
+        if int(full_gray[seed_y, seed_x]) <= threshold:
+            raise ThresholdResolutionError(
+                f"Calculated solar seed is not light at threshold T={threshold}"
+            )
+
+    binary = cv2.compare(full_gray, threshold, cv2.CMP_GT)
+    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+    raw_component = binary == 128
+    if _touches_image_border(raw_component):
         raise ThresholdResolutionError(
-            "Refined SolarData component no longer contains the solar seed"
+            f"Seeded solar component touches the image border at T={threshold}"
+        )
+
+    refined_component = refine_solar_component_mask(raw_component)
+    if not refined_component[seed_y, seed_x]:
+        raise ThresholdResolutionError(
+            "Refined solar component no longer contains the solar seed"
         )
 
     image_scale = math.sqrt(float(width) * float(height))
     roi_6_5 = _full_mask_from_observation_region(
         full_gray,
-        component,
+        refined_component,
         ROI_DILATION_FRACTION * image_scale,
         (seed_x, seed_y),
     )
     guard_19_5 = _full_mask_from_observation_region(
         full_gray,
-        component,
+        refined_component,
         GUARD_DILATION_FRACTION * image_scale,
         (seed_x, seed_y),
     )
-    contour = _ordered_external_component_contour(component)
+    contour = _ordered_external_component_contour(refined_component)
 
-    return SolarData(
+    solar_data = SolarData(
         threshold=threshold,
         seed_point=(seed_x, seed_y),
-        component_mask=compress_full_mask(component),
+        component_mask=compress_full_mask(refined_component),
         roi_6_5_mask=compress_full_mask(roi_6_5),
         guard_19_5_mask=compress_full_mask(guard_19_5),
         component_contour=contour,
     )
+
+    # No partially constructed state is published if any step above fails.
+    image_state["solar_data"] = solar_data
+    return refined_component
 
 
 class DetectorApp:
@@ -1073,8 +1063,6 @@ class DetectorApp:
         # expresses the image-to-state hierarchy.
         self.image_state: dict[str, dict[str, object]] = {}
 
-        self.threshold_photo = None
-        self.color_photo = None
         self.preview_redraw_job = None
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
@@ -1181,8 +1169,6 @@ class DetectorApp:
             self.color_image = None
             self.gray_image = None
             self.threshold_preview = transparent_bgra()
-            self.threshold_photo = None
-            self.color_photo = None
             self._redraw_previews()
             self.status.set(f"Could not load image: {path}")
         else:
@@ -1193,35 +1179,16 @@ class DetectorApp:
             self.gray_image = to_gray(image)
 
             restored = path in self.image_state
-            solar_build_error = None
             if restored:
                 state = self.image_state[path]
                 result = state["auto_threshold_result"]
                 state.setdefault("solar_data", None)
             else:
-                # Stage 1 completes fully before post-threshold solar persistence starts.
                 result = auto_threshold(self.gray_image)
-                solar_data = None
-                if result.resolved and result.full_seed_point is not None:
-                    try:
-                        component = solar_component_from_seed_at_threshold(
-                            self.gray_image,
-                            result.threshold,
-                            result.full_seed_point,
-                        )
-                        solar_data = build_solar_data(
-                            self.gray_image,
-                            result.threshold,
-                            result.full_seed_point,
-                            component,
-                        )
-                    except (ThresholdResolutionError, ValueError) as exc:
-                        solar_build_error = str(exc)
-
                 state = {
                     "settings": ImageSettings(),
                     "auto_threshold_result": result,
-                    "solar_data": solar_data,
+                    "solar_data": None,
                 }
                 self.image_state[path] = state
 
@@ -1235,40 +1202,51 @@ class DetectorApp:
                 variable.set(baseline if override is None else override)
 
             self._update_center_preview_label()
-            # Loading only redraws the image panes. Refresh Preview remains the
-            # explicit processing boundary for user-selected settings.
-            self._refresh_display_images()
             selected_threshold = int(self.threshold.get())
-            solar_data = state.get("solar_data")
 
-            if restored:
-                if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
+            # Stage 1: show the pure threshold result immediately.
+            self.threshold_preview = self.gray_image > selected_threshold
+            self._refresh_display_images()
+
+            # Stage 2: establish the seed/component/SolarData at this exact T and
+            # leave the final refined component as the persistent threshold canvas.
+            try:
+                refined_component = build_solar_data_at_threshold(
+                    self.gray_image,
+                    selected_threshold,
+                    state,
+                )
+            except (ThresholdResolutionError, ValueError) as exc:
+                self.status.set(
+                    f"Threshold T={selected_threshold} is visible, but SolarData could not "
+                    f"be established ({exc}). Adjust T if needed."
+                )
+            else:
+                self.threshold_preview = refined_component
+                if hasattr(self, "threshold_canvas"):
+                    self.display_on_canvas(
+                        self.threshold_canvas,
+                        self.threshold_preview,
+                    )
+
+                if restored:
                     self.status.set(
                         f"Image loaded. Restored per-image settings at T={selected_threshold}; "
-                        "SolarData is current."
+                        "final refined SolarData mask is current."
+                    )
+                elif not result.resolved:
+                    self.status.set(
+                        "Automatic component tracking was unresolved; using "
+                        f"rightmost-histogram left edge T={selected_threshold}. SolarData was "
+                        "established directly at that T and the refined component is displayed."
                     )
                 else:
                     self.status.set(
-                        f"Image loaded. Restored per-image settings at T={selected_threshold}. "
-                        "Press Refresh Preview to process the selected settings."
+                        "Image loaded. Automatic grayscale threshold "
+                        f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                        f"histogram start={result.histogram_left_edge}); final refined SolarData "
+                        "mask displayed."
                     )
-            elif not result.resolved:
-                self.status.set(
-                    "Automatic solar-component detection was unresolved; using "
-                    f"rightmost-histogram left edge T={selected_threshold}. Adjust the "
-                    "threshold if needed, then click Refresh Preview to continue."
-                )
-            elif solar_build_error is not None:
-                self.status.set(
-                    f"Automatic threshold T={selected_threshold} resolved, but SolarData "
-                    f"could not be built ({solar_build_error}). Click Refresh Preview to retry."
-                )
-            else:
-                self.status.set(
-                    "Image loaded. Automatic grayscale threshold "
-                    f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                    f"histogram start={result.histogram_left_edge}); SolarData prepared."
-                )
 
         self.update_navigation_state()
 
@@ -1583,7 +1561,7 @@ class DetectorApp:
         )
 
     def auto_select_threshold(self):
-        """Restore the cached image-only automatic T and refresh the B/W image."""
+        """Restore the cached image-only automatic T and process that threshold."""
         if self.gray_image is None or self.current_path is None:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
@@ -1597,101 +1575,77 @@ class DetectorApp:
         selected_threshold = int(result.threshold)
         self.threshold.set(selected_threshold)
         self._commit_setting_change("threshold")
-        if result.resolved:
-            self.status.set(
-                "Automatic grayscale threshold selected: "
-                f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                f"histogram start={result.histogram_left_edge})."
-            )
-        else:
-            self.status.set(
-                "Automatic component tracking unresolved; "
-                f"using rightmost-histogram left edge T={selected_threshold}."
-            )
+
+        solar_data = state.get("solar_data")
+        if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
+            if result.resolved:
+                self.status.set(
+                    "Automatic grayscale threshold selected: "
+                    f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                    f"histogram start={result.histogram_left_edge}); refined component displayed."
+                )
+            else:
+                self.status.set(
+                    "Automatic component tracking unresolved; "
+                    f"using rightmost-histogram left edge T={selected_threshold}; "
+                    "SolarData established directly at that T."
+                )
 
     def auto_select_radius(self):
         self.status.set(
             "Auto select radius range: algorithm not implemented in the threshold-finder stage."
         )
 
-    def _refresh_threshold_image(self):
-        """Rebuild and display only the B/W raster for the current threshold T."""
-        if self.gray_image is None:
-            self.threshold_preview = transparent_bgra()
-            self.threshold_photo = None
-        else:
-            # Exact semantics: dark = gray <= T, light = gray > T.
-            light_mask = cv2.compare(
-                self.gray_image,
-                int(self.threshold.get()),
-                cv2.CMP_GT,
-            )
-            preview = cv2.cvtColor(light_mask, cv2.COLOR_GRAY2BGRA)
-            preview[:, :, 3] = 255
-            self.threshold_preview = preview
-            self.threshold_photo = None
-
-        if hasattr(self, "threshold_canvas"):
-            self.threshold_photo = self._show_image_on_canvas(
-                self.threshold_canvas, self.threshold_preview
-            )
-
     def _refresh_display_images(self):
-        """Redraw the threshold and color panes without running processing stages."""
-        self._refresh_threshold_image()
+        """Redraw the currently stored preview rasters without processing them."""
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
         if hasattr(self, "color_canvas"):
             image = self.color_image if self.color_image is not None else transparent_bgra()
-            self.color_photo = self._show_image_on_canvas(self.color_canvas, image)
-
-    def _ensure_solar_data_for_current_threshold(self) -> tuple[SolarData, bool]:
-        """Return current-T SolarData, rebuilding it only at an explicit processing boundary."""
-        if self.gray_image is None or self.current_path is None:
-            raise ThresholdResolutionError("No readable image is loaded")
-
-        state = self.image_state[self.current_path]
-        threshold = int(self.threshold.get())
-        existing = state.get("solar_data")
-        if isinstance(existing, SolarData) and existing.threshold == threshold:
-            return existing, False
-
-        result = state["auto_threshold_result"]
-        preferred_seed = None
-        if result.resolved and result.full_seed_point is not None and threshold == int(result.threshold):
-            preferred_seed = result.full_seed_point
-        elif isinstance(existing, SolarData):
-            preferred_seed = existing.seed_point
-        elif result.resolved and result.full_seed_point is not None:
-            preferred_seed = result.full_seed_point
-
-        seed_point, component = establish_solar_component_at_threshold(
-            self.gray_image,
-            threshold,
-            preferred_seed=preferred_seed,
-        )
-        solar_data = build_solar_data(
-            self.gray_image,
-            threshold,
-            seed_point,
-            component,
-        )
-        state["solar_data"] = solar_data
-        return solar_data, True
+            self.display_on_canvas(self.color_canvas, image)
 
     def _commit_setting_change(self, setting_name):
-        """Persist one changed setting; completed control changes stay lightweight."""
-        if self.current_path is not None and self.current_path in self.image_state:
-            state = self.image_state[self.current_path]
-            settings = state["settings"]
-            value = self.setting_variables[setting_name].get()
+        """Persist one completed setting change and process T immediately when it changes."""
+        if self.current_path is None or self.current_path not in self.image_state:
+            return
 
-            if setting_name == "threshold":
-                baseline = int(state["auto_threshold_result"].threshold)
-            else:
-                baseline = getattr(self.default_settings, setting_name)
+        state = self.image_state[self.current_path]
+        settings = state["settings"]
+        value = self.setting_variables[setting_name].get()
 
-            setattr(settings, setting_name, None if value == baseline else value)
+        if setting_name == "threshold":
+            baseline = int(state["auto_threshold_result"].threshold)
+        else:
+            baseline = getattr(self.default_settings, setting_name)
 
-        self._refresh_threshold_image()
+        setattr(settings, setting_name, None if value == baseline else value)
+
+        # Other controls do not alter the threshold canvas. T changes are exactly
+        # two visual stages: pure threshold first, finalized refined component last.
+        if setting_name != "threshold" or self.gray_image is None:
+            return
+
+        threshold = int(self.threshold.get())
+        self.threshold_preview = self.gray_image > threshold
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
+
+        try:
+            refined_component = build_solar_data_at_threshold(
+                self.gray_image,
+                threshold,
+                state,
+            )
+        except (ThresholdResolutionError, ValueError) as exc:
+            self.status.set(
+                f"Pure threshold displayed at T={threshold}, but SolarData could not be "
+                f"established ({exc})."
+            )
+            return
+
+        self.threshold_preview = refined_component
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
 
     def _selected_center_target_name(self):
         """Return the user-facing name of the selected centering target."""
@@ -1710,42 +1664,76 @@ class DetectorApp:
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
     def refresh_preview(self):
-        """Explicitly process the current settings, beginning with current-T SolarData."""
+        """Regenerate current-T SolarData before later preview processing stages."""
         if self.gray_image is None or self.current_path is None:
             self.status.set("Refresh Preview: no readable image is loaded.")
             return
 
+        state = self.image_state[self.current_path]
         threshold = int(self.threshold.get())
+        existing = state.get("solar_data")
+        reused = isinstance(existing, SolarData) and existing.threshold == threshold
+
+        self.threshold_preview = self.gray_image > threshold
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
+
         try:
-            _solar_data, rebuilt = self._ensure_solar_data_for_current_threshold()
+            refined_component = build_solar_data_at_threshold(
+                self.gray_image,
+                threshold,
+                state,
+            )
         except (ThresholdResolutionError, ValueError) as exc:
-            # Keep any older SolarData object as a self-describing stale cache. It
-            # cannot be consumed while its stored T differs from the current T.
-            self._refresh_display_images()
             self.status.set(
-                f"No enclosed solar component could be established at T={threshold}: {exc}. "
-                "Adjust the threshold and click Refresh Preview again."
+                f"Pure threshold displayed at T={threshold}, but SolarData could not be "
+                f"established ({exc}). Adjust the threshold and try again."
             )
             return
 
-        self._refresh_display_images()
-        if rebuilt:
-            self.status.set(
-                f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
-            )
-        else:
+        self.threshold_preview = refined_component
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
+
+        if reused:
             self.status.set(
                 f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
             )
+        else:
+            self.status.set(
+                f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
+            )
 
     def apply_full_resolution(self):
-        if self.gray_image is None:
+        if self.gray_image is None or self.current_path is None:
             self.status.set("Apply Full Resolution: no readable image is loaded.")
             return
-        self._refresh_threshold_image()
+
+        state = self.image_state[self.current_path]
+        threshold = int(self.threshold.get())
+        self.threshold_preview = self.gray_image > threshold
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
+
+        try:
+            refined_component = build_solar_data_at_threshold(
+                self.gray_image,
+                threshold,
+                state,
+            )
+        except (ThresholdResolutionError, ValueError) as exc:
+            self.status.set(
+                f"Pure full-resolution threshold displayed at T={threshold}, but SolarData "
+                f"could not be established ({exc})."
+            )
+            return
+
+        self.threshold_preview = refined_component
+        if hasattr(self, "threshold_canvas"):
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
         self.status.set(
-            "Full-resolution threshold preview applied at "
-            f"T={int(self.threshold.get())}. Ellipse detector backend not implemented yet."
+            "Full-resolution refined solar-component preview applied at "
+            f"T={threshold}. Ellipse detector backend not implemented yet."
         )
 
     def _schedule_preview_redraw(self, _event=None):
@@ -1758,28 +1746,42 @@ class DetectorApp:
     def _redraw_previews(self):
         self.preview_redraw_job = None
         if hasattr(self, "threshold_canvas"):
-            self.threshold_photo = self._show_image_on_canvas(
-                self.threshold_canvas, self.threshold_preview
-            )
+            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
         if hasattr(self, "color_canvas"):
             image = self.color_image if self.color_image is not None else transparent_bgra()
-            self.color_photo = self._show_image_on_canvas(self.color_canvas, image)
+            self.display_on_canvas(self.color_canvas, image)
 
-    @staticmethod
-    def _show_image_on_canvas(canvas, image):
+    def display_on_canvas(self, canvas, canvas_content):
+        """Display supplied image/mask content on one canvas and flush pending repaint work."""
+        if canvas_content is None:
+            display = transparent_bgra()
+        else:
+            display = np.asarray(canvas_content)
+            if display.dtype == bool:
+                display = np.where(display, 255, 0).astype(np.uint8)
+            elif display.dtype != np.uint8:
+                display = np.clip(display, 0, 255).astype(np.uint8)
+
+            if display.ndim == 2:
+                display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGRA)
+                display[:, :, 3] = 255
+            elif display.ndim != 3 or display.shape[2] not in (3, 4):
+                raise ValueError("canvas content must be a 2D mask or 3/4-channel image")
+
         canvas_width = max(2, canvas.winfo_width() - 2)
         canvas_height = max(2, canvas.winfo_height() - 2)
-        image_height, image_width = image.shape[:2]
+        image_height, image_width = display.shape[:2]
         scale = max(min(canvas_width / image_width, canvas_height / image_height), 1e-6)
         size = (
             max(1, round(image_width * scale)),
             max(1, round(image_height * scale)),
         )
         interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        fitted = cv2.resize(image, size, interpolation=interpolation)
+        fitted = cv2.resize(display, size, interpolation=interpolation)
         ok, encoded = cv2.imencode(".png", fitted)
         if not ok:
-            return None
+            raise ValueError("could not encode canvas content")
+
         photo = tk.PhotoImage(
             data=base64.b64encode(encoded).decode("ascii"),
             format="png",
@@ -1791,7 +1793,11 @@ class DetectorApp:
             image=photo,
             anchor="center",
         )
-        return photo
+        canvas._display_photo = photo
+
+        # Let staged processing become visible without opening arbitrary event
+        # callbacks while image-processing state is only partly updated.
+        self.root.update_idletasks()
 
     def close(self):
         self.root.destroy()
