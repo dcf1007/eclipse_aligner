@@ -70,6 +70,7 @@ IMAGE_FILE_TYPES = (
 
 SLIDER_KEY_RELEASE_SETTLE_MS = 45
 PREVIEW_REDRAW_DELAY_MS = 60
+THRESHOLD_REFINEMENT_DISPLAY_DELAY_MS = 40
 
 
 def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
@@ -934,12 +935,12 @@ def build_solar_data_at_threshold(
 ) -> np.ndarray:
     """Establish, refine, and persist SolarData at exactly one already-selected T.
 
-    If this is the resolved automatic threshold, its full-resolution seed is an
-    invariant and is validated rather than recalculated. At any other T, establish
-    the solar identity at that exact threshold and calculate a new full-resolution
-    seed before extracting the component. The raw seeded component is internal only;
-    the returned mask and every persisted SolarData geometry derive from the same
-    7x7 open-then-close refined component.
+    At the exact resolved automatic threshold, the Auto-T full-resolution seed is
+    authoritative and must survive refinement. At every other T, a freshly
+    calculated seed is used only to identify/flood the current-T raw component; the
+    finalized refined component then receives its own robust interior seed. This
+    prevents a valid manual/current-T component from failing merely because 7x7
+    cleanup removed the particular pre-cleanup flood seed.
     """
     threshold = int(threshold)
     if full_gray.ndim != 2:
@@ -954,11 +955,14 @@ def build_solar_data_at_threshold(
         raise ValueError("image state has no AutoThresholdResult")
 
     height, width = full_gray.shape
+    exact_auto_threshold = bool(
+        auto_result.resolved and threshold == int(auto_result.threshold)
+    )
 
-    # T is already known. Establish its seed first. The exact resolved Auto T owns
-    # an authoritative seed calculated during auto thresholding; every other T
-    # establishes its identity and calculates a new seed at that exact threshold.
-    if auto_result.resolved and threshold == int(auto_result.threshold):
+    # T is already known. Establish an identity/flood seed first. The exact
+    # resolved Auto T owns its stored authoritative seed. Every other T establishes
+    # solar identity and calculates a fresh seed at that exact threshold.
+    if exact_auto_threshold:
         if auto_result.full_seed_point is None:
             raise ThresholdResolutionError(
                 "Resolved Auto T has no full-resolution solar seed"
@@ -1004,10 +1008,31 @@ def build_solar_data_at_threshold(
         )
 
     refined_component = refine_solar_component_mask(raw_component)
-    if not refined_component[seed_y, seed_x]:
+    if not np.any(refined_component):
         raise ThresholdResolutionError(
-            "Refined solar component no longer contains the solar seed"
+            f"Solar component was removed by refinement at T={threshold}"
         )
+
+    if exact_auto_threshold:
+        if not refined_component[seed_y, seed_x]:
+            raise ThresholdResolutionError(
+                "Refined solar component no longer contains the Auto-T solar seed"
+            )
+    else:
+        # The current-T flood seed established component identity before cleanup.
+        # Once cleanup has finalized that same component, seed the authoritative
+        # SolarData from the finalized geometry rather than requiring one raw-mask
+        # pixel to survive morphology.
+        refined_u8 = np.where(refined_component, 255, 0).astype(np.uint8)
+        seed_x, seed_y = brightest_supported_component_point(full_gray, refined_u8)
+        if not refined_component[seed_y, seed_x]:
+            raise ThresholdResolutionError(
+                "Calculated refined-component seed lies outside the solar component"
+            )
+        if int(full_gray[seed_y, seed_x]) <= threshold:
+            raise ThresholdResolutionError(
+                f"Calculated refined-component seed is not light at T={threshold}"
+            )
 
     image_scale = math.sqrt(float(width) * float(height))
     roi_6_5 = _full_mask_from_observation_region(
@@ -1064,6 +1089,7 @@ class DetectorApp:
         self.image_state: dict[str, dict[str, object]] = {}
 
         self.preview_redraw_job = None
+        self.threshold_refinement_job = None
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
         # Tk platforms. Keep one deferred refresh job so only the final key-up
@@ -1605,7 +1631,7 @@ class DetectorApp:
             self.display_on_canvas(self.color_canvas, image)
 
     def _commit_setting_change(self, setting_name):
-        """Persist one completed setting change and process T immediately when it changes."""
+        """Persist one completed setting change, then refresh the current preview."""
         if self.current_path is None or self.current_path not in self.image_state:
             return
 
@@ -1620,32 +1646,11 @@ class DetectorApp:
 
         setattr(settings, setting_name, None if value == baseline else value)
 
-        # Other controls do not alter the threshold canvas. T changes are exactly
-        # two visual stages: pure threshold first, finalized refined component last.
-        if setting_name != "threshold" or self.gray_image is None:
-            return
-
-        threshold = int(self.threshold.get())
-        self.threshold_preview = self.gray_image > threshold
-        if hasattr(self, "threshold_canvas"):
-            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
-
-        try:
-            refined_component = build_solar_data_at_threshold(
-                self.gray_image,
-                threshold,
-                state,
-            )
-        except (ThresholdResolutionError, ValueError) as exc:
-            self.status.set(
-                f"Pure threshold displayed at T={threshold}, but SolarData could not be "
-                f"established ({exc})."
-            )
-            return
-
-        self.threshold_preview = refined_component
-        if hasattr(self, "threshold_canvas"):
-            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
+        # A completed control interaction is the processing boundary. Slider value
+        # labels may update continuously while dragging/auto-repeating, but the
+        # expensive preview refresh happens once when that interaction is committed.
+        if self.gray_image is not None:
+            self.refresh_preview(changed_setting=setting_name)
 
     def _selected_center_target_name(self):
         """Return the user-facing name of the selected centering target."""
@@ -1663,10 +1668,17 @@ class DetectorApp:
         target = self._selected_center_target_name()
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
-    def refresh_preview(self):
-        """Regenerate current-T SolarData before later preview processing stages."""
+    def refresh_preview(self, changed_setting: str | None = None, full_resolution: bool = False):
+        """Show pure current-T threshold now, then refine it on the next GUI turn.
+
+        Separating the two visual stages through ``after`` guarantees that Tk can
+        paint the raw ``gray > T`` result before SolarData construction replaces it
+        with the finalized refined component. Any pending stage-2 job is cancelled
+        when a newer control commit arrives, so stale T values cannot win a race.
+        """
         if self.gray_image is None or self.current_path is None:
-            self.status.set("Refresh Preview: no readable image is loaded.")
+            action = "Apply Full Resolution" if full_resolution else "Refresh Preview"
+            self.status.set(f"{action}: no readable image is loaded.")
             return
 
         state = self.image_state[self.current_path]
@@ -1674,20 +1686,72 @@ class DetectorApp:
         existing = state.get("solar_data")
         reused = isinstance(existing, SolarData) and existing.threshold == threshold
 
+        # Never expose SolarData from a different T as current while the new T is
+        # waiting for its stage-2 rebuild. This also makes downstream state ownership
+        # explicit if current-T establishment later fails.
+        if isinstance(existing, SolarData) and existing.threshold != threshold:
+            state["solar_data"] = None
+
         self.threshold_preview = self.gray_image > threshold
         if hasattr(self, "threshold_canvas"):
             self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
 
+        if self.threshold_refinement_job is not None:
+            self.root.after_cancel(self.threshold_refinement_job)
+            self.threshold_refinement_job = None
+
+        if full_resolution:
+            self.status.set(
+                f"Pure full-resolution threshold displayed at T={threshold}; refining current-T component."
+            )
+        elif changed_setting is not None:
+            self.status.set(
+                f"{changed_setting} committed; pure threshold displayed at T={threshold}; "
+                "refining current preview."
+            )
+        else:
+            self.status.set(
+                f"Pure threshold displayed at T={threshold}; refining current preview."
+            )
+
+        self.threshold_refinement_job = self.root.after(
+            THRESHOLD_REFINEMENT_DISPLAY_DELAY_MS,
+            self._finish_threshold_preview_refresh,
+            self.current_path,
+            threshold,
+            reused,
+            changed_setting,
+            full_resolution,
+        )
+
+    def _finish_threshold_preview_refresh(
+        self,
+        path: str,
+        threshold: int,
+        reused: bool,
+        changed_setting: str | None,
+        full_resolution: bool,
+    ):
+        """Build current-T SolarData and publish the finalized refined preview."""
+        self.threshold_refinement_job = None
+
+        # A navigation or newer threshold change supersedes this queued stage.
+        if self.current_path != path or self.gray_image is None:
+            return
+        if int(self.threshold.get()) != int(threshold):
+            return
+
+        state = self.image_state[path]
         try:
             refined_component = build_solar_data_at_threshold(
                 self.gray_image,
-                threshold,
+                int(threshold),
                 state,
             )
         except (ThresholdResolutionError, ValueError) as exc:
             self.status.set(
-                f"Pure threshold displayed at T={threshold}, but SolarData could not be "
-                f"established ({exc}). Adjust the threshold and try again."
+                f"Pure threshold remains displayed at T={threshold}; SolarData could not be "
+                f"established ({exc})."
             )
             return
 
@@ -1695,7 +1759,16 @@ class DetectorApp:
         if hasattr(self, "threshold_canvas"):
             self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
 
-        if reused:
+        if full_resolution:
+            self.status.set(
+                "Full-resolution refined solar-component preview applied at "
+                f"T={threshold}. Ellipse detector backend not implemented yet."
+            )
+        elif changed_setting is not None:
+            self.status.set(
+                f"{changed_setting} committed; refined current preview displayed at T={threshold}."
+            )
+        elif reused:
             self.status.set(
                 f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
             )
@@ -1708,33 +1781,7 @@ class DetectorApp:
         if self.gray_image is None or self.current_path is None:
             self.status.set("Apply Full Resolution: no readable image is loaded.")
             return
-
-        state = self.image_state[self.current_path]
-        threshold = int(self.threshold.get())
-        self.threshold_preview = self.gray_image > threshold
-        if hasattr(self, "threshold_canvas"):
-            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
-
-        try:
-            refined_component = build_solar_data_at_threshold(
-                self.gray_image,
-                threshold,
-                state,
-            )
-        except (ThresholdResolutionError, ValueError) as exc:
-            self.status.set(
-                f"Pure full-resolution threshold displayed at T={threshold}, but SolarData "
-                f"could not be established ({exc})."
-            )
-            return
-
-        self.threshold_preview = refined_component
-        if hasattr(self, "threshold_canvas"):
-            self.display_on_canvas(self.threshold_canvas, self.threshold_preview)
-        self.status.set(
-            "Full-resolution refined solar-component preview applied at "
-            f"T={threshold}. Ellipse detector backend not implemented yet."
-        )
+        self.refresh_preview(full_resolution=True)
 
     def _schedule_preview_redraw(self, _event=None):
         if self.preview_redraw_job is not None:
