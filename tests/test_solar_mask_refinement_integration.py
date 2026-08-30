@@ -17,6 +17,7 @@ SNIPPET = ROOT / "snippets" / "refine_solar_component_mask.py"
 def _snippet_module():
     spec = importlib.util.spec_from_file_location("refinement_snippet", SNIPPET)
     module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
@@ -35,7 +36,7 @@ def test_production_uses_exact_tested_refinement_function():
         SNIPPET, "refine_solar_component_mask"
     )
     snippet = _snippet_module()
-    assert candidate.REFINEMENT_KERNEL_SIZE == snippet.REFINEMENT_KERNEL_SIZE == 3
+    assert candidate.REFINEMENT_KERNEL_SIZE == snippet.REFINEMENT_KERNEL_SIZE == 7
     assert candidate.REFINEMENT_ITERATIONS == snippet.REFINEMENT_ITERATIONS == 1
 
 
@@ -50,8 +51,8 @@ def test_build_solar_data_stores_refined_mask_not_raw_mask():
     gray = np.zeros((81, 81), np.uint8)
     raw = np.zeros_like(gray, dtype=bool)
     raw[20:61, 20:61] = True
-    raw[19, 19] = True  # 8-connected diagonal burr removed by the approved opening.
-    raw[40, 40] = False  # single-pixel hole filled by closing.
+    raw[19, 19] = True
+    raw[40, 40] = False
     gray[raw] = 220
     seed = (41, 40)
 

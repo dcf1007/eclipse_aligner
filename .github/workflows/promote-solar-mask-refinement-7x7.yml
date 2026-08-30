@@ -1,0 +1,60 @@
+name: Promote solar mask refinement 7x7
+
+on:
+  push:
+    branches:
+      - rebuild/overhaul
+    paths:
+      - snippets/refine_solar_component_mask.py
+      - snippets/apply_solar_mask_refinement_7x7.py
+      - tests/test_refine_solar_component_mask.py
+      - tests/test_solar_mask_refinement_integration.py
+      - .github/workflows/promote-solar-mask-refinement-7x7.yml
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: rebuild/overhaul
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check numpy opencv-python-headless pytest
+
+      - name: Apply exact tested patch
+        run: python snippets/apply_solar_mask_refinement_7x7.py
+
+      - name: Verify intended production diff only
+        run: |
+          git diff --check
+          git diff -- circle_arc_detector.py
+          test "$(git diff --numstat -- circle_arc_detector.py | awk '{print $1+$2}')" -eq 3
+
+      - name: Run combined regression
+        run: >-
+          python -m pytest -q
+          tests/test_threshold_finder.py
+          tests/test_topology_threshold_optimizer.py
+          tests/test_threshold_topology_integration.py
+          tests/test_gui_threshold_integration.py
+          tests/test_threshold_gui_deferred_preview_refresh.py
+          tests/test_solar_data_persistence.py
+          tests/test_refine_solar_component_mask.py
+          tests/test_solar_mask_refinement_integration.py
+
+      - name: Commit validated production change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add circle_arc_detector.py
+          git commit -m "Use 7x7 SolarData mask refinement"
+          git push origin HEAD:rebuild/overhaul
