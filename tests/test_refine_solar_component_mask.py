@@ -12,11 +12,11 @@ spec.loader.exec_module(module)
 refine = module.refine_solar_component_mask
 
 
-def test_kernel_contract_is_approved_7x7_single_pass():
-    assert module.REFINEMENT_KERNEL_SIZE == 7
+def test_kernel_contract_is_shared_7x7_ellipse_single_pass():
+    assert module.SOLAR_COMPONENT_KERNEL_SIZE == 7
     assert module.REFINEMENT_ITERATIONS == 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    assert kernel.shape == (7, 7)
+    expected = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    assert np.array_equal(module.SOLAR_COMPONENT_KERNEL, expected)
 
 
 def test_rejects_empty_mask():

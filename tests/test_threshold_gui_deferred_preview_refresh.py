@@ -1,5 +1,4 @@
-"""Behavioral checks for deferred slider commits on the threshold branch."""
-
+"""Behavioral checks for deferred slider-interaction commits on the threshold branch."""
 from types import SimpleNamespace
 
 import circle_arc_detector as appmod
@@ -38,18 +37,18 @@ def make_app():
     app.slider_keyboard_widget = None
     app.slider_keyboard_start_value = None
     app.commits = []
-    app._commit_setting_change = lambda name: app.commits.append(name)
+    app.commit_setting_change = lambda name, value: app.commits.append((name, value))
     return app
 
 
-def test_mouse_release_commits_only_the_changed_slider_setting():
+def test_mouse_release_commits_only_the_changed_slider_setting_and_value():
     app = make_app()
     slider = FakeSlider(8, "threshold")
     event = SimpleNamespace(widget=slider)
     app._begin_slider_mouse_change(event)
     slider.value = 12
     app._finish_slider_mouse_change(event)
-    assert app.commits == ["threshold"]
+    assert app.commits == [("threshold", 12)]
 
 
 def test_mouse_release_without_change_does_not_commit():
@@ -61,7 +60,7 @@ def test_mouse_release_without_change_does_not_commit():
     assert app.commits == []
 
 
-def test_keyboard_repeat_release_is_cancelled_until_final_release():
+def test_keyboard_repeat_release_is_cancelled_until_final_release_then_commits_value():
     app = make_app()
     slider = FakeSlider(8, "threshold")
     event = SimpleNamespace(widget=slider)
@@ -77,4 +76,4 @@ def test_keyboard_repeat_release_is_cancelled_until_final_release():
     delay, callback = app.root.jobs[final_job]
     assert delay == appmod.SLIDER_KEY_RELEASE_SETTLE_MS
     callback()
-    assert app.commits == ["threshold"]
+    assert app.commits == [("threshold", 12)]

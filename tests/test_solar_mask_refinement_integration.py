@@ -24,73 +24,51 @@ def _snippet_module():
 
 def _function_ast(path: Path, name: str):
     tree = ast.parse(path.read_text())
-    node = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
+    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
     return ast.dump(node, include_attributes=False)
 
 
-def _auto_state(threshold, seed):
+def _state(threshold):
     return {
-        "settings": candidate.ImageSettings(),
-        "auto_threshold_result": candidate.AutoThresholdResult(
-            threshold=threshold,
-            histogram_peak=200,
-            histogram_left_edge=threshold,
-            seed_threshold=threshold,
-            coarse_threshold=threshold,
-            roi_seed_threshold=threshold,
-            full_seed_point=seed,
-            used_guard=False,
-            resolved=True,
-        ),
+        "settings": candidate.ImageSettings(threshold=threshold),
+        "auto_threshold_result": None,
         "solar_data": None,
     }
 
 
-def test_production_uses_exact_tested_refinement_function():
-    assert _function_ast(
-        ROOT / "circle_arc_detector.py",
-        "refine_solar_component_mask",
-    ) == _function_ast(SNIPPET, "refine_solar_component_mask")
+def test_production_uses_exact_tested_refinement_function_and_shared_kernel():
+    assert _function_ast(ROOT / "circle_arc_detector.py", "refine_solar_component_mask") == _function_ast(
+        SNIPPET, "refine_solar_component_mask"
+    )
     snippet = _snippet_module()
-    assert candidate.REFINEMENT_KERNEL_SIZE == snippet.REFINEMENT_KERNEL_SIZE == 7
+    assert candidate.SOLAR_COMPONENT_KERNEL_SIZE == snippet.SOLAR_COMPONENT_KERNEL_SIZE == 7
     assert candidate.REFINEMENT_ITERATIONS == snippet.REFINEMENT_ITERATIONS == 1
+    assert np.array_equal(candidate.SOLAR_COMPONENT_KERNEL, snippet.SOLAR_COMPONENT_KERNEL)
 
 
-def test_refinement_is_after_threshold_and_inside_current_t_solar_build():
-    auto_source = inspect.getsource(candidate.auto_threshold)
-    build_source = inspect.getsource(candidate.build_solar_data_at_threshold)
-
+def test_refinement_is_inside_atomic_current_t_resolver():
+    auto_source = inspect.getsource(candidate.find_auto_threshold)
+    resolve_source = inspect.getsource(candidate.resolve_threshold)
     assert "refine_solar_component_mask" not in auto_source
-    assert "refine_solar_component_mask" in build_source
-    assert build_source.index("seed_x") < build_source.index("cv2.compare")
-    assert build_source.index("cv2.compare") < build_source.index("refine_solar_component_mask")
-    assert build_source.index("refine_solar_component_mask") < build_source.index("SolarData(")
-    assert build_source.index("SolarData(") < build_source.index('image_state["solar_data"]')
+    assert "refine_solar_component_mask" in resolve_source
+    assert resolve_source.index("brightest_supported_component_point") < resolve_source.index("refine_solar_component_mask")
+    assert resolve_source.index("refine_solar_component_mask") < resolve_source.index("SolarData(")
+    assert resolve_source.index("SolarData(") < resolve_source.index('image_state["solar_data"]')
 
 
-def test_build_returns_and_stores_same_refined_component():
+def test_resolver_returns_and_stores_same_refined_component():
     gray = np.zeros((81, 81), np.uint8)
     raw = np.zeros_like(gray, dtype=bool)
     raw[20:61, 20:61] = True
     raw[19, 19] = True
     raw[40, 40] = False
     gray[raw] = 220
-    seed = (41, 40)
-    state = _auto_state(100, seed)
+    gray[40, 41] = 250
+    state = _state(100)
 
     expected = candidate.refine_solar_component_mask(raw)
-    assert not np.array_equal(raw, expected)
-
-    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
-    stored = candidate.decompress_full_mask(
-        state["solar_data"].component_mask,
-        gray.shape,
-    )
-
+    refined = candidate.resolve_threshold(gray, 100, state)
+    stored = candidate.decompress_full_mask(state["solar_data"].component_mask, gray.shape)
     assert np.array_equal(refined, expected)
     assert np.array_equal(stored, refined)
 
@@ -102,10 +80,10 @@ def test_roi_guard_and_contour_derive_from_same_returned_refined_component():
     raw = raw_u8 != 0
     raw[25, 35] = True
     gray[raw] = 220
-    seed = (60, 50)
-    state = _auto_state(100, seed)
+    gray[50, 60] = 250
+    state = _state(100)
 
-    refined = candidate.build_solar_data_at_threshold(gray, 100, state)
+    refined = candidate.resolve_threshold(gray, 100, state)
     solar = state["solar_data"]
     image_scale = (gray.shape[0] * gray.shape[1]) ** 0.5
 
@@ -114,12 +92,7 @@ def test_roi_guard_and_contour_derive_from_same_returned_refined_component():
         (solar.guard_19_5_mask, candidate.GUARD_DILATION_FRACTION),
     ):
         stored = candidate.decompress_full_mask(payload, gray.shape)
-        region = candidate._build_observation_region(
-            gray,
-            refined,
-            fraction * image_scale,
-            seed,
-        )
+        region = candidate._build_observation_region(gray, refined, fraction * image_scale, solar.seed_point)
         expected = np.zeros(gray.shape, bool)
         x0, y0, x1, y1 = region.bbox
         expected[y0:y1, x0:x1] = region.allowed_u8 != 0

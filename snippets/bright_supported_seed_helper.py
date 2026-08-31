@@ -1,45 +1,42 @@
-"""Validated bright, well-supported solar seed selection helper.
+"""Validated 7x7-supported solar seed selection helper.
 
-Production integration replaces deepest-only seed selection at the coarse and
-mapped full-resolution seed-establishment points. The threshold algorithm itself
-is otherwise unchanged.
+Seed candidates must survive the same 7x7 elliptical support erosion used by the
+solar-component refinement. There is deliberately no unsupported fallback.
 """
 import cv2
 import numpy as np
 
+SOLAR_COMPONENT_KERNEL_SIZE = 7
+SOLAR_COMPONENT_KERNEL = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE,
+    (SOLAR_COMPONENT_KERNEL_SIZE, SOLAR_COMPONENT_KERNEL_SIZE),
+)
+
 
 class ThresholdResolutionError(RuntimeError):
-    """Raised when a solar component cannot supply a seed."""
+    """Raised when a solar component cannot supply a robust interior seed."""
 
 
 def brightest_supported_component_point(
     gray: np.ndarray,
     component_u8: np.ndarray,
 ) -> tuple[int, int]:
-    """Choose the brightest robust interior seed; depth breaks brightness ties.
-
-    Seed candidates normally must survive a 5x5 erosion of the component. This
-    prevents an isolated hot pixel, one-pixel filament, or boundary artifact from
-    becoming the solar seed. If a very thin component has no 5x5-supported pixel,
-    the component itself is used as a deterministic fallback.
-    """
+    """Choose brightest 7x7-supported pixel; depth breaks brightness ties."""
     source = (component_u8 != 0).astype(np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
     if not np.any(source):
         raise ThresholdResolutionError("Empty component")
 
-    supported = cv2.erode(
-        source,
-        np.ones((5, 5), dtype=np.uint8),
-        iterations=1,
-    ) != 0
+    supported = cv2.erode(source, SOLAR_COMPONENT_KERNEL, iterations=1) != 0
     if not np.any(supported):
-        supported = source != 0
+        raise ThresholdResolutionError(
+            "Solar component has no 7x7-supported interior seed"
+        )
 
     max_gray = int(gray[supported].max())
     brightest = supported & (gray == max_gray)
-
+    # The 5 is the L2 distance-transform approximation mask size, not support size.
     distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
     scores = np.where(brightest, distance, -1.0)
     y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)

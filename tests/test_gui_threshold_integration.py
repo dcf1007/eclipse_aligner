@@ -1,5 +1,4 @@
-"""Behavioral integration checks for per-image settings and threshold preview routing."""
-
+"""Behavioral integration checks for explicit settings and synchronous threshold routing."""
 import inspect
 
 import numpy as np
@@ -18,32 +17,12 @@ class FakeVariable:
         self.value = value
 
 
-class FakeRoot:
-    def __init__(self):
-        self.jobs = {}
-        self.cancelled = []
-        self._next_job = 0
-
-    def after(self, delay_ms, callback, *args):
-        self._next_job += 1
-        job = f"job-{self._next_job}"
-        self.jobs[job] = (delay_ms, callback, args)
-        return job
-
-    def after_cancel(self, job):
-        self.cancelled.append(job)
-        self.jobs.pop(job, None)
-
-    def run_pending(self):
-        jobs = list(self.jobs.items())
-        self.jobs.clear()
-        for _job, (_delay, callback, args) in jobs:
-            callback(*args)
+class FakeStatus(FakeVariable):
+    pass
 
 
 def make_state_app():
     app = object.__new__(appmod.DetectorApp)
-    app.root = FakeRoot()
     app.current_path = "/tmp/image.jpg"
     app.gray_image = np.array([[0, 9, 10, 255]], dtype=np.uint8)
     app.threshold = FakeVariable(10)
@@ -55,8 +34,7 @@ def make_state_app():
     app.outer_limb_assistance = FakeVariable(False)
     app.use_horizon = FakeVariable(True)
     app.center_target = FakeVariable("light")
-    app.status = FakeVariable("")
-    app.threshold_refinement_job = None
+    app.status = FakeStatus("")
     app.default_settings = appmod.ImageSettings(
         min_radius=1000,
         max_radius=1500,
@@ -91,7 +69,7 @@ def make_state_app():
     )
     app.image_state = {
         app.current_path: {
-            "settings": appmod.ImageSettings(),
+            "settings": appmod.ImageSettings(threshold=10),
             "auto_threshold_result": result,
             "solar_data": None,
         }
@@ -99,8 +77,12 @@ def make_state_app():
     return app
 
 
-def test_each_processing_setting_is_stored_only_when_it_differs_from_baseline():
+def test_each_processing_setting_change_uses_explicit_value_and_refreshes_once():
     app = make_state_app()
+    refreshes = []
+    app.refresh_preview = lambda changed_setting=None, full_resolution=False: refreshes.append(
+        (changed_setting, full_resolution)
+    )
     changes = {
         "threshold": 14,
         "min_radius": 900,
@@ -112,75 +94,52 @@ def test_each_processing_setting_is_stored_only_when_it_differs_from_baseline():
         "use_horizon": False,
         "center_target": "dark",
     }
-
     settings = app.image_state[app.current_path]["settings"]
     for setting_name, value in changes.items():
-        app.setting_variables[setting_name].set(value)
-        app._commit_setting_change(setting_name)
+        app.commit_setting_change(setting_name, value)
+        assert app.setting_variables[setting_name].get() == value
         assert getattr(settings, setting_name) == value
+    assert refreshes == [(name, False) for name in changes]
 
 
-def test_returning_settings_to_their_baselines_clears_sparse_overrides():
+def test_returning_ordinary_setting_to_baseline_clears_override_but_threshold_remains_explicit():
     app = make_state_app()
+    app.refresh_preview = lambda **_kwargs: None
     settings = app.image_state[app.current_path]["settings"]
 
-    app.min_radius.set(900)
-    app._commit_setting_change("min_radius")
+    app.commit_setting_change("min_radius", 900)
     assert settings.min_radius == 900
-    app.min_radius.set(1000)
-    app._commit_setting_change("min_radius")
+    app.commit_setting_change("min_radius", 1000)
     assert settings.min_radius is None
 
-    app.threshold.set(14)
-    app._commit_setting_change("threshold")
+    app.commit_setting_change("threshold", 14)
     assert settings.threshold == 14
-    app.threshold.set(10)
-    app._commit_setting_change("threshold")
-    assert settings.threshold is None
+    app.commit_setting_change("threshold", 10)
+    assert settings.threshold == 10
 
 
-def test_threshold_commit_paints_raw_now_and_refined_on_next_gui_turn(monkeypatch):
+def test_threshold_commit_synchronously_displays_raw_then_resolves_then_displays_refined(monkeypatch):
     app = make_state_app()
     app.threshold_canvas = object()
-    displayed = []
-    app.display_on_canvas = lambda canvas, content: displayed.append(np.asarray(content).copy())
+    events = []
+    app.render_canvas_content = lambda _canvas, content: events.append(("display", np.asarray(content).copy()))
     refined = np.array([[False, False, True, True]])
-    monkeypatch.setattr(
-        appmod,
-        "build_solar_data_at_threshold",
-        lambda _gray, _threshold, _state: refined,
-    )
 
-    app.threshold.set(12)
-    app._commit_setting_change("threshold")
+    def fake_resolve(_gray, threshold, _state):
+        events.append(("resolve", threshold))
+        return refined
 
-    assert len(displayed) == 1
-    assert np.array_equal(displayed[0], app.gray_image > 12)
-    assert app.threshold_refinement_job is not None
-    assert list(app.root.jobs.values())[0][0] == appmod.THRESHOLD_REFINEMENT_DISPLAY_DELAY_MS
+    monkeypatch.setattr(appmod, "resolve_threshold", fake_resolve)
+    app.commit_setting_change("threshold", 12)
 
-    app.root.run_pending()
-
-    assert len(displayed) == 2
-    assert np.array_equal(displayed[1], refined)
-    assert np.array_equal(app.threshold_preview, refined)
-    assert app.threshold_refinement_job is None
+    assert events[0][0] == "display"
+    assert np.array_equal(events[0][1], app.gray_image > 12)
+    assert events[1] == ("resolve", 12)
+    assert events[2][0] == "display"
+    assert np.array_equal(events[2][1], refined)
 
 
-def test_non_threshold_commit_refreshes_current_preview_once():
-    app = make_state_app()
-    refreshes = []
-    app.refresh_preview = lambda changed_setting=None, full_resolution=False: refreshes.append(
-        (changed_setting, full_resolution)
-    )
-
-    app.min_radius.set(900)
-    app._commit_setting_change("min_radius")
-
-    assert refreshes == [("min_radius", False)]
-
-
-def test_threshold_change_invalidates_old_t_solar_data_before_deferred_rebuild():
+def test_threshold_change_invalidates_old_t_solar_data_before_resolve(monkeypatch):
     app = make_state_app()
     app.image_state[app.current_path]["solar_data"] = appmod.SolarData(
         threshold=10,
@@ -190,70 +149,43 @@ def test_threshold_change_invalidates_old_t_solar_data_before_deferred_rebuild()
         guard_19_5_mask=b"old",
         component_contour=np.empty((0, 2), dtype=np.uint16),
     )
+    seen = []
 
-    app.threshold.set(12)
-    app._commit_setting_change("threshold")
+    def fake_refresh(**_kwargs):
+        seen.append(app.image_state[app.current_path]["solar_data"])
 
-    assert app.image_state[app.current_path]["solar_data"] is None
-    assert app.threshold_refinement_job is not None
-
-
-def test_newer_threshold_commit_cancels_pending_old_t_stage(monkeypatch):
-    app = make_state_app()
-    calls = []
-    monkeypatch.setattr(
-        appmod,
-        "build_solar_data_at_threshold",
-        lambda _gray, threshold, _state: calls.append(threshold) or (_gray > threshold),
-    )
-
-    app.threshold.set(12)
-    app._commit_setting_change("threshold")
-    first_job = app.threshold_refinement_job
-
-    app.threshold.set(14)
-    app._commit_setting_change("threshold")
-
-    assert first_job in app.root.cancelled
-    assert len(app.root.jobs) == 1
-    app.root.run_pending()
-    assert calls == [14]
+    app.refresh_preview = fake_refresh
+    app.commit_setting_change("threshold", 12)
+    assert seen == [None]
 
 
-def test_auto_select_reuses_cached_result_without_rerunning_algorithm(monkeypatch):
+def test_auto_select_reuses_cached_result_and_commits_exact_value(monkeypatch):
     app = make_state_app()
     app.threshold.set(14)
     commits = []
-    app._commit_setting_change = lambda name: commits.append(name)
+    app.commit_setting_change = lambda name, value: commits.append((name, value))
 
-    def fail_if_called(_gray):
+    def fail_if_called(_gray, _state):
         raise AssertionError("cached AutoThresholdResult should have been reused")
 
-    monkeypatch.setattr(appmod, "auto_threshold", fail_if_called)
+    monkeypatch.setattr(appmod, "find_auto_threshold", fail_if_called)
     app.auto_select_threshold()
-
-    assert app.threshold.get() == 10
-    assert commits == ["threshold"]
+    assert commits == [("threshold", 10)]
 
 
-def test_display_on_canvas_is_generic_and_flushes_pending_repaint_work():
-    source = inspect.getsource(appmod.DetectorApp.display_on_canvas)
-    assert "canvas_content" in source
-    assert "canvas._display_photo" in source
+def test_renderer_is_generic_flushes_idle_work_and_owns_canvas_cache():
+    source = inspect.getsource(appmod.DetectorApp.render_canvas_content)
+    assert "content" in source
+    assert "canvas._unscaled_render_raster" in source
+    assert "canvas._tk_photo_image" in source
     assert "update_idletasks" in source
-    assert not hasattr(appmod.DetectorApp, "_show_image_on_canvas")
-    assert not hasattr(appmod.DetectorApp, "_refresh_threshold_image")
+    assert "resolve_threshold" not in source
 
 
-def test_refresh_preview_defers_refinement_instead_of_replacing_raw_in_same_callback():
+def test_refresh_preview_has_no_threshold_specific_deferred_refinement():
     source = inspect.getsource(appmod.DetectorApp.refresh_preview)
-    assert "THRESHOLD_REFINEMENT_DISPLAY_DELAY_MS" in source
-    assert "self.root.after(" in source
-    assert "_finish_threshold_preview_refresh" in source
-
-
-def test_generic_display_refresh_does_not_recompute_threshold_or_solar_data():
-    source = inspect.getsource(appmod.DetectorApp._refresh_display_images)
-    assert "gray_image >" not in source
-    assert "cv2.compare" not in source
-    assert "build_solar_data_at_threshold" not in source
+    assert "resolve_threshold" in source
+    assert "render_canvas_content" in source
+    assert "self.root.after(" not in source
+    assert "_finish_threshold_preview_refresh" not in source
+    assert "THRESHOLD_REFINEMENT_DISPLAY_DELAY_MS" not in source

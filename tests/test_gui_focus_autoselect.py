@@ -1,8 +1,6 @@
 """Static regression checks for slider focus and Auto select GUI controls."""
-
 from pathlib import Path
 import ast
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "circle_arc_detector.py"
@@ -32,13 +30,14 @@ def test_radius_auto_select_button_spans_min_and_max_rows():
     assert 'row=1, column=3, rowspan=2' in TEXT
 
 
-def test_threshold_auto_select_reuses_cached_result_and_commits_threshold():
+def test_threshold_auto_select_reuses_cached_result_and_commits_explicit_value():
     block = TEXT.split("def auto_select_threshold(self):", 1)[1].split(
         "def auto_select_radius", 1
     )[0]
-    assert 'state["auto_threshold_result"]' in block
-    assert "self.threshold.set(selected_threshold)" in block
-    assert 'self._commit_setting_change("threshold")' in block
+    assert 'state.get("auto_threshold_result")' in block
+    assert 'selected_threshold = find_auto_threshold(self.gray_image, state)' in block
+    assert 'self.commit_setting_change("threshold", selected_threshold)' in block
+    assert "self.threshold.set(selected_threshold)" not in block
     assert "self.refresh_preview()" not in block
 
 
