@@ -62,7 +62,8 @@ def disk_gray(size=81, radius=20, threshold=100):
     return gray, threshold, center
 
 
-def test_shared_seed_support_is_7x7_elliptical_and_has_no_fallback():
+def test_seed_support_regresses_to_5x5_square_with_thin_component_fallback():
+    # Final component refinement remains the independent 7x7 elliptical OPEN/CLOSE.
     assert cad.SOLAR_COMPONENT_KERNEL.shape == (7, 7)
     assert cad.SOLAR_COMPONENT_KERNEL[3, 3] == 1
     assert cad.SOLAR_COMPONENT_KERNEL[0, 0] == 0
@@ -71,10 +72,7 @@ def test_shared_seed_support_is_7x7_elliptical_and_has_no_fallback():
     thin = np.zeros_like(gray)
     thin[10, 4:17] = 255
     gray[10, 10] = 250
-
-    with pytest.raises(cad.ThresholdResolutionError, match="no 7x7-supported interior seed"):
-        cad.brightest_supported_component_point(gray, thin)
-
+    assert cad.brightest_supported_component_point(gray, thin) == (10, 10)
 
 def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray = np.zeros((51, 51), np.uint8)
@@ -116,7 +114,7 @@ def test_resolve_threshold_chooses_authoritative_seed_before_refinement_and_pers
     gray[component_center[1], component_center[0]] = 240
 
     # Add a thin connected spur with a brighter endpoint. It is part of the raw
-    # component but cannot become the seed because it lacks 7x7 support.
+    # component but cannot become the seed because it lacks 5x5 support.
     gray[40, 58:66] = 255
 
     state = {"settings": cad.ImageSettings(threshold=100), "auto_threshold_result": None, "solar_data": None}

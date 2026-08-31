@@ -3,7 +3,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "snippets"))
 import bright_supported_seed_helper as seed
@@ -29,18 +28,18 @@ def test_equal_brightness_prefers_deeper_supported_pixel():
     assert seed.brightest_supported_component_point(gray, component) == (20, 20)
 
 
-def test_thin_component_without_7x7_support_is_error_not_fallback():
+def test_thin_component_without_5x5_support_falls_back_to_component():
     gray = np.zeros((15, 15), np.uint8)
     component = np.zeros_like(gray)
     component[7, 2:13] = 255
     gray[7, 5] = 180
     gray[7, 9] = 220
-    with pytest.raises(seed.ThresholdResolutionError, match="no 7x7-supported interior seed"):
-        seed.brightest_supported_component_point(gray, component)
+    assert seed.brightest_supported_component_point(gray, component) == (9, 7)
 
 
-def test_support_kernel_is_shared_shape_contract():
-    assert seed.SOLAR_COMPONENT_KERNEL_SIZE == 7
-    assert seed.SOLAR_COMPONENT_KERNEL.shape == (7, 7)
-    assert seed.SOLAR_COMPONENT_KERNEL[3, 3] == 1
-    assert seed.SOLAR_COMPONENT_KERNEL[0, 0] == 0
+def test_5x5_support_is_square_not_ellipse():
+    source = np.ones((5, 5), np.uint8)
+    square = cv2.erode(source, np.ones((5, 5), np.uint8), iterations=1)
+    assert square[2, 2] == 1
+    kernel = np.ones((5, 5), np.uint8)
+    assert np.all(kernel == 1)

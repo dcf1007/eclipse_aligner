@@ -404,12 +404,12 @@ def brightest_supported_component_point(
     gray: np.ndarray,
     component_u8: np.ndarray,
 ) -> tuple[int, int]:
-    """Choose the brightest 7x7-supported pixel; depth breaks brightness ties.
+    """Choose the brightest robust interior seed; depth breaks brightness ties.
 
-    Eligibility requires surviving the same 7x7 elliptical erosion used by the
-    subsequent solar-component refinement. There is deliberately no unsupported
-    fallback: a component with no robust interior cannot supply an authoritative
-    or tracking seed.
+    Seed candidates normally must survive a 5x5 erosion of the component. This
+    prevents an isolated hot pixel, one-pixel filament, or boundary artifact from
+    becoming the solar seed. If a very thin component has no 5x5-supported pixel,
+    the component itself is used as a deterministic fallback.
     """
     source = (component_u8 != 0).astype(np.uint8)
     if gray.shape != source.shape:
@@ -419,25 +419,19 @@ def brightest_supported_component_point(
 
     supported = cv2.erode(
         source,
-        SOLAR_COMPONENT_KERNEL,
+        np.ones((5, 5), dtype=np.uint8),
         iterations=1,
     ) != 0
     if not np.any(supported):
-        raise ThresholdResolutionError(
-            "Solar component has no 7x7-supported interior seed"
-        )
+        supported = source != 0
 
     max_gray = int(gray[supported].max())
     brightest = supported & (gray == max_gray)
 
-    # The 5 here is OpenCV's L2 distance-transform approximation mask size; it is
-    # unrelated to the 7x7 support kernel above.
     distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
     scores = np.where(brightest, distance, -1.0)
     y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
     return int(x), int(y)
-
-
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
