@@ -1,37 +1,36 @@
-"""5x5-square-supported solar seed helper with thin-component fallback.
+"""Explicit-kernel supported solar-seed selection helper.
 
-This restores the seed-selection behavior used by the validated Auto-T implementation
-at commit 8ea0e44. Candidates normally must survive a 5x5 square erosion. If that
-erosion removes the whole component, the component itself remains eligible so a very
-thin early Auto-T tracking component can still establish identity.
+The caller owns support geometry. Unsupported components fail explicitly; there is
+no fallback to a boundary/thin pixel that did not survive the requested erosion.
 """
 import cv2
 import numpy as np
 
 
 class ThresholdResolutionError(RuntimeError):
-    """Raised when a solar component is empty or otherwise unusable."""
+    """Raised when a component cannot supply the requested supported seed."""
 
 
 def brightest_supported_component_point(
     gray: np.ndarray,
     component_u8: np.ndarray,
+    support_kernel: np.ndarray,
 ) -> tuple[int, int]:
-    """Choose brightest 5x5-supported pixel; fall back to component; depth ties."""
+    """Choose brightest support-eligible pixel; depth breaks brightness ties."""
     source = (component_u8 != 0).astype(np.uint8)
+    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
+    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
+        raise ValueError("support kernel must be a non-empty two-dimensional mask")
     if not np.any(source):
         raise ThresholdResolutionError("Empty component")
-
-    supported = cv2.erode(
-        source,
-        np.ones((5, 5), dtype=np.uint8),
-        iterations=1,
-    ) != 0
+    supported = cv2.erode(source, support_kernel, iterations=1) != 0
     if not np.any(supported):
-        supported = source != 0
-
+        kh, kw = support_kernel.shape
+        raise ThresholdResolutionError(
+            f"Solar component has no {kw}x{kh}-supported interior seed"
+        )
     max_gray = int(gray[supported].max())
     brightest = supported & (gray == max_gray)
     distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)

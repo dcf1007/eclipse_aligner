@@ -39,8 +39,8 @@ raster with INTER_AREA, uses the rightmost locally smoothed histogram mode only 
 establish a solar seed, tracks 8-connected component topology, maps the seed back
 to full resolution, constructs rounded 6.5% and 19.5% observation regions, and
 selects the lowest full-resolution threshold whose tracked component is genuinely
-separated. If topology cannot be resolved, the deterministic fallback is the left
-edge of the rightmost histogram peak. No HSV/color thresholding, Otsu thresholding,
+separated. If no supported solar seed can be established through T=0, Auto-T fails
+explicitly instead of substituting the histogram left edge. No HSV/color thresholding, Otsu thresholding,
 ellipse-fit score, bright-pixel dominance, competitor gain, or horizon special case
 is part of automatic threshold selection.
 """
@@ -107,6 +107,10 @@ PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 ROI_DILATION_FRACTION = 0.065
 GUARD_DILATION_FRACTION = 0.195
 TOPOLOGY_OPTIMIZATION_STEPS = 5
+TRACKING_SEED_KERNEL_SIZE = 5
+TRACKING_SEED_KERNEL = np.ones(
+    (TRACKING_SEED_KERNEL_SIZE, TRACKING_SEED_KERNEL_SIZE), dtype=np.uint8
+)
 SOLAR_COMPONENT_KERNEL_SIZE = 7
 SOLAR_COMPONENT_KERNEL = cv2.getStructuringElement(
     cv2.MORPH_ELLIPSE,
@@ -324,10 +328,10 @@ class CoarseThresholdResult:
 
 @dataclass(frozen=True)
 class AutoThresholdResult:
-    threshold: int
+    threshold: int | None
     histogram_peak: int
     histogram_left_edge: int
-    seed_threshold: int
+    seed_threshold: int | None
     coarse_threshold: int | None
     roi_seed_threshold: int | None
     full_seed_point: tuple[int, int] | None
@@ -403,35 +407,66 @@ def find_rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
 def brightest_supported_component_point(
     gray: np.ndarray,
     component_u8: np.ndarray,
+    support_kernel: np.ndarray,
 ) -> tuple[int, int]:
-    """Choose the brightest robust interior seed; depth breaks brightness ties.
+    """Choose the brightest support-eligible component pixel; depth breaks ties.
 
-    Seed candidates normally must survive a 5x5 erosion of the component. This
-    prevents an isolated hot pixel, one-pixel filament, or boundary artifact from
-    becoming the solar seed. If a very thin component has no 5x5-supported pixel,
-    the component itself is used as a deterministic fallback.
+    The caller owns the support geometry. A tracking or authoritative seed must
+    survive one erosion by that exact kernel; there is deliberately no fallback
+    to unsupported component pixels.
     """
     source = (component_u8 != 0).astype(np.uint8)
+    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
+    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
+        raise ValueError("support kernel must be a non-empty two-dimensional mask")
     if not np.any(source):
         raise ThresholdResolutionError("Empty component")
 
-    supported = cv2.erode(
-        source,
-        np.ones((5, 5), dtype=np.uint8),
-        iterations=1,
-    ) != 0
+    supported = cv2.erode(source, support_kernel, iterations=1) != 0
     if not np.any(supported):
-        supported = source != 0
+        kh, kw = support_kernel.shape
+        raise ThresholdResolutionError(
+            f"Solar component has no {kw}x{kh}-supported interior seed"
+        )
 
     max_gray = int(gray[supported].max())
     brightest = supported & (gray == max_gray)
-
     distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
     scores = np.where(brightest, distance, -1.0)
     y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
     return int(x), int(y)
+
+
+def equivalent_full_resolution_seed_kernel(
+    full_shape: tuple[int, int],
+    work_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Return the square full-resolution support equivalent to the 5x5 work seed.
+
+    Scaling uses the realized maximum-dimension ratio. If ``work_shape`` is omitted,
+    it is the shape produced by the <=1200-pixel work-raster rule. The mapped size
+    is rounded to the nearest positive odd integer so the square remains centered.
+    """
+    fh, fw = map(int, full_shape)
+    if fh <= 0 or fw <= 0:
+        raise ValueError("full shape dimensions must be positive")
+    if work_shape is None:
+        work_max = min(max(fh, fw), WORK_MAX_DIM)
+    else:
+        sh, sw = map(int, work_shape)
+        if sh <= 0 or sw <= 0:
+            raise ValueError("work shape dimensions must be positive")
+        work_max = max(sh, sw)
+    mapped = TRACKING_SEED_KERNEL_SIZE * max(fh, fw) / float(work_max)
+    low = max(1, int(math.floor(mapped)))
+    if low % 2 == 0:
+        low -= 1
+    high = low + 2
+    size = low if abs(mapped - low) <= abs(high - mapped) else high
+    return np.ones((size, size), dtype=np.uint8)
+
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -481,13 +516,20 @@ def coarse_threshold_search(work_gray: np.ndarray) -> CoarseThresholdResult:
         component = largest_enclosed_bright_component(work_gray > threshold)
         if component is None:
             continue
+        candidate_mask = np.where(component, 255, 0).astype(np.uint8)
+        try:
+            candidate_seed = brightest_supported_component_point(
+                work_gray, candidate_mask, TRACKING_SEED_KERNEL
+            )
+        except ThresholdResolutionError:
+            continue
         seed_threshold = int(threshold)
-        seed_mask = np.where(component, 255, 0).astype(np.uint8)
-        seed_point = brightest_supported_component_point(work_gray, seed_mask)
+        seed_mask = candidate_mask
+        seed_point = candidate_seed
         break
 
     if seed_threshold is None or seed_point is None or seed_mask is None:
-        raise ThresholdResolutionError("No enclosed bright component exists")
+        raise ThresholdResolutionError("No 5x5-supported enclosed bright component exists through T=0")
 
     # Phase 2: keep the same seed and lower T. Connectivity is monotone while T is
     # lowered: pixels are only added, so once this tracked 8-connected component
@@ -565,7 +607,8 @@ def establish_full_resolution_seed(
         raise ThresholdResolutionError("Mapped solar seed is empty")
 
     local = np.where(source, 255, 0).astype(np.uint8)
-    px, py = brightest_supported_component_point(local_gray, local)
+    support = equivalent_full_resolution_seed_kernel(full_gray.shape, work_shape)
+    px, py = brightest_supported_component_point(local_gray, local, support)
     return x0 + px, y0 + py
 
 
@@ -758,10 +801,10 @@ def find_auto_threshold(
         )
     except ThresholdResolutionError as exc:
         result = AutoThresholdResult(
-            threshold=int(left_edge),
+            threshold=None,
             histogram_peak=int(peak),
             histogram_left_edge=int(left_edge),
-            seed_threshold=int(left_edge),
+            seed_threshold=None,
             coarse_threshold=None,
             roi_seed_threshold=None,
             full_seed_point=None,
@@ -769,6 +812,8 @@ def find_auto_threshold(
             resolved=False,
             reason=str(exc),
         )
+        image_state["auto_threshold_result"] = result
+        raise
 
     image_state["auto_threshold_result"] = result
     return int(result.threshold)
@@ -912,7 +957,10 @@ def resolve_threshold(
             f"No enclosed solar component exists at selected T={threshold}"
         )
     raw_u8 = np.where(raw_component, 255, 0).astype(np.uint8)
-    seed_x, seed_y = brightest_supported_component_point(full_gray, raw_u8)
+    full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)
+    seed_x, seed_y = brightest_supported_component_point(
+        full_gray, raw_u8, full_seed_support
+    )
     if not raw_component[seed_y, seed_x]:
         raise ThresholdResolutionError(
             "Authoritative solar seed lies outside the unrefined solar component"
@@ -1127,8 +1175,12 @@ class DetectorApp:
 
         if settings.threshold is None:
             # None has one meaning only: this image has never had T initialized.
-            threshold = find_auto_threshold(self.gray_image, state)
-            self.commit_setting_change("threshold", threshold)
+            try:
+                threshold = find_auto_threshold(self.gray_image, state)
+            except ThresholdResolutionError as exc:
+                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+            else:
+                self.commit_setting_change("threshold", threshold)
         else:
             self.threshold.set(int(settings.threshold))
             self.refresh_preview(changed_setting="image load")
@@ -1454,28 +1506,29 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         result = state.get("auto_threshold_result")
-        if isinstance(result, AutoThresholdResult):
+        if (
+            isinstance(result, AutoThresholdResult)
+            and result.resolved
+            and result.threshold is not None
+        ):
             selected_threshold = int(result.threshold)
         else:
-            selected_threshold = find_auto_threshold(self.gray_image, state)
+            try:
+                selected_threshold = find_auto_threshold(self.gray_image, state)
+            except ThresholdResolutionError as exc:
+                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+                return
             result = state["auto_threshold_result"]
 
         self.commit_setting_change("threshold", selected_threshold)
 
         solar_data = state.get("solar_data")
         if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
-            if result.resolved:
-                self.status.set(
-                    "Automatic grayscale threshold selected: "
-                    f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                    f"histogram start={result.histogram_left_edge}); refined component displayed."
-                )
-            else:
-                self.status.set(
-                    "Automatic component tracking unresolved; "
-                    f"using rightmost-histogram left edge T={selected_threshold}; "
-                    "SolarData established directly at that T."
-                )
+            self.status.set(
+                "Automatic grayscale threshold selected: "
+                f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                f"histogram start={result.histogram_left_edge}); refined component displayed."
+            )
 
 
     def auto_select_radius(self):
