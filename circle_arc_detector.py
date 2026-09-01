@@ -131,6 +131,26 @@ class ThresholdTopology:
 
 
 @dataclass(frozen=True)
+class CleanupMetrics:
+    """Unweighted cleanup benefit/cost terms measured against one raw component."""
+
+    contour_cleanup: float
+    roughness_cleanup: float
+    solidity_gain: float
+    internal_dark_cleanup: float
+    area_loss: float
+    solidity_loss: float
+
+
+@dataclass(frozen=True)
+class CleanupCandidateEvaluation:
+    name: str
+    mask: np.ndarray
+    topology: ThresholdTopology
+    metrics: CleanupMetrics
+
+
+@dataclass(frozen=True)
 class ThresholdTopologySelection:
     threshold: int
     base_threshold: int
@@ -926,6 +946,64 @@ def seed_connected_cleanup_candidates(
     if "raw" not in valid:
         raise ThresholdResolutionError("Raw cleanup component lost its authoritative seed")
     return valid
+
+
+def evaluate_cleanup_candidates(
+    component: np.ndarray,
+    seed_point: tuple[int, int],
+    threshold: int,
+) -> tuple[CleanupCandidateEvaluation, ...]:
+    """Measure every valid cleanup candidate against the same raw component.
+
+    This stage intentionally computes no aggregate score and chooses no winner.
+    ``internal_dark_cleanup`` is the agreed absolute reduction in internal-dark
+    fraction; all other terms retain the existing dimensionless normalization.
+    """
+    candidates = seed_connected_cleanup_candidates(component, seed_point)
+    raw_topology = _component_descriptor(candidates["raw"], int(threshold))
+    base_area = max(float(raw_topology.area), 1.0)
+    base_contour = max(float(raw_topology.contour_n), 1.0)
+    base_roughness = max(float(raw_topology.roughness), 1e-12)
+    base_solidity = max(float(raw_topology.solidity), 1e-12)
+    solidity_headroom = max(1.0 - float(raw_topology.solidity), 1e-12)
+
+    rows: list[CleanupCandidateEvaluation] = []
+    for name in CLEANUP_CANDIDATE_ORDER:
+        candidate = candidates.get(name)
+        if candidate is None:
+            continue
+        topology = raw_topology if name == "raw" else _component_descriptor(candidate, int(threshold))
+        contour_cleanup = max(0.0, 1.0 - float(topology.contour_n) / base_contour)
+        roughness_cleanup = max(0.0, 1.0 - float(topology.roughness) / base_roughness)
+        solidity_gain = max(
+            0.0,
+            (float(topology.solidity) - float(raw_topology.solidity)) / solidity_headroom,
+        )
+        internal_dark_cleanup = max(
+            0.0,
+            float(raw_topology.internal_dark_fraction) - float(topology.internal_dark_fraction),
+        )
+        area_loss = max(0.0, 1.0 - float(topology.area) / base_area)
+        solidity_loss = max(
+            0.0,
+            (float(raw_topology.solidity) - float(topology.solidity)) / base_solidity,
+        )
+        rows.append(
+            CleanupCandidateEvaluation(
+                name=name,
+                mask=candidate,
+                topology=topology,
+                metrics=CleanupMetrics(
+                    contour_cleanup=float(contour_cleanup),
+                    roughness_cleanup=float(roughness_cleanup),
+                    solidity_gain=float(solidity_gain),
+                    internal_dark_cleanup=float(internal_dark_cleanup),
+                    area_loss=float(area_loss),
+                    solidity_loss=float(solidity_loss),
+                ),
+            )
+        )
+    return tuple(rows)
 
 
 # ---------------------------------------------------------------------------
