@@ -107,10 +107,10 @@ jobs:
           git diff --cached --check
           git commit -m 'Add morphology quality measurements'
 
-      - name: Full regression suite
+      - name: Full retained test regression
         run: |
           python -m py_compile circle_arc_detector.py
-          xvfb-run -a python -m pytest -q
+          xvfb-run -a python -m pytest -q tests
           git diff --check
           test -z "$(git status --porcelain --untracked-files=no)"
 
