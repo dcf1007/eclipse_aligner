@@ -1,0 +1,230 @@
+    )
+    s = replace_once(
+        s,
+        '''    hull = cv2.convexHull(contour)
+    hull_area = float(cv2.contourArea(hull))
+    solidity = float(area / hull_area) if hull_area > 0.0 else 0.0
+    roughness = float(perimeter / max(2.0 * math.sqrt(math.pi * area), 1e-9))
+    return ThresholdTopology(
+        threshold=int(threshold),
+        area=area,
+        contour_n=contour_n,
+        perimeter=perimeter,
+        roughness=roughness,
+        solidity=solidity,
+    )
+''',
+        '''    hull = cv2.convexHull(contour)
+    hull_area = float(cv2.contourArea(hull))
+    solidity = float(area / hull_area) if hull_area > 0.0 else 0.0
+    roughness = float(perimeter / max(2.0 * math.sqrt(math.pi * area), 1e-9))
+
+    # Internal dark fraction is measured in raster pixels, not contourArea. Fill
+    # the selected external contour, then count original component pixels (N1) and
+    # missing/dark pixels (N0) inside that fill.
+    filled = np.zeros(component.shape, dtype=np.uint8)
+    cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
+    filled_bool = filled != 0
+    n1 = int(np.count_nonzero(component & filled_bool))
+    n0 = int(np.count_nonzero(filled_bool & ~component))
+    total = n0 + n1
+    internal_dark_fraction = float(n0 / total) if total else 0.0
+
+    return ThresholdTopology(
+        threshold=int(threshold),
+        area=area,
+        contour_n=contour_n,
+        perimeter=perimeter,
+        roughness=roughness,
+        solidity=solidity,
+        internal_dark_fraction=internal_dark_fraction,
+    )
+''',
+        "descriptor internal-dark metric",
+    )
+    SOURCE.write_text(s, encoding="utf-8")
+    write(
+        ROOT / "tests/test_internal_dark_descriptor.py",
+        '''import cv2
+import numpy as np
+import circle_arc_detector as cad
+
+
+def test_filled_component_has_zero_internal_dark_fraction():
+    mask=np.zeros((51,51),bool)
+    cv2.circle(mask.view(np.uint8),(25,25),15,1,-1)
+    d=cad._component_descriptor(mask,7)
+    assert d.internal_dark_fraction == 0.0
+
+
+def test_internal_dark_fraction_counts_binary_pixels_inside_external_fill():
+    mask=np.zeros((51,51),bool)
+    cv2.rectangle(mask.view(np.uint8),(10,10),(40,40),1,-1)
+    mask[20:25,22:29]=False
+    d=cad._component_descriptor(mask,9)
+    filled=np.zeros(mask.shape,np.uint8)
+    contours,_=cv2.findContours(np.where(mask,255,0).astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_NONE)
+    contour=max(contours,key=cv2.contourArea)
+    cv2.drawContours(filled,[contour],-1,1,cv2.FILLED)
+    f=filled!=0
+    n1=np.count_nonzero(mask & f); n0=np.count_nonzero(f & ~mask)
+    assert d.internal_dark_fraction == n0/(n0+n1)
+    assert n0 == 35
+
+
+def test_existing_topology_construction_remains_backward_compatible():
+    row=cad.ThresholdTopology(10,100,20,25.0,1.2,0.9)
+    assert row.internal_dark_fraction == 0.0
+''',
+    )
+
+
+def stage_d() -> None:
+    s = SOURCE.read_text(encoding="utf-8")
+    anchor = "\n\n# ---------------------------------------------------------------------------\n# Final-T full-resolution solar resolution and persistence\n# ---------------------------------------------------------------------------\n"
+    idx = s.index(anchor)
+    block = '''
+
+def seed_connected_cleanup_candidates(
+    component: np.ndarray,
+    seed_point: tuple[int, int],
+) -> dict[str, np.ndarray]:
+    """Return only cleanup candidates whose seed survives, retaining its 8-component.
+
+    OPEN can sever a thin bridge while leaving detached bright material elsewhere.
+    Such material is not part of the authoritative solar component. Each surviving
+    candidate is therefore reduced to the 8-connected component containing the
+    authoritative seed. Morphology candidates that remove the seed are rejected.
+    """
+    raw = np.asarray(component, dtype=bool)
+    if raw.ndim != 2 or not np.any(raw):
+        raise ThresholdResolutionError("Raw cleanup component is empty")
+    sx, sy = map(int, seed_point)
+    height, width = raw.shape
+    if not (0 <= sx < width and 0 <= sy < height):
+        raise ThresholdResolutionError("Cleanup seed lies outside the component raster")
+    if not raw[sy, sx]:
+        raise ThresholdResolutionError("Cleanup seed lies outside the raw component")
+
+    candidates = cleanup_morphology_candidates(raw)
+    valid: dict[str, np.ndarray] = {}
+    for name in CLEANUP_CANDIDATE_ORDER:
+        candidate = candidates[name]
+        if not candidate[sy, sx]:
+            continue
+        flood = np.where(candidate, 255, 0).astype(np.uint8)
+        cv2.floodFill(flood, None, (sx, sy), 128, flags=8)
+        connected = flood == 128
+        if np.any(connected):
+            valid[name] = connected
+
+    if "raw" not in valid:
+        raise ThresholdResolutionError("Raw cleanup component lost its authoritative seed")
+    return valid
+'''
+    s = s[:idx] + block + s[idx:]
+    SOURCE.write_text(s, encoding="utf-8")
+    write(
+        ROOT / "tests/test_seed_connected_cleanup_candidates.py",
+        '''import cv2
+import numpy as np
+import pytest
+import circle_arc_detector as cad
+
+
+def test_cleanup_retains_only_component_containing_authoritative_seed():
+    raw=np.zeros((101,151),bool)
+    cv2.circle(raw.view(np.uint8),(45,50),20,1,-1)
+    cv2.circle(raw.view(np.uint8),(115,50),14,1,-1)
+    raw[49:52,65:102]=True
+    out=cad.seed_connected_cleanup_candidates(raw,(45,50))
+    assert out['raw'][50,115]
+    severed=[name for name in out if not out[name][50,115]]
+    assert severed
+    for name in severed:
+        assert out[name][50,45]
+
+
+def test_candidate_that_removes_seed_is_rejected(monkeypatch):
+    raw=np.zeros((41,41),bool); raw[10:31,10:31]=True; seed=(20,20)
+    original=cad.cleanup_morphology_candidates
+    def fake(component):
+        d=original(component)
+        d['D7']=d['D7'].copy(); d['D7'][seed[1],seed[0]]=False
+        return d
+    monkeypatch.setattr(cad,'cleanup_morphology_candidates',fake)
+    out=cad.seed_connected_cleanup_candidates(raw,seed)
+    assert 'raw' in out
+    assert 'D7' not in out
+
+
+def test_raw_component_without_seed_is_an_invariant_error():
+    raw=np.zeros((21,21),bool); raw[5:10,5:10]=True
+    with pytest.raises(cad.ThresholdResolutionError,match='outside the raw'):
+        cad.seed_connected_cleanup_candidates(raw,(15,15))
+''',
+    )
+
+
+def stage_e() -> None:
+    s = SOURCE.read_text(encoding="utf-8")
+    anchor = "@dataclass(frozen=True)\nclass ThresholdTopologySelection:\n"
+    idx = s.index(anchor)
+    block = '''@dataclass(frozen=True)
+class CleanupMetrics:
+    """Unweighted cleanup benefit/cost terms measured against one raw component."""
+
+    contour_cleanup: float
+    roughness_cleanup: float
+    solidity_gain: float
+    internal_dark_cleanup: float
+    area_loss: float
+    solidity_loss: float
+
+
+@dataclass(frozen=True)
+class CleanupCandidateEvaluation:
+    name: str
+    mask: np.ndarray
+    topology: ThresholdTopology
+    metrics: CleanupMetrics
+
+
+'''
+    s = s[:idx] + block + s[idx:]
+    anchor2 = "\n\n# ---------------------------------------------------------------------------\n# Final-T full-resolution solar resolution and persistence\n# ---------------------------------------------------------------------------\n"
+    idx = s.index(anchor2)
+    block2 = '''
+
+def evaluate_cleanup_candidates(
+    component: np.ndarray,
+    seed_point: tuple[int, int],
+    threshold: int,
+) -> tuple[CleanupCandidateEvaluation, ...]:
+    """Measure every valid cleanup candidate against the same raw component.
+
+    This stage intentionally computes no aggregate score and chooses no winner.
+    ``internal_dark_cleanup`` is the agreed absolute reduction in internal-dark
+    fraction; all other terms retain the existing dimensionless normalization.
+    """
+    candidates = seed_connected_cleanup_candidates(component, seed_point)
+    raw_topology = _component_descriptor(candidates["raw"], int(threshold))
+    base_area = max(float(raw_topology.area), 1.0)
+    base_contour = max(float(raw_topology.contour_n), 1.0)
+    base_roughness = max(float(raw_topology.roughness), 1e-12)
+    base_solidity = max(float(raw_topology.solidity), 1e-12)
+    solidity_headroom = max(1.0 - float(raw_topology.solidity), 1e-12)
+
+    rows: list[CleanupCandidateEvaluation] = []
+    for name in CLEANUP_CANDIDATE_ORDER:
+        candidate = candidates.get(name)
+        if candidate is None:
+            continue
+        topology = raw_topology if name == "raw" else _component_descriptor(candidate, int(threshold))
+        contour_cleanup = max(0.0, 1.0 - float(topology.contour_n) / base_contour)
+        roughness_cleanup = max(0.0, 1.0 - float(topology.roughness) / base_roughness)
+        solidity_gain = max(
+            0.0,
+            (float(topology.solidity) - float(raw_topology.solidity)) / solidity_headroom,
+        )
+        internal_dark_cleanup = max(
