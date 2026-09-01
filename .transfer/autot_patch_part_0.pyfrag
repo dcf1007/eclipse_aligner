@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Temporary deterministic patch driver for the agreed Auto-T refinement commits.
+
+This file is execution scaffolding only. It is intentionally removed from final
+feature-branch history after GitHub has tested the exact staged implementation.
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SOURCE = ROOT / "circle_arc_detector.py"
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected exactly one old block, found {count}")
+    return text.replace(old, new, 1)
+
+
+def replace_function(text: str, name: str, next_name: str, replacement: str) -> str:
+    start = text.index(f"def {name}(")
+    end = text.index(f"\ndef {next_name}(", start)
+    return text[:start] + replacement.rstrip() + "\n\n" + text[end + 1 :]
+
+
+def write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def stage_a() -> None:
+    s = SOURCE.read_text(encoding="utf-8")
+    s = replace_once(
+        s,
+        "TOPOLOGY_OPTIMIZATION_STEPS = 5\nSOLAR_COMPONENT_KERNEL_SIZE = 7\n",
+        "TOPOLOGY_OPTIMIZATION_STEPS = 5\n"
+        "TRACKING_SEED_KERNEL_SIZE = 5\n"
+        "TRACKING_SEED_KERNEL = np.ones(\n"
+        "    (TRACKING_SEED_KERNEL_SIZE, TRACKING_SEED_KERNEL_SIZE), dtype=np.uint8\n"
+        ")\n"
+        "SOLAR_COMPONENT_KERNEL_SIZE = 7\n",
+        "tracking seed constants",
+    )
+
+    seed_helper = '''def brightest_supported_component_point(
+    gray: np.ndarray,
+    component_u8: np.ndarray,
+    support_kernel: np.ndarray,
+) -> tuple[int, int]:
+    """Choose the brightest support-eligible component pixel; depth breaks ties.
+
+    The caller owns the support geometry. A tracking or authoritative seed must
+    survive one erosion by that exact kernel; there is deliberately no fallback
+    to unsupported component pixels.
+    """
+    source = (component_u8 != 0).astype(np.uint8)
+    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
+    if gray.shape != source.shape:
+        raise ValueError("gray and component must have identical shapes")
+    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
+        raise ValueError("support kernel must be a non-empty two-dimensional mask")
+    if not np.any(source):
+        raise ThresholdResolutionError("Empty component")
+
+    supported = cv2.erode(source, support_kernel, iterations=1) != 0
+    if not np.any(supported):
+        kh, kw = support_kernel.shape
+        raise ThresholdResolutionError(
+            f"Solar component has no {kw}x{kh}-supported interior seed"
+        )
+
+    max_gray = int(gray[supported].max())
+    brightest = supported & (gray == max_gray)
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    scores = np.where(brightest, distance, -1.0)
+    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    return int(x), int(y)
+
+
+def equivalent_full_resolution_seed_kernel(
+    full_shape: tuple[int, int],
+    work_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Return the square full-resolution support equivalent to the 5x5 work seed.
+
+    Scaling uses the realized maximum-dimension ratio. If ``work_shape`` is omitted,
+    it is the shape produced by the <=1200-pixel work-raster rule. The mapped size
+    is rounded to the nearest positive odd integer so the square remains centered.
+    """
+    fh, fw = map(int, full_shape)
+    if fh <= 0 or fw <= 0:
+        raise ValueError("full shape dimensions must be positive")
+    if work_shape is None:
+        work_max = min(max(fh, fw), WORK_MAX_DIM)
+    else:
+        sh, sw = map(int, work_shape)
+        if sh <= 0 or sw <= 0:
+            raise ValueError("work shape dimensions must be positive")
+        work_max = max(sh, sw)
+    mapped = TRACKING_SEED_KERNEL_SIZE * max(fh, fw) / float(work_max)
+    low = max(1, int(math.floor(mapped)))
+    if low % 2 == 0:
+        low -= 1
+    high = low + 2
+    size = low if abs(mapped - low) <= abs(high - mapped) else high
+    return np.ones((size, size), dtype=np.uint8)
+'''
+    start = s.index("def brightest_supported_component_point(")
+    end = s.index("\ndef largest_enclosed_bright_component", start)
+    s = s[:start] + seed_helper + "\n" + s[end + 1 :]
+
+    s = replace_once(
+        s,
+        '''        seed_threshold = int(threshold)
+        seed_mask = np.where(component, 255, 0).astype(np.uint8)
+        seed_point = brightest_supported_component_point(work_gray, seed_mask)
+        break
+''',
+        '''        candidate_mask = np.where(component, 255, 0).astype(np.uint8)
+        try:
+            candidate_seed = brightest_supported_component_point(
+                work_gray, candidate_mask, TRACKING_SEED_KERNEL
+            )
+        except ThresholdResolutionError:
+            continue
+        seed_threshold = int(threshold)
+        seed_mask = candidate_mask
+        seed_point = candidate_seed
+        break
+''',
+        "coarse supported-seed descent",
+    )
+    # The current branch message is this exact string. A historical local archive
+    # used the shorter variant; tolerate that only in this temporary driver.
+    if 'raise ThresholdResolutionError("No enclosed bright component exists")' in s:
+        s = s.replace(
+            'raise ThresholdResolutionError("No enclosed bright component exists")',
+            'raise ThresholdResolutionError("No 5x5-supported enclosed bright component exists through T=0")',
+            1,
+        )
+    elif 'raise ThresholdResolutionError("No 5x5-supported enclosed bright component exists through T=0")' not in s:
+        raise RuntimeError("coarse failure message: expected known block")
+
+    s = replace_once(
+        s,
+        '''    local = np.where(source, 255, 0).astype(np.uint8)
+    px, py = brightest_supported_component_point(local_gray, local)
+    return x0 + px, y0 + py
+''',
+        '''    local = np.where(source, 255, 0).astype(np.uint8)
+    support = equivalent_full_resolution_seed_kernel(full_gray.shape, work_shape)
+    px, py = brightest_supported_component_point(local_gray, local, support)
+    return x0 + px, y0 + py
+''',
+        "full-resolution mapped seed support",
+    )
+    s = replace_once(
+        s,
+        '''class AutoThresholdResult:
+    threshold: int
+    histogram_peak: int
+    histogram_left_edge: int
+    seed_threshold: int
+''',
+        '''class AutoThresholdResult:
+    threshold: int | None
+    histogram_peak: int
+    histogram_left_edge: int
+    seed_threshold: int | None
+''',
+        "nullable unresolved AutoThresholdResult",
+    )
+    s = replace_once(
+        s,
+        '''    except ThresholdResolutionError as exc:
+        result = AutoThresholdResult(
+            threshold=int(left_edge),
+            histogram_peak=int(peak),
+            histogram_left_edge=int(left_edge),
+            seed_threshold=int(left_edge),
+            coarse_threshold=None,
+            roi_seed_threshold=None,
+            full_seed_point=None,
+            used_guard=False,
+            resolved=False,
+            reason=str(exc),
+        )
+
+    image_state["auto_threshold_result"] = result
+    return int(result.threshold)
+''',
+        '''    except ThresholdResolutionError as exc:
+        result = AutoThresholdResult(
+            threshold=None,
+            histogram_peak=int(peak),
+            histogram_left_edge=int(left_edge),
+            seed_threshold=None,
+            coarse_threshold=None,
+            roi_seed_threshold=None,
+            full_seed_point=None,
+            used_guard=False,
+            resolved=False,
+            reason=str(exc),
+        )
+        image_state["auto_threshold_result"] = result
+        raise
+
+    image_state["auto_threshold_result"] = result
+    return int(result.threshold)
+''',
+        "remove histogram fallback",
+    )
+    s = replace_once(
+        s,
+        '''    raw_u8 = np.where(raw_component, 255, 0).astype(np.uint8)
+    seed_x, seed_y = brightest_supported_component_point(full_gray, raw_u8)
+''',
+        '''    raw_u8 = np.where(raw_component, 255, 0).astype(np.uint8)
+    full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)
+    seed_x, seed_y = brightest_supported_component_point(
+        full_gray, raw_u8, full_seed_support
+    )
+''',
+        "authoritative full-resolution seed support",
+    )
+    s = replace_once(
+        s,
