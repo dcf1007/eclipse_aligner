@@ -1,0 +1,230 @@
+        '''        if settings.threshold is None:
+            # None has one meaning only: this image has never had T initialized.
+            threshold = find_auto_threshold(self.gray_image, state)
+            self.commit_setting_change("threshold", threshold)
+        else:
+''',
+        '''        if settings.threshold is None:
+            # None has one meaning only: this image has never had T initialized.
+            try:
+                threshold = find_auto_threshold(self.gray_image, state)
+            except ThresholdResolutionError as exc:
+                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+            else:
+                self.commit_setting_change("threshold", threshold)
+        else:
+''',
+        "image-load Auto-T failure handling",
+    )
+
+    auto_start = s.index("    def auto_select_threshold(self):")
+    auto_end = s.index("\n\n    def auto_select_radius", auto_start)
+    auto_function = '''    def auto_select_threshold(self):
+        """Restore/recompute image-only Auto T, then commit it like any other T change."""
+        if self.gray_image is None or self.current_path is None:
+            self.status.set("Auto select threshold: no readable image is loaded.")
+            return
+
+        state = self.image_state[self.current_path]
+        result = state.get("auto_threshold_result")
+        if (
+            isinstance(result, AutoThresholdResult)
+            and result.resolved
+            and result.threshold is not None
+        ):
+            selected_threshold = int(result.threshold)
+        else:
+            try:
+                selected_threshold = find_auto_threshold(self.gray_image, state)
+            except ThresholdResolutionError as exc:
+                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+                return
+            result = state["auto_threshold_result"]
+
+        self.commit_setting_change("threshold", selected_threshold)
+
+        solar_data = state.get("solar_data")
+        if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
+            self.status.set(
+                "Automatic grayscale threshold selected: "
+                f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
+                f"histogram start={result.histogram_left_edge}); refined component displayed."
+            )
+'''
+    s = s[:auto_start] + auto_function + s[auto_end:]
+
+    s = s.replace(
+        '''selects the lowest full-resolution threshold whose tracked component is genuinely
+separated. If topology cannot be resolved, the deterministic fallback is the left
+edge of the rightmost histogram peak. No HSV/color thresholding, Otsu thresholding,''',
+        '''selects the lowest full-resolution threshold whose tracked component is genuinely
+separated. If no supported solar seed can be established through T=0, Auto-T fails
+explicitly instead of substituting the histogram left edge. No HSV/color thresholding, Otsu thresholding,''',
+        1,
+    )
+    SOURCE.write_text(s, encoding="utf-8")
+
+    write(
+        ROOT / "snippets/bright_supported_seed_helper.py",
+        '''"""Explicit-kernel supported solar-seed selection helper.
+
+The caller owns support geometry. Unsupported components fail explicitly; there is
+no fallback to a boundary/thin pixel that did not survive the requested erosion.
+"""
+import cv2
+import numpy as np
+
+
+class ThresholdResolutionError(RuntimeError):
+    """Raised when a component cannot supply the requested supported seed."""
+
+
+def brightest_supported_component_point(
+    gray: np.ndarray,
+    component_u8: np.ndarray,
+    support_kernel: np.ndarray,
+) -> tuple[int, int]:
+    """Choose brightest support-eligible pixel; depth breaks brightness ties."""
+    source = (component_u8 != 0).astype(np.uint8)
+    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
+    if gray.shape != source.shape:
+        raise ValueError("gray and component must have identical shapes")
+    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
+        raise ValueError("support kernel must be a non-empty two-dimensional mask")
+    if not np.any(source):
+        raise ThresholdResolutionError("Empty component")
+    supported = cv2.erode(source, support_kernel, iterations=1) != 0
+    if not np.any(supported):
+        kh, kw = support_kernel.shape
+        raise ThresholdResolutionError(
+            f"Solar component has no {kw}x{kh}-supported interior seed"
+        )
+    max_gray = int(gray[supported].max())
+    brightest = supported & (gray == max_gray)
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    scores = np.where(brightest, distance, -1.0)
+    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    return int(x), int(y)
+''',
+    )
+
+    write(
+        ROOT / "tests/test_bright_supported_seed.py",
+        '''import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "snippets"))
+import bright_supported_seed_helper as seed
+
+
+SQUARE_5 = np.ones((5, 5), np.uint8)
+
+
+def test_hot_boundary_pixel_does_not_win_over_supported_solar_core():
+    gray = np.zeros((41, 41), np.uint8)
+    component = np.zeros_like(gray)
+    component[7:34, 7:34] = 255
+    gray[7:34, 7:34] = 180
+    gray[7, 20] = 255
+    gray[18:23, 18:23] = 230
+    x, y = seed.brightest_supported_component_point(gray, component, SQUARE_5)
+    assert gray[y, x] == 230
+
+
+def test_equal_brightness_prefers_deeper_supported_pixel():
+    gray = np.zeros((41, 41), np.uint8)
+    component = np.zeros_like(gray)
+    cv2.circle(component, (20, 20), 14, 255, -1)
+    gray[14, 20] = 240
+    gray[20, 20] = 240
+    assert seed.brightest_supported_component_point(gray, component, SQUARE_5) == (20, 20)
+
+
+def test_thin_component_without_requested_support_is_error_not_fallback():
+    gray = np.zeros((15, 15), np.uint8)
+    component = np.zeros_like(gray)
+    component[7, 2:13] = 255
+    gray[7, 9] = 220
+    with pytest.raises(seed.ThresholdResolutionError, match="5x5-supported"):
+        seed.brightest_supported_component_point(gray, component, SQUARE_5)
+
+
+def test_support_geometry_is_explicit():
+    gray = np.zeros((15, 15), np.uint8)
+    component = np.zeros_like(gray)
+    component[7, 2:13] = 255
+    gray[7, 9] = 220
+    assert seed.brightest_supported_component_point(
+        gray, component, np.ones((1, 1), np.uint8)
+    ) == (9, 7)
+''',
+    )
+
+    write(
+        ROOT / "tests/test_threshold_finder.py",
+        '''"""Synthetic regression tests for the integrated grayscale-only Auto-T finder."""
+import math
+
+import cv2
+import numpy as np
+import pytest
+
+import circle_arc_detector as tf
+
+
+def synthetic_bridge_image():
+    gray = np.zeros((220, 320), dtype=np.uint8)
+    cv2.circle(gray, (180, 110), 46, 30, -1)
+    gray[106:115, 0:180] = 8
+    cv2.circle(gray, (190, 105), 12, 70, -1)
+    return gray
+
+
+def run_auto(gray):
+    state = {"settings": tf.ImageSettings(), "auto_threshold_result": None, "solar_data": None}
+    threshold = tf.find_auto_threshold(gray, state)
+    return threshold, state["auto_threshold_result"]
+
+
+def test_threshold_semantics_and_lowest_separation():
+    threshold, result = run_auto(synthetic_bridge_image())
+    assert result.resolved
+    assert threshold == result.threshold == 8
+
+
+def test_find_rightmost_histogram_peak_has_left_edge():
+    peak, left = tf.find_rightmost_histogram_peak(synthetic_bridge_image())
+    assert peak >= 60
+    assert 0 <= left < peak
+
+
+def test_unresolved_auto_fails_instead_of_returning_histogram_left_edge():
+    gray = np.full((80, 120), 100, dtype=np.uint8)
+    peak, left = tf.find_rightmost_histogram_peak(gray)
+    state = {"settings": tf.ImageSettings(), "auto_threshold_result": None, "solar_data": None}
+    with pytest.raises(tf.ThresholdResolutionError):
+        tf.find_auto_threshold(gray, state)
+    result = state["auto_threshold_result"]
+    assert not result.resolved
+    assert result.threshold is None
+    assert result.seed_threshold is None
+    assert result.histogram_peak == peak
+    assert result.histogram_left_edge == left
+
+
+def test_sqrt_pixel_scale_preserves_linear_scaling():
+    base = math.sqrt(6016 * 4000)
+    half_linear = math.sqrt(3008 * 2000)
+    assert abs(half_linear / base - 0.5) < 1e-12
+    assert round(tf.ROI_DILATION_FRACTION * base) == 319
+    assert round(tf.GUARD_DILATION_FRACTION * base) == 957
+
+
+def test_working_resize_is_1200_max_and_grayscale_area():
+    gray = np.arange(2000 * 1000, dtype=np.uint32).reshape(2000, 1000)
+    gray = (gray % 256).astype(np.uint8)
+    work = tf.resize_gray_max_dim(gray)
