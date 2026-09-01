@@ -820,6 +820,63 @@ def find_auto_threshold(
 
 
 # ---------------------------------------------------------------------------
+# Cleanup morphology candidates
+# ---------------------------------------------------------------------------
+CLEANUP_KERNEL_SIZES = (3, 5, 7)
+CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
+
+
+def euclidean_disk_kernel(size: int) -> np.ndarray:
+    """Return a centered discrete L2 disk for one positive odd kernel size."""
+    size = int(size)
+    if size <= 0 or size % 2 == 0:
+        raise ValueError("cleanup kernel size must be a positive odd integer")
+    radius = size // 2
+    yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+    return ((xx * xx + yy * yy) <= radius * radius).astype(np.uint8)
+
+
+def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Apply exactly one binary OPEN followed by one CLOSE with ``kernel``."""
+    component = np.asarray(component, dtype=bool)
+    kernel = np.asarray(kernel, dtype=np.uint8)
+    if component.ndim != 2 or not np.any(component):
+        raise ValueError("component mask must be a non-empty two-dimensional mask")
+    if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
+        raise ValueError("cleanup kernel must be a non-empty two-dimensional mask")
+    u8 = np.where(component, 255, 0).astype(np.uint8)
+    opened = cv2.morphologyEx(u8, cv2.MORPH_OPEN, kernel, iterations=1)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return closed != 0
+
+
+def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray]:
+    """Build raw, direct 3/5/7, and progressive 3->5 / 3->5->7 candidates.
+
+    Cleanup geometry is fixed to Euclidean disks. Progressive candidates use the
+    output of the preceding OPEN->CLOSE step rather than reapplying each kernel to
+    the raw component. No candidate selection or weighting is performed here.
+    """
+    raw = np.asarray(component, dtype=bool)
+    if raw.ndim != 2 or not np.any(raw):
+        raise ValueError("component mask must be a non-empty two-dimensional mask")
+    k3, k5, k7 = (euclidean_disk_kernel(size) for size in CLEANUP_KERNEL_SIZES)
+    d3 = open_close_component(raw, k3)
+    d5 = open_close_component(raw, k5)
+    d7 = open_close_component(raw, k7)
+    p35 = open_close_component(d3, k5)
+    p357 = open_close_component(p35, k7)
+    return {
+        "raw": raw.copy(),
+        "D3": d3,
+        "D5": d5,
+        "D7": d7,
+        "P35": p35,
+        "P357": p357,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Final-T full-resolution solar resolution and persistence
 # ---------------------------------------------------------------------------
 def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
