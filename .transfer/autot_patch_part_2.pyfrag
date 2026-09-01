@@ -1,0 +1,230 @@
+    assert max(work.shape) == 1200
+    assert work.shape == (1200, 600)
+    assert work.ndim == 2
+''',
+    )
+
+    # Narrowly update the existing unified-architecture test rather than replacing
+    # its unrelated GUI/persistence coverage.
+    tp = ROOT / "tests/test_agreed_threshold_unification.py"
+    t = tp.read_text(encoding="utf-8")
+    first_start = t.index("def test_seed_support_regresses_to_5x5_square_with_thin_component_fallback():")
+    first_end = t.index("\ndef test_seed_rule_is_brightest_supported_then_innermost_tie_break", first_start)
+    first = '''def test_seed_support_is_explicit_5x5_square_with_no_fallback():
+    assert cad.TRACKING_SEED_KERNEL.shape == (5, 5)
+    assert np.all(cad.TRACKING_SEED_KERNEL == 1)
+    gray = np.zeros((21, 21), np.uint8)
+    thin = np.zeros_like(gray)
+    thin[10, 4:17] = 255
+    gray[10, 10] = 250
+    with pytest.raises(cad.ThresholdResolutionError, match="5x5-supported"):
+        cad.brightest_supported_component_point(gray, thin, cad.TRACKING_SEED_KERNEL)
+
+'''
+    t = t[:first_start] + first + t[first_end + 1 :]
+    t = replace_once(
+        t,
+        "assert cad.brightest_supported_component_point(gray, component) == (25, 25)",
+        "assert cad.brightest_supported_component_point(gray, component, cad.TRACKING_SEED_KERNEL) == (25, 25)",
+        "unification supported seed call",
+    )
+    t = replace_once(
+        t,
+        'assert "seed_x, seed_y = brightest_supported_component_point(full_gray, raw_u8)" in source',
+        'assert "full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)" in source',
+        "unification resolver source assertion",
+    )
+    tp.write_text(t, encoding="utf-8")
+
+    write(
+        ROOT / "tests/test_autot_seed_support_refinement.py",
+        '''import numpy as np
+import pytest
+import circle_arc_detector as cad
+
+
+def test_seed_helper_uses_explicit_kernel_and_has_no_fallback():
+    gray=np.zeros((21,21),np.uint8); comp=np.zeros_like(gray); comp[10,3:18]=255; gray[10,10]=250
+    with pytest.raises(cad.ThresholdResolutionError, match='5x5-supported'):
+        cad.brightest_supported_component_point(gray, comp, np.ones((5,5),np.uint8))
+    assert cad.brightest_supported_component_point(gray, comp, np.ones((1,1),np.uint8)) == (10,10)
+
+
+def test_work_seed_kernel_is_fixed_5x5_square():
+    assert cad.TRACKING_SEED_KERNEL.shape == (5,5)
+    assert np.all(cad.TRACKING_SEED_KERNEL == 1)
+
+
+def test_full_seed_support_maps_6016_to_25_square():
+    k=cad.equivalent_full_resolution_seed_kernel((4000,6016),(798,1200))
+    assert k.shape == (25,25)
+    assert np.all(k == 1)
+
+
+def test_full_seed_support_stays_5_if_no_downscale():
+    assert cad.equivalent_full_resolution_seed_kernel((800,1200)).shape == (5,5)
+
+
+def test_coarse_search_continues_below_unsupported_candidate(monkeypatch):
+    gray=np.zeros((31,31),np.uint8)
+    gray[11:20,11:20]=15
+    gray[14:17,14:17]=30
+    monkeypatch.setattr(cad,'find_rightmost_histogram_peak',lambda _g:(30,20))
+    result=cad.coarse_threshold_search(gray)
+    assert result.seed_threshold == 14
+
+
+def test_coarse_search_errors_if_nothing_supported_through_zero(monkeypatch):
+    gray=np.zeros((21,21),np.uint8); gray[9:12,9:12]=30
+    monkeypatch.setattr(cad,'find_rightmost_histogram_peak',lambda _g:(30,20))
+    with pytest.raises(cad.ThresholdResolutionError, match='through T=0'):
+        cad.coarse_threshold_search(gray)
+
+
+def test_unresolved_auto_is_stored_but_not_returned_as_histogram_fallback():
+    gray=np.full((40,50),100,np.uint8)
+    state={'settings':cad.ImageSettings(),'auto_threshold_result':None,'solar_data':None}
+    with pytest.raises(cad.ThresholdResolutionError):
+        cad.find_auto_threshold(gray,state)
+    r=state['auto_threshold_result']
+    assert not r.resolved
+    assert r.threshold is None
+    assert r.seed_threshold is None
+''',
+    )
+
+
+def stage_b() -> None:
+    s = SOURCE.read_text(encoding="utf-8")
+    anchor = "# ---------------------------------------------------------------------------\n# Final-T full-resolution solar resolution and persistence\n# ---------------------------------------------------------------------------\n"
+    if anchor not in s:
+        raise RuntimeError("stage B anchor missing")
+    block = '''# ---------------------------------------------------------------------------
+# Cleanup morphology candidates
+# ---------------------------------------------------------------------------
+CLEANUP_KERNEL_SIZES = (3, 5, 7)
+CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
+
+
+def euclidean_disk_kernel(size: int) -> np.ndarray:
+    """Return a centered discrete L2 disk for one positive odd kernel size."""
+    size = int(size)
+    if size <= 0 or size % 2 == 0:
+        raise ValueError("cleanup kernel size must be a positive odd integer")
+    radius = size // 2
+    yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+    return ((xx * xx + yy * yy) <= radius * radius).astype(np.uint8)
+
+
+def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Apply exactly one binary OPEN followed by one CLOSE with ``kernel``."""
+    component = np.asarray(component, dtype=bool)
+    kernel = np.asarray(kernel, dtype=np.uint8)
+    if component.ndim != 2 or not np.any(component):
+        raise ValueError("component mask must be a non-empty two-dimensional mask")
+    if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
+        raise ValueError("cleanup kernel must be a non-empty two-dimensional mask")
+    u8 = np.where(component, 255, 0).astype(np.uint8)
+    opened = cv2.morphologyEx(u8, cv2.MORPH_OPEN, kernel, iterations=1)
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return closed != 0
+
+
+def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray]:
+    """Build raw, direct 3/5/7, and progressive 3->5 / 3->5->7 candidates.
+
+    Cleanup geometry is fixed to Euclidean disks. Progressive candidates use the
+    output of the preceding OPEN->CLOSE step rather than reapplying each kernel to
+    the raw component. No candidate selection or weighting is performed here.
+    """
+    raw = np.asarray(component, dtype=bool)
+    if raw.ndim != 2 or not np.any(raw):
+        raise ValueError("component mask must be a non-empty two-dimensional mask")
+    k3, k5, k7 = (euclidean_disk_kernel(size) for size in CLEANUP_KERNEL_SIZES)
+    d3 = open_close_component(raw, k3)
+    d5 = open_close_component(raw, k5)
+    d7 = open_close_component(raw, k7)
+    p35 = open_close_component(d3, k5)
+    p357 = open_close_component(p35, k7)
+    return {
+        "raw": raw.copy(),
+        "D3": d3,
+        "D5": d5,
+        "D7": d7,
+        "P35": p35,
+        "P357": p357,
+    }
+
+
+'''
+    s = s.replace(anchor, block + anchor, 1)
+    SOURCE.write_text(s, encoding="utf-8")
+    write(
+        ROOT / "tests/test_euclidean_cleanup_candidates.py",
+        '''import cv2
+import numpy as np
+import pytest
+import circle_arc_detector as cad
+
+
+def oc(mask,kernel):
+    u8=np.where(mask,255,0).astype(np.uint8)
+    a=cv2.morphologyEx(u8,cv2.MORPH_OPEN,kernel,iterations=1)
+    b=cv2.morphologyEx(a,cv2.MORPH_CLOSE,kernel,iterations=1)
+    return b!=0
+
+
+def test_euclidean_disk_footprints_are_exact():
+    assert cad.euclidean_disk_kernel(3).sum() == 5
+    assert cad.euclidean_disk_kernel(5).sum() == 13
+    assert cad.euclidean_disk_kernel(7).sum() == 29
+    for size in (3,5,7):
+        k=cad.euclidean_disk_kernel(size)
+        assert np.array_equal(k,np.rot90(k))
+    with pytest.raises(ValueError): cad.euclidean_disk_kernel(4)
+
+
+def test_candidate_paths_are_direct_and_progressive_open_close():
+    raw=np.zeros((61,61),bool)
+    cv2.circle(raw.view(np.uint8),(30,30),18,1,-1)
+    raw[30,49:55]=True
+    candidates=cad.cleanup_morphology_candidates(raw)
+    assert tuple(candidates) == cad.CLEANUP_CANDIDATE_ORDER
+    k3,k5,k7=(cad.euclidean_disk_kernel(s) for s in (3,5,7))
+    assert np.array_equal(candidates['raw'],raw)
+    assert np.array_equal(candidates['D3'],oc(raw,k3))
+    assert np.array_equal(candidates['D5'],oc(raw,k5))
+    assert np.array_equal(candidates['D7'],oc(raw,k7))
+    assert np.array_equal(candidates['P35'],oc(oc(raw,k3),k5))
+    assert np.array_equal(candidates['P357'],oc(oc(oc(raw,k3),k5),k7))
+
+
+def test_cleanup_generation_does_not_replace_production_refiner_yet():
+    assert cad.SOLAR_COMPONENT_KERNEL.shape == (7,7)
+    assert cad.CLEANUP_CANDIDATE_ORDER[0] == 'raw'
+''',
+    )
+
+
+def stage_c() -> None:
+    s = SOURCE.read_text(encoding="utf-8")
+    s = replace_once(
+        s,
+        '''class ThresholdTopology:
+    threshold: int
+    area: int
+    contour_n: int
+    perimeter: float
+    roughness: float
+    solidity: float
+''',
+        '''class ThresholdTopology:
+    threshold: int
+    area: int
+    contour_n: int
+    perimeter: float
+    roughness: float
+    solidity: float
+    internal_dark_fraction: float = 0.0
+''',
+        "ThresholdTopology internal-dark field",
