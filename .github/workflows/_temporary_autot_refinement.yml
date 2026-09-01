@@ -1,0 +1,118 @@
+name: Temporary Auto-T refinement transfer
+
+on:
+  push:
+    branches:
+      - tmp/autot-refinement-transfer-20260901
+    paths:
+      - .github/workflows/_temporary_autot_refinement.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-tested-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy opencv-python-headless
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+
+      - name: Reassemble deterministic patch driver
+        run: |
+          cat .transfer/autot_patch_part_0.pyfrag \
+              .transfer/autot_patch_part_1.pyfrag \
+              .transfer/autot_patch_part_2.pyfrag \
+              .transfer/autot_patch_part_3.pyfrag \
+              .transfer/autot_patch_part_4.pyfrag > autot_patch.py
+          python -m py_compile autot_patch.py
+          git config user.name 'OpenAI development transfer'
+          git config user.email 'openai-development@users.noreply.github.com'
+
+      - name: A - explicit scale-equivalent seed support
+        run: |
+          python autot_patch.py A
+          python -m py_compile circle_arc_detector.py snippets/bright_supported_seed_helper.py
+          xvfb-run -a python -m pytest -q \
+            tests/test_autot_seed_support_refinement.py \
+            tests/test_bright_supported_seed.py \
+            tests/test_threshold_finder.py \
+            tests/test_agreed_threshold_unification.py \
+            tests/test_gui_threshold_integration.py
+          git add circle_arc_detector.py \
+            snippets/bright_supported_seed_helper.py \
+            tests/test_autot_seed_support_refinement.py \
+            tests/test_bright_supported_seed.py \
+            tests/test_threshold_finder.py \
+            tests/test_agreed_threshold_unification.py
+          git diff --cached --check
+          git commit -m 'Make seed support explicit and scale-equivalent'
+
+      - name: B - Euclidean cleanup candidate generation
+        run: |
+          python autot_patch.py B
+          python -m py_compile circle_arc_detector.py
+          xvfb-run -a python -m pytest -q \
+            tests/test_autot_seed_support_refinement.py \
+            tests/test_euclidean_cleanup_candidates.py \
+            tests/test_refine_solar_component_mask.py
+          git add circle_arc_detector.py tests/test_euclidean_cleanup_candidates.py
+          git diff --cached --check
+          git commit -m 'Add Euclidean cleanup candidate generation'
+
+      - name: C - internal component porosity
+        run: |
+          python autot_patch.py C
+          python -m py_compile circle_arc_detector.py
+          xvfb-run -a python -m pytest -q \
+            tests/test_internal_dark_descriptor.py \
+            tests/test_topology_threshold_optimizer.py \
+            tests/test_threshold_topology_integration.py
+          git add circle_arc_detector.py tests/test_internal_dark_descriptor.py
+          git diff --cached --check
+          git commit -m 'Measure internal component porosity'
+
+      - name: D - seed-connected cleanup candidates
+        run: |
+          python autot_patch.py D
+          python -m py_compile circle_arc_detector.py
+          xvfb-run -a python -m pytest -q tests/test_seed_connected_cleanup_candidates.py
+          git add circle_arc_detector.py tests/test_seed_connected_cleanup_candidates.py
+          git diff --cached --check
+          git commit -m 'Enforce seed-connected cleanup candidates'
+
+      - name: E - unweighted morphology quality measurements
+        run: |
+          python autot_patch.py E
+          python -m py_compile circle_arc_detector.py snippets/report_cleanup_quality_measurements.py
+          xvfb-run -a python -m pytest -q \
+            tests/test_cleanup_quality_measurements.py \
+            tests/test_euclidean_cleanup_candidates.py \
+            tests/test_internal_dark_descriptor.py \
+            tests/test_seed_connected_cleanup_candidates.py
+          git add circle_arc_detector.py \
+            snippets/report_cleanup_quality_measurements.py \
+            tests/test_cleanup_quality_measurements.py
+          git diff --cached --check
+          git commit -m 'Add morphology quality measurements'
+
+      - name: Full regression suite
+        run: |
+          python -m py_compile circle_arc_detector.py
+          xvfb-run -a python -m pytest -q
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Push tested implementation chain to transfer branch
+        run: git push origin HEAD:tmp/autot-refinement-transfer-20260901
