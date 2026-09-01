@@ -890,6 +890,44 @@ def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray
     }
 
 
+def seed_connected_cleanup_candidates(
+    component: np.ndarray,
+    seed_point: tuple[int, int],
+) -> dict[str, np.ndarray]:
+    """Return only cleanup candidates whose seed survives, retaining its 8-component.
+
+    OPEN can sever a thin bridge while leaving detached bright material elsewhere.
+    Such material is not part of the authoritative solar component. Each surviving
+    candidate is therefore reduced to the 8-connected component containing the
+    authoritative seed. Morphology candidates that remove the seed are rejected.
+    """
+    raw = np.asarray(component, dtype=bool)
+    if raw.ndim != 2 or not np.any(raw):
+        raise ThresholdResolutionError("Raw cleanup component is empty")
+    sx, sy = map(int, seed_point)
+    height, width = raw.shape
+    if not (0 <= sx < width and 0 <= sy < height):
+        raise ThresholdResolutionError("Cleanup seed lies outside the component raster")
+    if not raw[sy, sx]:
+        raise ThresholdResolutionError("Cleanup seed lies outside the raw component")
+
+    candidates = cleanup_morphology_candidates(raw)
+    valid: dict[str, np.ndarray] = {}
+    for name in CLEANUP_CANDIDATE_ORDER:
+        candidate = candidates[name]
+        if not candidate[sy, sx]:
+            continue
+        flood = np.where(candidate, 255, 0).astype(np.uint8)
+        cv2.floodFill(flood, None, (sx, sy), 128, flags=8)
+        connected = flood == 128
+        if np.any(connected):
+            valid[name] = connected
+
+    if "raw" not in valid:
+        raise ThresholdResolutionError("Raw cleanup component lost its authoritative seed")
+    return valid
+
+
 # ---------------------------------------------------------------------------
 # Final-T full-resolution solar resolution and persistence
 # ---------------------------------------------------------------------------
