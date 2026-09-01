@@ -127,6 +127,7 @@ class ThresholdTopology:
     perimeter: float
     roughness: float
     solidity: float
+    internal_dark_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,18 @@ def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTop
     hull_area = float(cv2.contourArea(hull))
     solidity = float(area / hull_area) if hull_area > 0.0 else 0.0
     roughness = float(perimeter / max(2.0 * math.sqrt(math.pi * area), 1e-9))
+
+    # Internal dark fraction is measured in raster pixels, not contourArea. Fill
+    # the selected external contour, then count original component pixels (N1) and
+    # missing/dark pixels (N0) inside that fill.
+    filled = np.zeros(component.shape, dtype=np.uint8)
+    cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
+    filled_bool = filled != 0
+    n1 = int(np.count_nonzero(component & filled_bool))
+    n0 = int(np.count_nonzero(filled_bool & ~component))
+    total = n0 + n1
+    internal_dark_fraction = float(n0 / total) if total else 0.0
+
     return ThresholdTopology(
         threshold=int(threshold),
         area=area,
@@ -162,6 +175,7 @@ def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTop
         perimeter=perimeter,
         roughness=roughness,
         solidity=solidity,
+        internal_dark_fraction=internal_dark_fraction,
     )
 
 
