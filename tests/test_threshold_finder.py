@@ -3,6 +3,7 @@ import math
 
 import cv2
 import numpy as np
+import pytest
 
 import circle_arc_detector as tf
 
@@ -33,13 +34,18 @@ def test_find_rightmost_histogram_peak_has_left_edge():
     assert 0 <= left < peak
 
 
-def test_unresolved_falls_back_to_rightmost_peak_left_edge_and_is_stored():
+def test_unresolved_auto_fails_instead_of_returning_histogram_left_edge():
     gray = np.full((80, 120), 100, dtype=np.uint8)
     peak, left = tf.find_rightmost_histogram_peak(gray)
-    threshold, result = run_auto(gray)
+    state = {"settings": tf.ImageSettings(), "auto_threshold_result": None, "solar_data": None}
+    with pytest.raises(tf.ThresholdResolutionError):
+        tf.find_auto_threshold(gray, state)
+    result = state["auto_threshold_result"]
     assert not result.resolved
-    assert threshold == result.threshold == left
+    assert result.threshold is None
+    assert result.seed_threshold is None
     assert result.histogram_peak == peak
+    assert result.histogram_left_edge == left
 
 
 def test_sqrt_pixel_scale_preserves_linear_scaling():

@@ -62,17 +62,15 @@ def disk_gray(size=81, radius=20, threshold=100):
     return gray, threshold, center
 
 
-def test_seed_support_regresses_to_5x5_square_with_thin_component_fallback():
-    # Final component refinement remains the independent 7x7 elliptical OPEN/CLOSE.
-    assert cad.SOLAR_COMPONENT_KERNEL.shape == (7, 7)
-    assert cad.SOLAR_COMPONENT_KERNEL[3, 3] == 1
-    assert cad.SOLAR_COMPONENT_KERNEL[0, 0] == 0
-
+def test_seed_support_is_explicit_5x5_square_with_no_fallback():
+    assert cad.TRACKING_SEED_KERNEL.shape == (5, 5)
+    assert np.all(cad.TRACKING_SEED_KERNEL == 1)
     gray = np.zeros((21, 21), np.uint8)
     thin = np.zeros_like(gray)
     thin[10, 4:17] = 255
     gray[10, 10] = 250
-    assert cad.brightest_supported_component_point(gray, thin) == (10, 10)
+    with pytest.raises(cad.ThresholdResolutionError, match="5x5-supported"):
+        cad.brightest_supported_component_point(gray, thin, cad.TRACKING_SEED_KERNEL)
 
 def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray = np.zeros((51, 51), np.uint8)
@@ -85,7 +83,7 @@ def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray[25, 25] = 240
     gray[25, 30] = 240
 
-    assert cad.brightest_supported_component_point(gray, component) == (25, 25)
+    assert cad.brightest_supported_component_point(gray, component, cad.TRACKING_SEED_KERNEL) == (25, 25)
 
 
 def test_find_auto_threshold_writes_result_and_returns_threshold():
@@ -286,7 +284,7 @@ def test_resolve_threshold_is_atomic_solardata_writer():
     source = inspect.getsource(cad.resolve_threshold)
     assert 'image_state["solar_data"] = solar_data' in source
     assert "component_mask=compress_full_mask(refined_component)" in source
-    assert "seed_x, seed_y = brightest_supported_component_point(full_gray, raw_u8)" in source
+    assert "full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)" in source
     assert "Authoritative solar seed did not survive" in source
 
 
