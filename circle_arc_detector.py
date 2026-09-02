@@ -35,14 +35,17 @@ placeholder; both preview modes use full resolution today.
 
 The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
 ``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel working
-raster with INTER_AREA, uses the rightmost locally smoothed histogram mode only to
-establish a solar seed, tracks 8-connected component topology, maps the seed back
-to full resolution, constructs rounded 6.5% and 19.5% observation regions, and
-selects the lowest full-resolution threshold whose tracked component is genuinely
-separated. If no supported solar seed can be established through T=0, Auto-T fails
-explicitly instead of substituting the histogram left edge. No HSV/color thresholding, Otsu thresholding,
-ellipse-fit score, bright-pixel dominance, competitor gain, or horizon special case
-is part of automatic threshold selection.
+raster, starts from the left valley of the rightmost locally smoothed histogram mode,
+establishes one 5x5-supported work-resolution solar seed, and tracks that same
+8-connected component downward. The tracked work-resolution component is resized to
+full resolution only to delimit the full-resolution seed search and a rounded 10%
+guard. Auto-T then starts from the work-resolution T and searches only in the
+monotonic direction needed to find the lowest full-resolution threshold whose seeded
+component stays inside that fixed guard. If no supported work-resolution seed can be
+established through T=0, Auto-T fails explicitly instead of substituting a histogram
+fallback. No HSV/color thresholding, Otsu thresholding, ellipse-fit score,
+bright-pixel dominance, competitor gain, or horizon special case is part of
+automatic threshold selection.
 """
 
 import argparse
@@ -106,11 +109,9 @@ WORK_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 ROI_DILATION_FRACTION = 0.065
 GUARD_DILATION_FRACTION = 0.195
+AUTO_T_GUARD_DILATION_FRACTION = 0.10
 TOPOLOGY_OPTIMIZATION_STEPS = 5
 TRACKING_SEED_KERNEL_SIZE = 5
-TRACKING_SEED_KERNEL = np.ones(
-    (TRACKING_SEED_KERNEL_SIZE, TRACKING_SEED_KERNEL_SIZE), dtype=np.uint8
-)
 SOLAR_COMPONENT_KERNEL_SIZE = 7
 SOLAR_COMPONENT_KERNEL = cv2.getStructuringElement(
     cv2.MORPH_ELLIPSE,
@@ -348,44 +349,13 @@ class ThresholdResolutionError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class CoarseThresholdResult:
-    histogram_peak: int
-    histogram_left_edge: int
-    seed_threshold: int
-    seed_point: tuple[int, int]
-    seed_mask: np.ndarray
-    threshold: int
-    component_mask: np.ndarray
-    component_area: int
-    component_bbox: tuple[int, int, int, int]
-
-
-@dataclass(frozen=True)
 class AutoThresholdResult:
     threshold: int | None
-    histogram_peak: int
-    histogram_left_edge: int
-    seed_threshold: int | None
-    coarse_threshold: int | None
-    roi_seed_threshold: int | None
-    full_seed_point: tuple[int, int] | None
-    used_guard: bool
+    histogram_start_threshold: int
+    work_res_threshold: int | None
+    full_res_seed_point: tuple[int, int] | None
     resolved: bool
     reason: str = ""
-
-
-@dataclass(frozen=True)
-class ObservationRegion:
-    """Rounded component dilation stored in the smallest useful rectangular crop."""
-    bbox: tuple[int, int, int, int]       # x0, y0, x1, y1 in full image
-    allowed_u8: np.ndarray               # 255 inside rounded dilation, else 0
-    boundary: np.ndarray                 # True on the INNER edge of allowed region
-    gray: np.ndarray                     # view into full-resolution gray image
-    seed_local: tuple[int, int]
-    touches_left_image_edge: bool
-    touches_right_image_edge: bool
-    touches_top_image_edge: bool
-    touches_bottom_image_edge: bool
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
@@ -399,71 +369,94 @@ def to_gray(image: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
-def resize_gray_max_dim(gray: np.ndarray, max_dim: int = WORK_MAX_DIM) -> np.ndarray:
-    """Downscale grayscale with area averaging; never upscale."""
-    h, w = gray.shape
-    if max(h, w) <= max_dim:
-        return gray.copy()
-    scale = float(max_dim) / float(max(h, w))
-    return cv2.resize(
-        gray,
-        (max(1, round(w * scale)), max(1, round(h * scale))),
-        interpolation=cv2.INTER_AREA,
+def resize_img(
+    img: np.ndarray,
+    size: tuple[int | None, int | None],
+) -> np.ndarray:
+    """Resize raster to size, preserving aspect ratio if one dimension is omitted and dtype."""
+
+    original_dtype = img.dtype
+
+    h, w = img.shape[:2]
+    width, height = size
+
+    if width is None and height is None:
+        raise ValueError("resize size must provide width, height, or both")
+    if width is None:
+        height = int(height)
+        if height <= 0:
+            raise ValueError("resize height must be positive")
+        width = round(w * height / h)
+    elif height is None:
+        width = int(width)
+        if width <= 0:
+            raise ValueError("resize width must be positive")
+        height = round(h * width / w)
+    else:
+        width = int(width)
+        height = int(height)
+
+    if width <= 0 or height <= 0:
+        raise ValueError("resize dimensions must be positive")
+
+    if np.all((img == img.min()) | (img == img.max())):
+        img = img.astype(np.uint8)
+        interpolation = cv2.INTER_NEAREST_EXACT
+    elif width < w:
+        interpolation = cv2.INTER_AREA
+    else:
+        interpolation = cv2.INTER_LANCZOS4
+
+    resized = cv2.resize(
+        img,
+        (width, height),
+        interpolation=interpolation,
     )
 
+    return resized.astype(original_dtype)
 
-def find_rightmost_histogram_peak(gray: np.ndarray) -> tuple[int, int]:
-    """Return the rightmost 3-bin-smoothed mode and its preceding left valley."""
-    histogram = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+
+def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
+    """Return the left valley preceding the rightmost 3-bin-smoothed histogram mode."""
+    histogram = np.bincount(work_res_gray.ravel(), minlength=256).astype(np.float64)
     signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
 
     peaks: list[int] = []
     for index in range(1, len(signal) - 1):
         if signal[index] >= signal[index - 1] and signal[index] > signal[index + 1]:
             peaks.append(index)
-    # Saturation itself is allowed to be the rightmost histogram mode.
     if len(signal) >= 2 and signal[-1] > signal[-2]:
         peaks.append(len(signal) - 1)
-    peak = max(peaks or [int(np.argmax(signal))])
+    rightmost_peak = max(peaks or [int(np.argmax(signal))])
 
-    left_edge = 0
-    for index in range(peak - 1, 0, -1):
+    for index in range(rightmost_peak - 1, 0, -1):
         if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
-            left_edge = index
-            break
-
-    return int(peak), int(left_edge)
-
-
-
+            return int(index)
+    return 0
 
 
 def brightest_supported_component_point(
     gray: np.ndarray,
-    component_u8: np.ndarray,
+    component: np.ndarray,
     support_kernel: np.ndarray,
-) -> tuple[int, int]:
-    """Choose the brightest support-eligible component pixel; depth breaks ties.
+) -> tuple[int, int] | None:
+    """Return the brightest support-eligible component pixel; depth breaks ties.
 
-    The caller owns the support geometry. A tracking or authoritative seed must
-    survive one erosion by that exact kernel; there is deliberately no fallback
-    to unsupported component pixels.
+    The caller owns support geometry and the meaning of an unavailable point. Empty
+    or unsupported components return ``None``; malformed caller inputs remain errors.
     """
-    source = (component_u8 != 0).astype(np.uint8)
+    source = (np.asarray(component) != 0).astype(np.uint8)
     support_kernel = np.asarray(support_kernel, dtype=np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
     if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
         raise ValueError("support kernel must be a non-empty two-dimensional mask")
     if not np.any(source):
-        raise ThresholdResolutionError("Empty component")
+        return None
 
     supported = cv2.erode(source, support_kernel, iterations=1) != 0
     if not np.any(supported):
-        kh, kw = support_kernel.shape
-        raise ThresholdResolutionError(
-            f"Solar component has no {kw}x{kh}-supported interior seed"
-        )
+        return None
 
     max_gray = int(gray[supported].max())
     brightest = supported & (gray == max_gray)
@@ -472,34 +465,6 @@ def brightest_supported_component_point(
     y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
     return int(x), int(y)
 
-
-def equivalent_full_resolution_seed_kernel(
-    full_shape: tuple[int, int],
-    work_shape: tuple[int, int] | None = None,
-) -> np.ndarray:
-    """Return the square full-resolution support equivalent to the 5x5 work seed.
-
-    Scaling uses the realized maximum-dimension ratio. If ``work_shape`` is omitted,
-    it is the shape produced by the <=1200-pixel work-raster rule. The mapped size
-    is rounded to the nearest positive odd integer so the square remains centered.
-    """
-    fh, fw = map(int, full_shape)
-    if fh <= 0 or fw <= 0:
-        raise ValueError("full shape dimensions must be positive")
-    if work_shape is None:
-        work_max = min(max(fh, fw), WORK_MAX_DIM)
-    else:
-        sh, sw = map(int, work_shape)
-        if sh <= 0 or sw <= 0:
-            raise ValueError("work shape dimensions must be positive")
-        work_max = max(sh, sw)
-    mapped = TRACKING_SEED_KERNEL_SIZE * max(fh, fw) / float(work_max)
-    low = max(1, int(math.floor(mapped)))
-    if low % 2 == 0:
-        low -= 1
-    high = low + 2
-    size = low if abs(mapped - low) <= abs(high - mapped) else high
-    return np.ones((size, size), dtype=np.uint8)
 
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
@@ -525,324 +490,252 @@ def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     return labels == best[1]
 
 
-def _touches_image_border(component: np.ndarray | None) -> bool:
-    """Return whether a tracked component is absent or reaches the image boundary."""
-    if component is None or not np.any(component):
-        return True
-    return bool(
-        np.any(component[0])
-        or np.any(component[-1])
-        or np.any(component[:, 0])
-        or np.any(component[:, -1])
-    )
+def find_work_res_solar_component(
+    work_res_gray: np.ndarray,
+    start_T: int,
+    work_res_seed_kernel: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    """Establish one supported work-res seed, then track only that identity downward."""
+    seed: tuple[int, int] | None = None
+    work_res_T: int | None = None
+    work_res_component: np.ndarray | None = None
+    height, width = work_res_gray.shape
 
+    for threshold in range(int(start_T), -1, -1):
+        if seed is None:
+            component = largest_enclosed_bright_component(work_res_gray > threshold)
+            if component is not None:
+                seed = brightest_supported_component_point(
+                    work_res_gray,
+                    component,
+                    work_res_seed_kernel,
+                )
+                if seed is not None:
+                    work_res_T = int(threshold)
+                    work_res_component = component
+        else:
+            binary = work_res_gray > threshold
+            seed_x, seed_y = seed
+            if not (0 <= seed_x < width and 0 <= seed_y < height):
+                raise ThresholdResolutionError("Work-resolution seed lies outside the image")
+            if not bool(binary[seed_y, seed_x]):
+                raise ThresholdResolutionError(
+                    f"Work-resolution tracking seed is not light at T={threshold}"
+                )
 
-def coarse_threshold_search(work_gray: np.ndarray) -> CoarseThresholdResult:
-    """Establish the solar seed, then track it to the lowest enclosed coarse T."""
-    # Phase 1: histogram identity/start only. Descend from the left edge of the
-    # rightmost mode until the first enclosed bright component identifies the Sun.
-    peak, left_edge = find_rightmost_histogram_peak(work_gray)
-    seed_threshold = None
-    seed_point = None
-    seed_mask = None
-
-    for threshold in range(left_edge, -1, -1):
-        component = largest_enclosed_bright_component(work_gray > threshold)
-        if component is None:
-            continue
-        candidate_mask = np.where(component, 255, 0).astype(np.uint8)
-        try:
-            candidate_seed = brightest_supported_component_point(
-                work_gray, candidate_mask, TRACKING_SEED_KERNEL
+            flooded = np.where(binary, 255, 0).astype(np.uint8)
+            cv2.floodFill(flooded, None, seed, 128, flags=8)
+            component = flooded == 128
+            touches_border = bool(
+                np.any(component[0])
+                or np.any(component[-1])
+                or np.any(component[:, 0])
+                or np.any(component[:, -1])
             )
-        except ThresholdResolutionError:
-            continue
-        seed_threshold = int(threshold)
-        seed_mask = candidate_mask
-        seed_point = candidate_seed
-        break
+            if touches_border:
+                break
 
-    if seed_threshold is None or seed_point is None or seed_mask is None:
-        raise ThresholdResolutionError("No 5x5-supported enclosed bright component exists through T=0")
+            work_res_T = int(threshold)
+            work_res_component = component
 
-    # Phase 2: keep the same seed and lower T. Connectivity is monotone while T is
-    # lowered: pixels are only added, so once this tracked 8-connected component
-    # reaches the image border it cannot become enclosed again at a lower T.
-    lowest_threshold = seed_threshold
-    lowest_component = seed_mask != 0
-    seed_x, seed_y = seed_point
-    height, width = work_gray.shape
+    if seed is None or work_res_T is None or work_res_component is None:
+        raise ThresholdResolutionError(
+            "No 5x5-supported enclosed bright component exists through T=0"
+        )
 
-    for threshold in range(seed_threshold, -1, -1):
-        binary = work_gray > threshold
-        if not (0 <= seed_x < width and 0 <= seed_y < height) or not bool(binary[seed_y, seed_x]):
-            continue
-
-        flooded = cv2.compare(binary.astype(np.uint8), 0, cv2.CMP_GT)
-        cv2.floodFill(flooded, None, seed_point, 128, flags=8)
-        component = flooded == 128
-        if _touches_image_border(component):
-            break
-
-        lowest_threshold = threshold
-        lowest_component = component
-
-    ys, xs = np.nonzero(lowest_component)
-    if len(xs) == 0:
-        raise ThresholdResolutionError("Empty component")
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    component_area = int(len(xs))
-    component_bbox = (x0, y0, x1 - x0, y1 - y0)
-
-    return CoarseThresholdResult(
-        histogram_peak=peak,
-        histogram_left_edge=left_edge,
-        seed_threshold=seed_threshold,
-        seed_point=seed_point,
-        seed_mask=seed_mask,
-        threshold=int(lowest_threshold),
-        component_mask=np.where(lowest_component, 255, 0).astype(np.uint8),
-        component_area=component_area,
-        component_bbox=component_bbox,
-    )
+    return int(work_res_T), np.asarray(work_res_component, dtype=bool)
 
 
-def _map_interval(lo: int, hi: int, source_n: int, target_n: int) -> tuple[int, int]:
-    out_lo = int(math.floor(lo * target_n / source_n))
-    out_hi = int(math.ceil(hi * target_n / source_n))
-    return max(0, out_lo), min(target_n, max(out_lo + 1, out_hi))
-
-
-def establish_full_resolution_seed(
-    full_gray: np.ndarray,
-    work_shape: tuple[int, int],
-    coarse_seed_mask: np.ndarray,
-    seed_threshold: int,
-) -> tuple[int, int]:
-    """Map the coarse solar seed and choose a bright, well-supported source pixel."""
-    ys, xs = np.nonzero(coarse_seed_mask)
-    if len(xs) == 0:
-        raise ThresholdResolutionError("Coarse seed mask is empty")
-    sh, sw = work_shape
-    fh, fw = full_gray.shape
-    sx0, sx1 = int(xs.min()), int(xs.max()) + 1
-    sy0, sy1 = int(ys.min()), int(ys.max()) + 1
-    x0, x1 = _map_interval(sx0, sx1, sw, fw)
-    y0, y1 = _map_interval(sy0, sy1, sh, fh)
-
-    coarse_crop = (coarse_seed_mask[sy0:sy1, sx0:sx1] != 0).astype(np.uint8)
-    mapped = cv2.resize(coarse_crop, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST) != 0
-    local_gray = full_gray[y0:y1, x0:x1]
-    candidate = mapped & (local_gray > int(seed_threshold))
-
-    source = candidate if np.any(candidate) else mapped
-    if not np.any(source):
-        raise ThresholdResolutionError("Mapped solar seed is empty")
-
-    local = np.where(source, 255, 0).astype(np.uint8)
-    support = equivalent_full_resolution_seed_kernel(full_gray.shape, work_shape)
-    px, py = brightest_supported_component_point(local_gray, local, support)
-    return x0 + px, y0 + py
-
-
-def find_full_resolution_enclosed_seed_component(
-    full_gray: np.ndarray,
-    coarse_threshold: int,
-    seed_point: tuple[int, int],
-):
-    """Find an actual enclosed full-resolution component containing the solar seed."""
-    start_threshold = max(0, int(coarse_threshold))
-    seed_x, seed_y = seed_point
-
-    for threshold in range(start_threshold, 256):
-        binary = cv2.compare(full_gray, int(threshold), cv2.CMP_GT)
-        if binary[seed_y, seed_x] == 0:
-            continue
-
-        cv2.floodFill(binary, None, seed_point, 128, flags=8)
-        component = binary == 128
-        if not _touches_image_border(component):
-            return int(threshold), component
-
-        # Usually resolved at the coarse T or one level higher. The loop remains
-        # exhaustive so reduced-resolution mismatch cannot determine the final T.
-
-    raise ThresholdResolutionError(
-        "No enclosed original-resolution solar component"
-    )
-
-
-def _build_observation_region(
-    full_gray: np.ndarray,
-    component: np.ndarray,
-    margin: float,
-    seed_point: tuple[int, int],
-) -> ObservationRegion:
-    """Distance-dilate the actual component by margin and cache its inner boundary."""
-    ys, xs = np.nonzero(component)
-    if len(xs) == 0:
+def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
+    """Return a full-size rounded Euclidean dilation of one component mask."""
+    component = np.asarray(component_mask, dtype=bool)
+    if component.ndim != 2 or not np.any(component):
         raise ThresholdResolutionError("Cannot dilate empty solar component")
-    h, w = full_gray.shape
+
+    ys, xs = np.nonzero(component)
+    height, width = component.shape
     padding = max(0, int(math.ceil(float(margin))))
     x0 = max(0, int(xs.min()) - padding - 2)
-    x1 = min(w, int(xs.max()) + padding + 3)
+    x1 = min(width, int(xs.max()) + padding + 3)
     y0 = max(0, int(ys.min()) - padding - 2)
-    y1 = min(h, int(ys.max()) + padding + 3)
+    y1 = min(height, int(ys.max()) + padding + 3)
 
     component_crop = component[y0:y1, x0:x1]
     outside = np.where(component_crop, 0, 255).astype(np.uint8)
     distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
     allowed = distance <= float(margin)
-    allowed_u8 = np.where(allowed, 255, 0).astype(np.uint8)
 
-    # Inner edge of the rounded region. If the tracked component reaches it, the
-    # observation is inconclusive and the caller retries the same T in 19.5% guard.
-    eroded = cv2.erode(allowed_u8, np.ones((3, 3), np.uint8), iterations=1)
-    boundary = allowed & (eroded == 0)
+    full_mask = np.zeros(component.shape, dtype=bool)
+    full_mask[y0:y1, x0:x1] = allowed
+    return full_mask
 
-    return ObservationRegion(
-        bbox=(x0, y0, x1, y1),
-        allowed_u8=allowed_u8,
-        boundary=boundary,
-        gray=full_gray[y0:y1, x0:x1],
-        seed_local=(seed_point[0] - x0, seed_point[1] - y0),
-        touches_left_image_edge=x0 == 0,
-        touches_right_image_edge=x1 == w,
-        touches_top_image_edge=y0 == 0,
-        touches_bottom_image_edge=y1 == h,
+
+def find_lowest_full_res_threshold(
+    full_res_gray: np.ndarray,
+    start_T: int,
+    full_res_seed: tuple[int, int],
+    full_res_guard_mask: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    """Find the lowest enclosed full-res T by searching only the monotonic direction."""
+    if full_res_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
+    guard = np.asarray(full_res_guard_mask, dtype=bool)
+    if guard.shape != full_res_gray.shape:
+        raise ValueError("full-resolution guard and grayscale image must have identical shapes")
+    if not np.any(guard):
+        raise ThresholdResolutionError("Full-resolution Auto-T guard is empty")
+
+    seed_x, seed_y = map(int, full_res_seed)
+    height, width = full_res_gray.shape
+    if not (0 <= seed_x < width and 0 <= seed_y < height):
+        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the image")
+    if not guard[seed_y, seed_x]:
+        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
+
+    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
+    boundary_kernel = generate_kernel(3, round_kernel=False)
+    eroded_guard = cv2.erode(guard_u8, boundary_kernel, iterations=1) != 0
+    full_res_guard_boundary = guard & ~eroded_guard
+    full_res_guard_boundary[0, :] |= guard[0, :]
+    full_res_guard_boundary[-1, :] |= guard[-1, :]
+    full_res_guard_boundary[:, 0] |= guard[:, 0]
+    full_res_guard_boundary[:, -1] |= guard[:, -1]
+
+    start_T = int(start_T)
+    binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
+    cv2.bitwise_and(binary, guard_u8, dst=binary)
+    if binary[seed_y, seed_x] == 0:
+        raise ThresholdResolutionError(
+            f"Full-resolution tracking seed is not light at start T={start_T}"
+        )
+    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+    component = binary == 128
+    enclosed = not bool(np.any(component & full_res_guard_boundary))
+
+    if enclosed:
+        best_T = start_T
+        best_component = component
+        for threshold in range(start_T - 1, -1, -1):
+            binary = cv2.compare(full_res_gray, int(threshold), cv2.CMP_GT)
+            cv2.bitwise_and(binary, guard_u8, dst=binary)
+            cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+            component = binary == 128
+            if np.any(component & full_res_guard_boundary):
+                break
+            best_T = int(threshold)
+            best_component = component
+        return best_T, best_component
+
+    for threshold in range(start_T + 1, 256):
+        binary = cv2.compare(full_res_gray, int(threshold), cv2.CMP_GT)
+        cv2.bitwise_and(binary, guard_u8, dst=binary)
+        if binary[seed_y, seed_x] == 0:
+            break
+        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+        component = binary == 128
+        if not np.any(component & full_res_guard_boundary):
+            return int(threshold), component
+
+    raise ThresholdResolutionError(
+        "Tracked full-resolution solar component never became enclosed by the 10% guard"
     )
-
-
-def _evaluate_observation_region(region: ObservationRegion, threshold: int):
-    """Return (exists, touches_artificial_boundary, touches_true_image_border)."""
-    work = cv2.compare(region.gray, int(threshold), cv2.CMP_GT)
-    cv2.bitwise_and(work, region.allowed_u8, dst=work)
-    sx, sy = region.seed_local
-    if not (0 <= sx < work.shape[1] and 0 <= sy < work.shape[0]) or work[sy, sx] == 0:
-        return False, False, False
-
-    cv2.floodFill(work, None, (sx, sy), 128, flags=8)
-    component = work == 128
-    touches_artificial = bool(np.any(component & region.boundary))
-
-    touches_true = False
-    if region.touches_top_image_edge and np.any(component[0]):
-        touches_true = True
-    if region.touches_bottom_image_edge and np.any(component[-1]):
-        touches_true = True
-    if region.touches_left_image_edge and np.any(component[:, 0]):
-        touches_true = True
-    if region.touches_right_image_edge and np.any(component[:, -1]):
-        touches_true = True
-    return True, touches_artificial, touches_true
-
-
-def find_lowest_full_threshold(
-    full_gray: np.ndarray,
-    seed_point: tuple[int, int],
-    roi_seed_component: np.ndarray,
-):
-    """Scan T upward from zero and return the first genuinely separated threshold.
-
-    The 6.5% * sqrt(pixel_count) dilation is always tried first. Only if that flood
-    reaches its artificial rounded edge is the SAME T retried using 19.5%. A flood
-    that also reaches the 19.5% guard is treated as background-connected at that T.
-    """
-    h, w = full_gray.shape
-    image_scale = math.sqrt(float(w) * float(h))
-    roi = _build_observation_region(
-        full_gray, roi_seed_component, ROI_DILATION_FRACTION * image_scale, seed_point
-    )
-    guard = _build_observation_region(
-        full_gray, roi_seed_component, GUARD_DILATION_FRACTION * image_scale, seed_point
-    )
-
-    used_guard = False
-    for threshold in range(0, 256):
-        exists, touches_roi, touches_true = _evaluate_observation_region(roi, threshold)
-        if not exists or touches_true:
-            continue
-        if not touches_roi:
-            return int(threshold), used_guard
-
-        used_guard = True
-        exists, touches_guard, touches_true = _evaluate_observation_region(guard, threshold)
-        if exists and not touches_true and not touches_guard:
-            return int(threshold), used_guard
-
-    raise ThresholdResolutionError("Tracked solar component never became separated")
 
 
 def find_auto_threshold(
-    gray: np.ndarray,
+    full_res_gray: np.ndarray,
     image_state: dict[str, object],
 ) -> int:
-    """Determine automatic T, store AutoThresholdResult, and return the selected T.
+    """Determine Auto T and cache only search state; ``resolve_threshold`` owns SolarData."""
+    if full_res_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
 
-    Auto-T owns threshold acquisition only. Components and seeds used here are
-    search/tracking data. The definitive current-T component, authoritative seed,
-    refinement, and SolarData are established later by ``resolve_threshold``.
-    """
-    work_gray = resize_gray_max_dim(gray)
-    peak, left_edge = find_rightmost_histogram_peak(work_gray)
+    # Auto-T limits the longest work-resolution dimension to 1200 pixels.
+    # Compute the complete target raster size here so resize_img() receives explicit
+    # dimensions and the exact work-res geometry is available for later mapping.
+    full_res_height, full_res_width = full_res_gray.shape
+    if max(full_res_height, full_res_width) > WORK_MAX_DIM:
+        work_res_scale = WORK_MAX_DIM / float(max(full_res_height, full_res_width))
+        work_res_size = (
+            max(1, round(full_res_width * work_res_scale)),
+            max(1, round(full_res_height * work_res_scale)),
+        )
+    else:
+        work_res_size = (full_res_width, full_res_height)
+    work_res_gray = resize_img(full_res_gray, work_res_size)
+
+    histogram_start_T = find_histogram_start_threshold(work_res_gray)
+    work_res_seed_kernel = generate_kernel(TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
 
     try:
-        coarse = coarse_threshold_search(work_gray)
-        full_seed = establish_full_resolution_seed(
-            gray, work_gray.shape, coarse.seed_mask, coarse.seed_threshold
-        )
-        roi_seed_threshold, roi_seed_component = (
-            find_full_resolution_enclosed_seed_component(
-                gray, coarse.threshold, full_seed
-            )
-        )
-        separated_threshold, used_guard = find_lowest_full_threshold(
-            gray,
-            full_seed,
-            roi_seed_component,
+        work_res_T, work_res_component = find_work_res_solar_component(
+            work_res_gray,
+            histogram_start_T,
+            work_res_seed_kernel,
         )
 
-        separated_binary = cv2.compare(gray, int(separated_threshold), cv2.CMP_GT)
-        seed_x, seed_y = map(int, full_seed)
-        if separated_binary[seed_y, seed_x] == 0:
+        full_res_search_mask = resize_img(
+            work_res_component,
+            (full_res_width, full_res_height),
+        )
+
+        mapped_kernel_size = (
+            TRACKING_SEED_KERNEL_SIZE
+            * max(full_res_gray.shape)
+            / float(max(work_res_gray.shape))
+        )
+        low = max(1, int(math.floor(mapped_kernel_size)))
+        if low % 2 == 0:
+            low -= 1
+        high = low + 2
+        full_res_kernel_size = (
+            low
+            if abs(mapped_kernel_size - low) <= abs(high - mapped_kernel_size)
+            else high
+        )
+        full_res_seed_kernel = generate_kernel(full_res_kernel_size, round_kernel=False)
+
+        full_res_seed = brightest_supported_component_point(
+            full_res_gray,
+            full_res_search_mask,
+            full_res_seed_kernel,
+        )
+        if full_res_seed is None:
             raise ThresholdResolutionError(
-                f"Auto-T tracking seed is not light at separated T={separated_threshold}"
+                f"Transferred solar component has no {full_res_kernel_size}x"
+                f"{full_res_kernel_size}-supported full-resolution seed"
             )
-        cv2.floodFill(separated_binary, None, (seed_x, seed_y), 128, flags=8)
-        separated_component = separated_binary == 128
-        if _touches_image_border(separated_component):
-            raise ThresholdResolutionError(
-                f"Auto-T solar component touches the image border at T={separated_threshold}"
-            )
+
+        image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
+        full_res_guard_mask = dilate_component_mask(
+            full_res_search_mask,
+            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
+        )
+        full_res_T, full_res_component = find_lowest_full_res_threshold(
+            full_res_gray,
+            work_res_T,
+            full_res_seed,
+            full_res_guard_mask,
+        )
 
         topology_selection = optimize_separated_threshold(
-            gray,
-            separated_threshold,
-            full_seed,
-            separated_component,
+            full_res_gray,
+            full_res_T,
+            full_res_seed,
+            full_res_component,
         )
         result = AutoThresholdResult(
             threshold=topology_selection.threshold,
-            histogram_peak=coarse.histogram_peak,
-            histogram_left_edge=coarse.histogram_left_edge,
-            seed_threshold=coarse.seed_threshold,
-            coarse_threshold=coarse.threshold,
-            roi_seed_threshold=roi_seed_threshold,
-            full_seed_point=full_seed,
-            used_guard=used_guard,
+            histogram_start_threshold=histogram_start_T,
+            work_res_threshold=work_res_T,
+            full_res_seed_point=full_res_seed,
             resolved=True,
         )
     except ThresholdResolutionError as exc:
         result = AutoThresholdResult(
             threshold=None,
-            histogram_peak=int(peak),
-            histogram_left_edge=int(left_edge),
-            seed_threshold=None,
-            coarse_threshold=None,
-            roi_seed_threshold=None,
-            full_seed_point=None,
-            used_guard=False,
+            histogram_start_threshold=histogram_start_T,
+            work_res_threshold=None,
+            full_res_seed_point=None,
             resolved=False,
             reason=str(exc),
         )
@@ -860,11 +753,13 @@ CLEANUP_KERNEL_SIZES = (3, 5, 7)
 CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
 
 
-def euclidean_disk_kernel(size: int) -> np.ndarray:
-    """Return a centered discrete L2 disk for one positive odd kernel size."""
+def generate_kernel(size: int, round_kernel: bool = False) -> np.ndarray:
+    """Return a centered positive odd square or discrete Euclidean-disk kernel."""
     size = int(size)
     if size <= 0 or size % 2 == 0:
-        raise ValueError("cleanup kernel size must be a positive odd integer")
+        raise ValueError("kernel size must be a positive odd integer")
+    if not round_kernel:
+        return np.ones((size, size), dtype=np.uint8)
     radius = size // 2
     yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
     return ((xx * xx + yy * yy) <= radius * radius).astype(np.uint8)
@@ -894,7 +789,12 @@ def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray
     raw = np.asarray(component, dtype=bool)
     if raw.ndim != 2 or not np.any(raw):
         raise ValueError("component mask must be a non-empty two-dimensional mask")
-    k3, k5, k7 = (euclidean_disk_kernel(size) for size in CLEANUP_KERNEL_SIZES)
+
+    # Generate each reused morphology kernel once before applying any candidate path.
+    k3 = generate_kernel(3, round_kernel=True)
+    k5 = generate_kernel(5, round_kernel=True)
+    k7 = generate_kernel(7, round_kernel=True)
+
     d3 = open_close_component(raw, k3)
     d5 = open_close_component(raw, k5)
     d7 = open_close_component(raw, k7)
@@ -1071,20 +971,6 @@ def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
     return bits.reshape((height, width)).astype(bool)
 
 
-def _full_mask_from_observation_region(
-    full_gray: np.ndarray,
-    component: np.ndarray,
-    margin: float,
-    seed_point: tuple[int, int],
-) -> np.ndarray:
-    """Promote the existing cropped Euclidean observation dilation to full size."""
-    region = _build_observation_region(full_gray, component, margin, seed_point)
-    full_mask = np.zeros(full_gray.shape, dtype=bool)
-    x0, y0, x1, y1 = region.bbox
-    full_mask[y0:y1, x0:x1] = region.allowed_u8 != 0
-    return full_mask
-
-
 def _ordered_external_component_contour(component: np.ndarray) -> np.ndarray:
     """Return the ordered external CHAIN_APPROX_NONE contour as uint16 XY pairs."""
     component_u8 = np.where(component, 255, 0).astype(np.uint8)
@@ -1143,11 +1029,30 @@ def resolve_threshold(
         raise ThresholdResolutionError(
             f"No enclosed solar component exists at selected T={threshold}"
         )
-    raw_u8 = np.where(raw_component, 255, 0).astype(np.uint8)
-    full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)
-    seed_x, seed_y = brightest_supported_component_point(
-        full_gray, raw_u8, full_seed_support
+
+    full_res_max = max(full_gray.shape)
+    work_res_max = min(full_res_max, WORK_MAX_DIM)
+    mapped_kernel_size = TRACKING_SEED_KERNEL_SIZE * full_res_max / float(work_res_max)
+    low = max(1, int(math.floor(mapped_kernel_size)))
+    if low % 2 == 0:
+        low -= 1
+    high = low + 2
+    full_res_kernel_size = (
+        low if abs(mapped_kernel_size - low) <= abs(high - mapped_kernel_size) else high
     )
+    full_res_seed_kernel = generate_kernel(full_res_kernel_size, round_kernel=False)
+    full_res_seed = brightest_supported_component_point(
+        full_gray,
+        raw_component,
+        full_res_seed_kernel,
+    )
+    if full_res_seed is None:
+        raise ThresholdResolutionError(
+            f"Solar component has no {full_res_kernel_size}x{full_res_kernel_size}-"
+            "supported authoritative seed"
+        )
+    seed_x, seed_y = full_res_seed
+
     if not raw_component[seed_y, seed_x]:
         raise ThresholdResolutionError(
             "Authoritative solar seed lies outside the unrefined solar component"
@@ -1169,17 +1074,13 @@ def resolve_threshold(
 
     height, width = full_gray.shape
     image_scale = math.sqrt(float(width) * float(height))
-    roi_6_5 = _full_mask_from_observation_region(
-        full_gray,
+    roi_6_5 = dilate_component_mask(
         refined_component,
         ROI_DILATION_FRACTION * image_scale,
-        (seed_x, seed_y),
     )
-    guard_19_5 = _full_mask_from_observation_region(
-        full_gray,
+    guard_19_5 = dilate_component_mask(
         refined_component,
         GUARD_DILATION_FRACTION * image_scale,
-        (seed_x, seed_y),
     )
     contour = _ordered_external_component_contour(refined_component)
 
@@ -1713,8 +1614,8 @@ class DetectorApp:
         if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
             self.status.set(
                 "Automatic grayscale threshold selected: "
-                f"T={selected_threshold} (coarse T={result.coarse_threshold}, "
-                f"histogram start={result.histogram_left_edge}); refined component displayed."
+                f"T={selected_threshold} (work-res T={result.work_res_threshold}, "
+                f"histogram start={result.histogram_start_threshold}); refined component displayed."
             )
 
 
@@ -1910,10 +1811,7 @@ class DetectorApp:
             max(1, round(raster_width * scale)),
             max(1, round(raster_height * scale)),
         )
-        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        scaled_raster = cv2.resize(
-            unscaled_render_raster, fitted_size, interpolation=interpolation
-        )
+        scaled_raster = resize_img(unscaled_render_raster, fitted_size)
         ok, encoded_png = cv2.imencode(".png", scaled_raster)
         if not ok:
             raise ValueError("could not encode canvas content")

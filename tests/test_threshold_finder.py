@@ -1,4 +1,4 @@
-"""Synthetic regression tests for the integrated grayscale-only Auto-T finder."""
+"""Synthetic regression tests for the streamlined grayscale-only Auto-T finder."""
 import math
 
 import cv2
@@ -28,30 +28,29 @@ def test_threshold_semantics_and_lowest_separation():
     assert threshold == result.threshold == 8
 
 
-def test_find_rightmost_histogram_peak_has_left_edge():
-    peak, left = tf.find_rightmost_histogram_peak(synthetic_bridge_image())
-    assert peak >= 60
-    assert 0 <= left < peak
+def test_histogram_start_threshold_is_left_of_rightmost_mode():
+    start_T = tf.find_histogram_start_threshold(synthetic_bridge_image())
+    assert 0 <= start_T < 70
 
 
-def test_unresolved_auto_fails_instead_of_returning_histogram_left_edge():
+def test_unresolved_auto_fails_instead_of_returning_histogram_start_threshold():
     gray = np.full((80, 120), 100, dtype=np.uint8)
-    peak, left = tf.find_rightmost_histogram_peak(gray)
+    start_T = tf.find_histogram_start_threshold(gray)
     state = {"settings": tf.ImageSettings(), "auto_threshold_result": None, "solar_data": None}
     with pytest.raises(tf.ThresholdResolutionError):
         tf.find_auto_threshold(gray, state)
     result = state["auto_threshold_result"]
     assert not result.resolved
     assert result.threshold is None
-    assert result.seed_threshold is None
-    assert result.histogram_peak == peak
-    assert result.histogram_left_edge == left
+    assert result.histogram_start_threshold == start_T
+    assert result.work_res_threshold is None
 
 
-def test_sqrt_pixel_scale_preserves_linear_scaling():
+def test_sqrt_pixel_scale_preserves_linear_scaling_and_10_percent_guard():
     base = math.sqrt(6016 * 4000)
     half_linear = math.sqrt(3008 * 2000)
     assert abs(half_linear / base - 0.5) < 1e-12
+    assert round(tf.AUTO_T_GUARD_DILATION_FRACTION * base) == 491
     assert round(tf.ROI_DILATION_FRACTION * base) == 319
     assert round(tf.GUARD_DILATION_FRACTION * base) == 957
 
@@ -59,7 +58,9 @@ def test_sqrt_pixel_scale_preserves_linear_scaling():
 def test_working_resize_is_1200_max_and_grayscale_area():
     gray = np.arange(2000 * 1000, dtype=np.uint32).reshape(2000, 1000)
     gray = (gray % 256).astype(np.uint8)
-    work = tf.resize_gray_max_dim(gray)
+    scale = tf.WORK_MAX_DIM / float(max(gray.shape))
+    work_size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
+    work = tf.resize_img(gray, work_size)
     assert max(work.shape) == 1200
     assert work.shape == (1200, 600)
     assert work.ndim == 2

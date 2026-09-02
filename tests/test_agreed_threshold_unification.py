@@ -63,14 +63,14 @@ def disk_gray(size=81, radius=20, threshold=100):
 
 
 def test_seed_support_is_explicit_5x5_square_with_no_fallback():
-    assert cad.TRACKING_SEED_KERNEL.shape == (5, 5)
-    assert np.all(cad.TRACKING_SEED_KERNEL == 1)
+    kernel = cad.generate_kernel(cad.TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
+    assert kernel.shape == (5, 5)
+    assert np.all(kernel == 1)
     gray = np.zeros((21, 21), np.uint8)
     thin = np.zeros_like(gray)
     thin[10, 4:17] = 255
     gray[10, 10] = 250
-    with pytest.raises(cad.ThresholdResolutionError, match="5x5-supported"):
-        cad.brightest_supported_component_point(gray, thin, cad.TRACKING_SEED_KERNEL)
+    assert cad.brightest_supported_component_point(gray, thin, kernel) is None
 
 def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray = np.zeros((51, 51), np.uint8)
@@ -83,7 +83,7 @@ def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray[25, 25] = 240
     gray[25, 30] = 240
 
-    assert cad.brightest_supported_component_point(gray, component, cad.TRACKING_SEED_KERNEL) == (25, 25)
+    assert cad.brightest_supported_component_point(gray, component, cad.generate_kernel(5)) == (25, 25)
 
 
 def test_find_auto_threshold_writes_result_and_returns_threshold():
@@ -102,7 +102,7 @@ def test_find_auto_threshold_writes_result_and_returns_threshold():
     assert isinstance(result, cad.AutoThresholdResult)
     assert threshold == result.threshold
     assert isinstance(threshold, int)
-    assert result.full_seed_point == (center, center)
+    assert result.full_res_seed_point == (center, center)
 
 
 def test_resolve_threshold_chooses_authoritative_seed_before_refinement_and_persists_same_mask():
@@ -158,13 +158,9 @@ def test_commit_setting_change_always_stores_initialized_threshold_even_at_auto_
     app.default_settings = cad.ImageSettings(min_radius=100)
     auto = cad.AutoThresholdResult(
         threshold=17,
-        histogram_peak=200,
-        histogram_left_edge=17,
-        seed_threshold=17,
-        coarse_threshold=17,
-        roi_seed_threshold=17,
-        full_seed_point=(2, 2),
-        used_guard=False,
+        histogram_start_threshold=17,
+        work_res_threshold=17,
+        full_res_seed_point=(2, 2),
         resolved=True,
     )
     app.image_state = {
@@ -284,7 +280,7 @@ def test_resolve_threshold_is_atomic_solardata_writer():
     source = inspect.getsource(cad.resolve_threshold)
     assert 'image_state["solar_data"] = solar_data' in source
     assert "component_mask=compress_full_mask(refined_component)" in source
-    assert "full_seed_support = equivalent_full_resolution_seed_kernel(full_gray.shape)" in source
+    assert "full_res_seed_kernel = generate_kernel" in source
     assert "Authoritative solar seed did not survive" in source
 
 

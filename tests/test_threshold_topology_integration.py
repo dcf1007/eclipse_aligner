@@ -1,4 +1,6 @@
 """Integration regression for topology optimization inside automatic thresholding."""
+import math
+
 import cv2
 import numpy as np
 
@@ -22,14 +24,47 @@ def auto(gray):
     return threshold, state["auto_threshold_result"]
 
 
+def base_separated_t(gray):
+    full_res_height, full_res_width = gray.shape
+    if max(full_res_height, full_res_width) > tf.WORK_MAX_DIM:
+        scale = tf.WORK_MAX_DIM / float(max(full_res_height, full_res_width))
+        work_res_size = (
+            max(1, round(full_res_width * scale)),
+            max(1, round(full_res_height * scale)),
+        )
+    else:
+        work_res_size = (full_res_width, full_res_height)
+    work_res_gray = tf.resize_img(gray, work_res_size)
+    start_T = tf.find_histogram_start_threshold(work_res_gray)
+    work_res_T, work_res_component = tf.find_work_res_solar_component(
+        work_res_gray, start_T, tf.generate_kernel(tf.TRACKING_SEED_KERNEL_SIZE)
+    )
+    full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height))
+    assert full_res_search_mask.shape == gray.shape
+
+    mapped = tf.TRACKING_SEED_KERNEL_SIZE * max(gray.shape) / float(max(work_res_gray.shape))
+    low = max(1, int(math.floor(mapped)))
+    if low % 2 == 0:
+        low -= 1
+    high = low + 2
+    kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
+    full_res_seed = tf.brightest_supported_component_point(
+        gray, full_res_search_mask, tf.generate_kernel(kernel_size)
+    )
+    assert full_res_seed is not None
+    image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
+    guard = tf.dilate_component_mask(
+        full_res_search_mask, tf.AUTO_T_GUARD_DILATION_FRACTION * image_scale
+    )
+    separated_t, _component = tf.find_lowest_full_res_threshold(
+        gray, work_res_T, full_res_seed, guard
+    )
+    return separated_t
+
+
 def test_find_auto_threshold_optimizes_above_lowest_separated_threshold():
     gray = synthetic_bridge_with_separated_appendage()
-    work = tf.resize_gray_max_dim(gray)
-    coarse = tf.coarse_threshold_search(work)
-    seed = tf.establish_full_resolution_seed(gray, work.shape, coarse.seed_mask, coarse.seed_threshold)
-    _roi_seed_t, roi_seed_component = tf.find_full_resolution_enclosed_seed_component(gray, coarse.threshold, seed)
-    separated_t, _used_guard = tf.find_lowest_full_threshold(gray, seed, roi_seed_component)
-    assert separated_t == 8
+    assert base_separated_t(gray) == 8
 
     threshold, result = auto(gray)
     assert result.resolved

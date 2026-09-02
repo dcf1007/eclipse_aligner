@@ -92,10 +92,7 @@ def test_roi_guard_and_contour_derive_from_same_returned_refined_component():
         (solar.guard_19_5_mask, candidate.GUARD_DILATION_FRACTION),
     ):
         stored = candidate.decompress_full_mask(payload, gray.shape)
-        region = candidate._build_observation_region(gray, refined, fraction * image_scale, solar.seed_point)
-        expected = np.zeros(gray.shape, bool)
-        x0, y0, x1, y1 = region.bbox
-        expected[y0:y1, x0:x1] = region.allowed_u8 != 0
+        expected = candidate.dilate_component_mask(refined, fraction * image_scale)
         assert np.array_equal(stored, expected)
 
     contour = solar.component_contour

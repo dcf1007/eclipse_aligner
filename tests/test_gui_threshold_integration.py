@@ -58,13 +58,9 @@ def make_state_app():
     }
     result = appmod.AutoThresholdResult(
         threshold=10,
-        histogram_peak=20,
-        histogram_left_edge=10,
-        seed_threshold=15,
-        coarse_threshold=12,
-        roi_seed_threshold=12,
-        full_seed_point=(3, 0),
-        used_guard=False,
+        histogram_start_threshold=10,
+        work_res_threshold=12,
+        full_res_seed_point=(3, 0),
         resolved=True,
     )
     app.image_state = {
