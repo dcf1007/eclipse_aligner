@@ -37,7 +37,7 @@ def stages(path: Path):
         work_res_size = (full_res_width, full_res_height)
     work_res_gray = cad.resize_img(full_res_gray, work_res_size)
     start_T = cad.find_histogram_start_threshold(work_res_gray)
-    work_kernel = cad.generate_kernel(cad.TRACKING_SEED_KERNEL_SIZE)
+    work_kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE))
     work_res_T, work_res_component = cad.find_work_res_solar_component(
         work_res_gray, start_T, work_kernel
     )
@@ -56,7 +56,7 @@ def stages(path: Path):
         low -= 1
     high = low + 2
     kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
-    full_kernel = cad.generate_kernel(kernel_size)
+    full_kernel = cad.generate_kernel((kernel_size, kernel_size))
     full_res_seed = cad.brightest_supported_component_point(
         full_res_gray, full_res_search_mask, full_kernel
     )

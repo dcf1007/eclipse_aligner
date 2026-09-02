@@ -40,12 +40,12 @@ def test_seed_helper_uses_explicit_kernel_and_returns_none_without_fallback():
     comp = np.zeros_like(gray)
     comp[10, 3:18] = 255
     gray[10, 10] = 250
-    assert cad.brightest_supported_component_point(gray, comp, cad.generate_kernel(5)) is None
-    assert cad.brightest_supported_component_point(gray, comp, cad.generate_kernel(1)) == (10, 10)
+    assert cad.brightest_supported_component_point(gray, comp, cad.generate_kernel((5, 5))) is None
+    assert cad.brightest_supported_component_point(gray, comp, cad.generate_kernel((1, 1))) == (10, 10)
 
 
 def test_work_seed_kernel_is_generated_as_fixed_5x5_square():
-    kernel = cad.generate_kernel(cad.TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
+    kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
     assert kernel.shape == (5, 5)
     assert np.all(kernel == 1)
 
@@ -59,7 +59,7 @@ def test_full_seed_support_maps_6016_to_25_square():
         low -= 1
     high = low + 2
     size = low if abs(mapped - low) <= abs(high - mapped) else high
-    kernel = cad.generate_kernel(size, round_kernel=False)
+    kernel = cad.generate_kernel((size, size), round_kernel=False)
     assert kernel.shape == (25, 25)
     assert np.all(kernel == 1)
 
@@ -69,7 +69,7 @@ def test_full_seed_support_stays_5_if_no_downscale():
     work_shape = full_shape
     mapped = cad.TRACKING_SEED_KERNEL_SIZE * max(full_shape) / float(max(work_shape))
     assert round(mapped) == 5
-    assert cad.generate_kernel(5).shape == (5, 5)
+    assert cad.generate_kernel((5, 5)).shape == (5, 5)
 
 
 def test_work_search_continues_below_unsupported_candidate():
@@ -77,7 +77,7 @@ def test_work_search_continues_below_unsupported_candidate():
     gray[11:20, 11:20] = 15
     gray[14:17, 14:17] = 30
     work_T, component = cad.find_work_res_solar_component(
-        gray, 20, cad.generate_kernel(5)
+        gray, 20, cad.generate_kernel((5, 5))
     )
     assert work_T == 0
     assert int(component.sum()) == 81
@@ -87,7 +87,7 @@ def test_work_search_errors_if_nothing_supported_through_zero():
     gray = np.zeros((21, 21), np.uint8)
     gray[9:12, 9:12] = 30
     with pytest.raises(cad.ThresholdResolutionError, match="through T=0"):
-        cad.find_work_res_solar_component(gray, 20, cad.generate_kernel(5))
+        cad.find_work_res_solar_component(gray, 20, cad.generate_kernel((5, 5)))
 
 
 def test_unresolved_auto_is_stored_but_not_returned_as_histogram_fallback():
@@ -246,7 +246,7 @@ def base_separated_t(gray):
     work_res_gray = tf.resize_img(gray, work_res_size)
     start_T = tf.find_histogram_start_threshold(work_res_gray)
     work_res_T, work_res_component = tf.find_work_res_solar_component(
-        work_res_gray, start_T, tf.generate_kernel(tf.TRACKING_SEED_KERNEL_SIZE)
+        work_res_gray, start_T, tf.generate_kernel((tf.TRACKING_SEED_KERNEL_SIZE, tf.TRACKING_SEED_KERNEL_SIZE))
     )
     full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height))
     assert full_res_search_mask.shape == gray.shape
@@ -258,7 +258,7 @@ def base_separated_t(gray):
     high = low + 2
     kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
     full_res_seed = tf.brightest_supported_component_point(
-        gray, full_res_search_mask, tf.generate_kernel(kernel_size)
+        gray, full_res_search_mask, tf.generate_kernel((kernel_size, kernel_size))
     )
     assert full_res_seed is not None
     image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
@@ -296,12 +296,12 @@ def test_find_auto_threshold_keeps_separation_t_when_no_cleanup_is_available():
 # Mechanical kernel-generator rename in B's retained morphology tests.
 path = TESTS / "test_euclidean_cleanup_candidates.py"
 text = path.read_text(encoding="utf-8")
-text = text.replace("cad.euclidean_disk_kernel(3)", "cad.generate_kernel(3, round_kernel=True)")
-text = text.replace("cad.euclidean_disk_kernel(5)", "cad.generate_kernel(5, round_kernel=True)")
-text = text.replace("cad.euclidean_disk_kernel(7)", "cad.generate_kernel(7, round_kernel=True)")
-text = text.replace("cad.euclidean_disk_kernel(4)", "cad.generate_kernel(4, round_kernel=True)")
-text = text.replace("cad.euclidean_disk_kernel(size)", "cad.generate_kernel(size, round_kernel=True)")
-text = text.replace("cad.euclidean_disk_kernel(s)", "cad.generate_kernel(s, round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(3)", "cad.generate_kernel((3, 3), round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(5)", "cad.generate_kernel((5, 5), round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(7)", "cad.generate_kernel((7, 7), round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(4)", "cad.generate_kernel((4, 4), round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(size)", "cad.generate_kernel((size, size), round_kernel=True)")
+text = text.replace("cad.euclidean_disk_kernel(s)", "cad.generate_kernel((s, s), round_kernel=True)")
 path.write_text(text, encoding="utf-8")
 
 
@@ -319,7 +319,7 @@ old = '''def test_seed_support_is_explicit_5x5_square_with_no_fallback():
         cad.brightest_supported_component_point(gray, thin, cad.TRACKING_SEED_KERNEL)
 '''
 new = '''def test_seed_support_is_explicit_5x5_square_with_no_fallback():
-    kernel = cad.generate_kernel(cad.TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
+    kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
     assert kernel.shape == (5, 5)
     assert np.all(kernel == 1)
     gray = np.zeros((21, 21), np.uint8)
@@ -333,7 +333,7 @@ if old not in text:
 text = text.replace(old, new, 1)
 text = text.replace(
     "cad.brightest_supported_component_point(gray, component, cad.TRACKING_SEED_KERNEL)",
-    "cad.brightest_supported_component_point(gray, component, cad.generate_kernel(5))",
+    "cad.brightest_supported_component_point(gray, component, cad.generate_kernel((5, 5)))",
 )
 text = text.replace("result.full_seed_point", "result.full_res_seed_point")
 old_ctor = '''    auto = cad.AutoThresholdResult(

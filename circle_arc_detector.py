@@ -593,7 +593,7 @@ def find_lowest_full_res_threshold(
         raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
 
     guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
-    boundary_kernel = generate_kernel(3, round_kernel=False)
+    boundary_kernel = generate_kernel((3, 3), round_kernel=False)
     eroded_guard = cv2.erode(guard_u8, boundary_kernel, iterations=1) != 0
     full_res_guard_boundary = guard & ~eroded_guard
     full_res_guard_boundary[0, :] |= guard[0, :]
@@ -664,7 +664,7 @@ def find_auto_threshold(
     work_res_gray = resize_img(full_res_gray, work_res_size)
 
     histogram_start_T = find_histogram_start_threshold(work_res_gray)
-    work_res_seed_kernel = generate_kernel(TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
+    work_res_seed_kernel = generate_kernel((TRACKING_SEED_KERNEL_SIZE, TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
 
     try:
         work_res_T, work_res_component = find_work_res_solar_component(
@@ -692,7 +692,7 @@ def find_auto_threshold(
             if abs(mapped_kernel_size - low) <= abs(high - mapped_kernel_size)
             else high
         )
-        full_res_seed_kernel = generate_kernel(full_res_kernel_size, round_kernel=False)
+        full_res_seed_kernel = generate_kernel((full_res_kernel_size, full_res_kernel_size), round_kernel=False)
 
         full_res_seed = brightest_supported_component_point(
             full_res_gray,
@@ -753,16 +753,30 @@ CLEANUP_KERNEL_SIZES = (3, 5, 7)
 CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
 
 
-def generate_kernel(size: int, round_kernel: bool = False) -> np.ndarray:
-    """Return a centered positive odd square or discrete Euclidean-disk kernel."""
-    size = int(size)
-    if size <= 0 or size % 2 == 0:
-        raise ValueError("kernel size must be a positive odd integer")
+def generate_kernel(
+    size: tuple[int, int],
+    round_kernel: bool = False,
+) -> np.ndarray:
+    """Return a centered positive-odd rectangular or discrete elliptical kernel.
+
+    ``size`` is explicit ``(width, height)`` image order. The returned NumPy
+    array therefore has shape ``(height, width)``. ``round_kernel=False``
+    returns a filled rectangle; ``round_kernel=True`` returns a centered
+    discrete ellipse.
+    """
+    width, height = map(int, size)
+    if width <= 0 or width % 2 == 0 or height <= 0 or height % 2 == 0:
+        raise ValueError("kernel width and height must be positive odd integers")
     if not round_kernel:
-        return np.ones((size, size), dtype=np.uint8)
-    radius = size // 2
-    yy, xx = np.ogrid[-radius : radius + 1, -radius : radius + 1]
-    return ((xx * xx + yy * yy) <= radius * radius).astype(np.uint8)
+        return np.ones((height, width), dtype=np.uint8)
+
+    x_radius = width // 2
+    y_radius = height // 2
+    yy, xx = np.ogrid[-y_radius : y_radius + 1, -x_radius : x_radius + 1]
+    x_scale = max(x_radius, 1)
+    y_scale = max(y_radius, 1)
+    ellipse = (xx / x_scale) ** 2 + (yy / y_scale) ** 2 <= 1.0
+    return ellipse.astype(np.uint8)
 
 
 def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
@@ -791,9 +805,9 @@ def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray
         raise ValueError("component mask must be a non-empty two-dimensional mask")
 
     # Generate each reused morphology kernel once before applying any candidate path.
-    k3 = generate_kernel(3, round_kernel=True)
-    k5 = generate_kernel(5, round_kernel=True)
-    k7 = generate_kernel(7, round_kernel=True)
+    k3 = generate_kernel((3, 3), round_kernel=True)
+    k5 = generate_kernel((5, 5), round_kernel=True)
+    k7 = generate_kernel((7, 7), round_kernel=True)
 
     d3 = open_close_component(raw, k3)
     d5 = open_close_component(raw, k5)
@@ -1040,7 +1054,7 @@ def resolve_threshold(
     full_res_kernel_size = (
         low if abs(mapped_kernel_size - low) <= abs(high - mapped_kernel_size) else high
     )
-    full_res_seed_kernel = generate_kernel(full_res_kernel_size, round_kernel=False)
+    full_res_seed_kernel = generate_kernel((full_res_kernel_size, full_res_kernel_size), round_kernel=False)
     full_res_seed = brightest_supported_component_point(
         full_gray,
         raw_component,

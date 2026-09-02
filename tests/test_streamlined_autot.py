@@ -43,20 +43,20 @@ def test_histogram_start_threshold_returns_only_preceding_left_valley():
 
 
 def test_generate_kernel_unifies_square_and_exact_euclidean_disk_geometry():
-    square = cad.generate_kernel(5, round_kernel=False)
+    square = cad.generate_kernel((5, 5), round_kernel=False)
     assert square.shape == (5, 5)
     assert square.dtype == np.uint8
     assert np.all(square == 1)
 
     expected_pixels = {3: 5, 5: 13, 7: 29}
     for size, pixel_count in expected_pixels.items():
-        disk = cad.generate_kernel(size, round_kernel=True)
+        disk = cad.generate_kernel((size, size), round_kernel=True)
         assert disk.shape == (size, size)
         assert int(disk.sum()) == pixel_count
         assert np.array_equal(disk, np.rot90(disk))
 
     with pytest.raises(ValueError):
-        cad.generate_kernel(4)
+        cad.generate_kernel((4, 4))
 
 
 def test_supported_point_returns_none_without_requested_support():
@@ -66,12 +66,12 @@ def test_supported_point_returns_none_without_requested_support():
     gray[10, 10] = 250
     assert (
         cad.brightest_supported_component_point(
-            gray, component, cad.generate_kernel(5)
+            gray, component, cad.generate_kernel((5, 5))
         )
         is None
     )
     assert cad.brightest_supported_component_point(
-        gray, component, cad.generate_kernel(1)
+        gray, component, cad.generate_kernel((1, 1))
     ) == (10, 10)
 
 
@@ -91,7 +91,7 @@ def test_work_search_stops_rediscovering_candidates_after_seed_is_established(mo
     work_T, component = cad.find_work_res_solar_component(
         gray,
         20,
-        cad.generate_kernel(5),
+        cad.generate_kernel((5, 5)),
     )
 
     # T20..T15 expose only the unsupported 3x3 core; T14 exposes the 9x9 body.
@@ -106,7 +106,7 @@ def test_work_search_fails_only_after_no_supported_seed_exists_through_zero():
     gray = np.zeros((21, 21), np.uint8)
     gray[9:12, 9:12] = 30
     with pytest.raises(cad.ThresholdResolutionError, match="through T=0"):
-        cad.find_work_res_solar_component(gray, 20, cad.generate_kernel(5))
+        cad.find_work_res_solar_component(gray, 20, cad.generate_kernel((5, 5)))
 
 
 def _guard(shape=(21, 21)):

@@ -12,14 +12,47 @@ def oc(mask,kernel):
 
 
 def test_euclidean_disk_footprints_are_exact():
-    assert cad.generate_kernel(3, round_kernel=True).sum() == 5
-    assert cad.generate_kernel(5, round_kernel=True).sum() == 13
-    assert cad.generate_kernel(7, round_kernel=True).sum() == 29
+    assert cad.generate_kernel((3, 3), round_kernel=True).sum() == 5
+    assert cad.generate_kernel((5, 5), round_kernel=True).sum() == 13
+    assert cad.generate_kernel((7, 7), round_kernel=True).sum() == 29
     for size in (3,5,7):
-        k=cad.generate_kernel(size, round_kernel=True)
+        k=cad.generate_kernel((size, size), round_kernel=True)
         assert np.array_equal(k,np.rot90(k))
-    with pytest.raises(ValueError): cad.generate_kernel(4, round_kernel=True)
+    with pytest.raises(ValueError): cad.generate_kernel((4, 4), round_kernel=True)
 
+
+
+
+def test_generate_kernel_supports_rectangles_and_ellipses():
+    rectangle = cad.generate_kernel((5, 3))
+    assert rectangle.shape == (3, 5)
+    assert np.all(rectangle == 1)
+
+    ellipse = cad.generate_kernel((5, 3), round_kernel=True)
+    expected = np.array(
+        [
+            [0, 0, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    assert np.array_equal(ellipse, expected)
+
+    # The new two-dimensional API must preserve the established disk exactly.
+    assert np.array_equal(
+        cad.generate_kernel((5, 5), round_kernel=True),
+        cad.generate_kernel((5, 5), round_kernel=True),
+    )
+
+    # Degenerate one-pixel dimensions remain valid centered ellipses.
+    assert np.all(cad.generate_kernel((1, 5), round_kernel=True) == 1)
+    assert np.all(cad.generate_kernel((5, 1), round_kernel=True) == 1)
+
+    with pytest.raises(ValueError):
+        cad.generate_kernel((4, 3))
+    with pytest.raises(ValueError):
+        cad.generate_kernel((5, 2), round_kernel=True)
 
 def test_candidate_paths_are_direct_and_progressive_open_close():
     raw=np.zeros((61,61),bool)
@@ -27,7 +60,7 @@ def test_candidate_paths_are_direct_and_progressive_open_close():
     raw[30,49:55]=True
     candidates=cad.cleanup_morphology_candidates(raw)
     assert tuple(candidates) == cad.CLEANUP_CANDIDATE_ORDER
-    k3,k5,k7=(cad.generate_kernel(s, round_kernel=True) for s in (3,5,7))
+    k3,k5,k7=(cad.generate_kernel((s, s), round_kernel=True) for s in (3,5,7))
     assert np.array_equal(candidates['raw'],raw)
     assert np.array_equal(candidates['D3'],oc(raw,k3))
     assert np.array_equal(candidates['D5'],oc(raw,k5))

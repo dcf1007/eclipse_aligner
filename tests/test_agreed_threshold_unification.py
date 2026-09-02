@@ -63,7 +63,7 @@ def disk_gray(size=81, radius=20, threshold=100):
 
 
 def test_seed_support_is_explicit_5x5_square_with_no_fallback():
-    kernel = cad.generate_kernel(cad.TRACKING_SEED_KERNEL_SIZE, round_kernel=False)
+    kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
     assert kernel.shape == (5, 5)
     assert np.all(kernel == 1)
     gray = np.zeros((21, 21), np.uint8)
@@ -83,7 +83,7 @@ def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray[25, 25] = 240
     gray[25, 30] = 240
 
-    assert cad.brightest_supported_component_point(gray, component, cad.generate_kernel(5)) == (25, 25)
+    assert cad.brightest_supported_component_point(gray, component, cad.generate_kernel((5, 5))) == (25, 25)
 
 
 def test_find_auto_threshold_writes_result_and_returns_threshold():

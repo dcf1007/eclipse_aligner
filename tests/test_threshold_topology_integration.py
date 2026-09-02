@@ -37,7 +37,7 @@ def base_separated_t(gray):
     work_res_gray = tf.resize_img(gray, work_res_size)
     start_T = tf.find_histogram_start_threshold(work_res_gray)
     work_res_T, work_res_component = tf.find_work_res_solar_component(
-        work_res_gray, start_T, tf.generate_kernel(tf.TRACKING_SEED_KERNEL_SIZE)
+        work_res_gray, start_T, tf.generate_kernel((tf.TRACKING_SEED_KERNEL_SIZE, tf.TRACKING_SEED_KERNEL_SIZE))
     )
     full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height))
     assert full_res_search_mask.shape == gray.shape
@@ -49,7 +49,7 @@ def base_separated_t(gray):
     high = low + 2
     kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
     full_res_seed = tf.brightest_supported_component_point(
-        gray, full_res_search_mask, tf.generate_kernel(kernel_size)
+        gray, full_res_search_mask, tf.generate_kernel((kernel_size, kernel_size))
     )
     assert full_res_seed is not None
     image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
