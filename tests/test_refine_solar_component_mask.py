@@ -4,6 +4,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import circle_arc_detector as cad
+
 SNIPPET = Path(__file__).parents[1] / "snippets" / "refine_solar_component_mask.py"
 spec = importlib.util.spec_from_file_location("mask_refinement", SNIPPET)
 module = importlib.util.module_from_spec(spec)
@@ -12,10 +14,10 @@ spec.loader.exec_module(module)
 refine = module.refine_solar_component_mask
 
 
-def test_kernel_contract_is_shared_7x7_ellipse_single_pass():
-    assert module.SOLAR_COMPONENT_KERNEL_SIZE == 7
-    assert module.REFINEMENT_ITERATIONS == 1
-    expected = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+def test_refinement_snippet_uses_authoritative_production_implementation():
+    assert refine is cad.refine_solar_component_mask
+    expected = cad.generate_kernel((7, 7), round_kernel=True)
+    assert expected.sum() == 29
     assert np.array_equal(module.SOLAR_COMPONENT_KERNEL, expected)
 
 

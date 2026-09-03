@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import importlib.util
 import inspect
 from pathlib import Path
@@ -22,12 +21,6 @@ def _snippet_module():
     return module
 
 
-def _function_ast(path: Path, name: str):
-    tree = ast.parse(path.read_text())
-    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
-    return ast.dump(node, include_attributes=False)
-
-
 def _state(threshold):
     return {
         "settings": candidate.ImageSettings(threshold=threshold),
@@ -36,14 +29,11 @@ def _state(threshold):
     }
 
 
-def test_production_uses_exact_tested_refinement_function_and_shared_kernel():
-    assert _function_ast(ROOT / "circle_arc_detector.py", "refine_solar_component_mask") == _function_ast(
-        SNIPPET, "refine_solar_component_mask"
-    )
+def test_refinement_snippet_reuses_authoritative_production_implementation():
     snippet = _snippet_module()
-    assert candidate.SOLAR_COMPONENT_KERNEL_SIZE == snippet.SOLAR_COMPONENT_KERNEL_SIZE == 7
-    assert candidate.REFINEMENT_ITERATIONS == snippet.REFINEMENT_ITERATIONS == 1
-    assert np.array_equal(candidate.SOLAR_COMPONENT_KERNEL, snippet.SOLAR_COMPONENT_KERNEL)
+    assert snippet.refine_solar_component_mask is candidate.refine_solar_component_mask
+    assert np.array_equal(snippet.SOLAR_COMPONENT_KERNEL, candidate.SOLAR_COMPONENT_KERNEL)
+    assert candidate.SOLAR_COMPONENT_KERNEL.sum() == 29
 
 
 def test_refinement_is_inside_atomic_current_t_resolver():

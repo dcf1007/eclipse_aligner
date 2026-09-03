@@ -1,88 +1,61 @@
-"""Eclipse alignment GUI with grayscale automatic threshold selection.
+#!/usr/bin/env python3
+"""Apply the approved readability cleanup to the threshold-finder implementation.
 
-This module combines the application's user-interface foundation with the tested
-image-only automatic threshold finder. The GUI owns image navigation, per-image
-processing settings, control interaction, preview lifecycle, and cached automatic
-threshold results. Automatic threshold acquisition accepts the authoritative 8-bit
-grayscale brightness image plus the current per-image state, stores its
-``AutoThresholdResult`` there, and returns the selected integer T. Color-to-grayscale
-conversion is an input-stage responsibility and is performed before the threshold
-algorithm is called.
-
-All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
-absolute image path. ``settings.threshold`` is special: ``None`` means the threshold
-has never been initialized, and once initialized its exact integer value is always
-stored regardless of whether it came from Auto T or manual input. Other controls may
-still use sparse overrides relative to application defaults.
-
-Slider labels update continuously, but a setting is committed only after mouse
-release or the final keyboard key release. Checkboxes and radio buttons commit
-immediately. Every actual setting change passes through
-``commit_setting_change(setting_name, value)``, which synchronizes the Tk variable,
-persists the per-image setting, invalidates incompatible derived state, and invokes
-``refresh_preview()`` once.
-
-Automatic thresholding is only the T-acquisition stage. ``find_auto_threshold()``
-writes ``AutoThresholdResult`` into the current image state and returns T; it does
-not build SolarData. ``refresh_preview()`` first displays the pure full-resolution
-``gray > T`` raster, then sequentially calls ``resolve_threshold()``. That one atomic
-final-T function identifies the full-resolution solar component, selects the
-authoritative seed from the unrefined component, applies 7x7 elliptical OPEN/CLOSE,
-validates that the seed survives, constructs/stores SolarData from that same refined
-mask, and returns the mask for final display. Auto, manual, and restored thresholds
-therefore share exactly the same final-T path. ``full_resolution`` remains a future
-placeholder; both preview modes use full resolution today.
-
-The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
-``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel working
-raster, starts from the left valley of the rightmost locally smoothed histogram mode,
-establishes one 5x5-supported work-resolution solar seed, and tracks that same
-8-connected component downward. The tracked work-resolution component is resized to
-full resolution only to delimit the full-resolution seed search and a rounded 10%
-guard. Auto-T then starts from the work-resolution T and searches only in the
-monotonic direction needed to find the lowest full-resolution threshold whose seeded
-component stays inside that fixed guard. If no supported work-resolution seed can be
-established through T=0, Auto-T fails explicitly instead of substituting a histogram
-fallback. No HSV/color thresholding, Otsu thresholding, ellipse-fit score,
-bright-pixel dominance, competitor gain, or horizon special case is part of
-automatic threshold selection.
+The transformation keeps the algorithmic stages intact while removing silent
+coercions, repair clamps, redundant invariant checks, GUI lambdas, and the cropped
+implementation detail from component-mask dilation. It also synchronizes the
+retained streamlined Auto-T patch with the current production conventions.
 """
 
-import argparse
-import base64
-from dataclasses import dataclass
-import math
-import os
-import tkinter as tk
-import zlib
-from tkinter import filedialog
+from __future__ import annotations
 
-import cv2
-import numpy as np
+import ast
+from pathlib import Path
+import re
+
+ROOT = Path('.')
+SOURCE_PATH = ROOT / 'circle_arc_detector.py'
+RETAINED_PATCH_PATH = ROOT / 'snippets' / 'apply_streamlined_autot.py'
 
 
-IMAGE_FILE_TYPES = (
-    ("Image files", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp *.webp"),
-    ("All files", "*.*"),
-)
-
-SLIDER_KEY_RELEASE_SETTLE_MS = 45
-CANVAS_REDRAW_DELAY_MS = 60
-
-
-def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
-    """Return a BGRA frame whose pixels are fully transparent (alpha = 0)."""
-    if width <= 0 or height <= 0:
-        raise ValueError("transparent raster dimensions must be positive")
-    return np.zeros((height, width, 4), dtype=np.uint8)
-
-
-def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
-    """Convert a normal OpenCV BGR image to BGRA with fully opaque image pixels."""
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+def replace_module_function(source: str, name: str, replacement: str) -> str:
+    tree = ast.parse(source)
+    node = next(
+        (item for item in tree.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name),
+        None,
+    )
+    if node is None:
+        raise RuntimeError(f'module function {name!r} not found')
+    lines = source.splitlines(keepends=True)
+    start = node.lineno - 1
+    end = node.end_lineno
+    replacement_text = replacement.rstrip() + ('\n' if replacement else '')
+    lines[start:end] = [replacement_text]
+    return ''.join(lines)
 
 
-def generate_kernel(
+def replace_class_method(source: str, class_name: str, name: str, replacement: str) -> str:
+    tree = ast.parse(source)
+    class_node = next(
+        (item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == class_name),
+        None,
+    )
+    if class_node is None:
+        raise RuntimeError(f'class {class_name!r} not found')
+    node = next(
+        (item for item in class_node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name),
+        None,
+    )
+    if node is None:
+        raise RuntimeError(f'{class_name}.{name} not found')
+    lines = source.splitlines(keepends=True)
+    start = node.lineno - 1
+    end = node.end_lineno
+    lines[start:end] = [replacement.rstrip() + '\n']
+    return ''.join(lines)
+
+
+GENERATE_KERNEL = r'''def generate_kernel(
     size: tuple[int, int],
     round_kernel: bool = False,
 ) -> np.ndarray:
@@ -103,82 +76,21 @@ def generate_kernel(
     yy, xx = np.ogrid[-y_radius : y_radius + 1, -x_radius : x_radius + 1]
     ellipse = (xx / x_radius) ** 2 + (yy / y_radius) ** 2 <= 1.0
     return ellipse.astype(np.uint8)
+'''
 
+TRANSPARENT_BGRA = r'''def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
+    """Return a BGRA frame whose pixels are fully transparent (alpha = 0)."""
+    if width <= 0 or height <= 0:
+        raise ValueError("transparent raster dimensions must be positive")
+    return np.zeros((height, width, 4), dtype=np.uint8)
+'''
 
-# ---------------------------------------------------------------------------
-# Per-image processing settings
-# ---------------------------------------------------------------------------
-@dataclass
-class ImageSettings:
-    """Per-image settings. Threshold ``None`` means never initialized; other ``None`` values use defaults."""
+OPAQUE_BGRA = r'''def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
+    """Convert a normal OpenCV BGR image to BGRA with fully opaque image pixels."""
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+'''
 
-    threshold: int | None = None
-    min_radius: int | None = None
-    max_radius: int | None = None
-    max_error: float | None = None
-    min_coverage: int | None = None
-    morphology: bool | None = None
-    outer_limb_assistance: bool | None = None
-    use_horizon: bool | None = None
-    center_target: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Grayscale automatic threshold finder
-# ---------------------------------------------------------------------------
-WORK_RES_MAX_DIM = 1200
-PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
-ROI_DILATION_FRACTION = 0.065
-GUARD_DILATION_FRACTION = 0.195
-AUTO_T_GUARD_DILATION_FRACTION = 0.10
-TOPOLOGY_OPTIMIZATION_STEPS = 5
-
-# Build the fixed final-T Euclidean cleanup kernel once and reuse it.
-SOLAR_COMPONENT_KERNEL = generate_kernel((7, 7), round_kernel=True)
-
-
-@dataclass(frozen=True)
-class ThresholdTopology:
-    threshold: int
-    area: int
-    contour_n: int
-    perimeter: float
-    roughness: float
-    solidity: float
-    internal_dark_fraction: float = 0.0
-
-
-@dataclass(frozen=True)
-class CleanupMetrics:
-    """Unweighted cleanup benefit/cost terms measured against one raw component."""
-
-    contour_cleanup: float
-    roughness_cleanup: float
-    solidity_gain: float
-    internal_dark_cleanup: float
-    area_loss: float
-    solidity_loss: float
-
-
-@dataclass(frozen=True)
-class CleanupCandidateEvaluation:
-    name: str
-    mask: np.ndarray
-    topology: ThresholdTopology
-    metrics: CleanupMetrics
-
-
-@dataclass(frozen=True)
-class ThresholdTopologySelection:
-    threshold: int
-    base_threshold: int
-    delta: int
-    trajectory: tuple[ThresholdTopology, ...]
-    net_quality: tuple[float, ...]
-    knee_curve: tuple[float, ...]
-
-
-def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTopology:
+COMPONENT_DESCRIPTOR = r'''def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTopology:
     component = np.asarray(component, dtype=bool)
     area = np.count_nonzero(component)
     if area <= 0:
@@ -217,9 +129,9 @@ def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTop
         solidity=solidity,
         internal_dark_fraction=internal_dark_fraction,
     )
+'''
 
-
-def topology_trajectory_from_separated_component(
+TOPOLOGY_TRAJECTORY = r'''def topology_trajectory_from_separated_component(
     full_res_gray: np.ndarray,
     base_threshold: int,
     seed_point: tuple[int, int],
@@ -263,9 +175,9 @@ def topology_trajectory_from_separated_component(
     if not trajectory:
         raise ValueError("no valid topology samples")
     return tuple(trajectory)
+'''
 
-
-def select_topology_knee(
+SELECT_TOPOLOGY_KNEE = r'''def select_topology_knee(
     trajectory: tuple[ThresholdTopology, ...] | list[ThresholdTopology],
 ) -> ThresholdTopologySelection:
     """Select the first cleanup-versus-erosion knee in the topology trajectory."""
@@ -338,9 +250,9 @@ def select_topology_knee(
         net_quality=tuple(net),
         knee_curve=tuple(knee.tolist()),
     )
+'''
 
-
-def optimize_separated_threshold(
+OPTIMIZE_SEPARATED = r'''def optimize_separated_threshold(
     full_res_gray: np.ndarray,
     base_threshold: int,
     seed_point: tuple[int, int],
@@ -359,36 +271,9 @@ def optimize_separated_threshold(
 
     # If only the input T survives, the knee selector returns that input unchanged.
     return select_topology_knee(trajectory)
+'''
 
-
-class ThresholdResolutionError(RuntimeError):
-    """Expected inability to establish/track a separated solar component."""
-
-
-@dataclass(frozen=True)
-class AutoThresholdResult:
-    threshold: int | None
-    histogram_start_threshold: int
-    work_res_threshold: int | None
-    full_res_seed_point: tuple[int, int] | None
-    # Currently equivalent to ``threshold is not None``. Kept explicit for now in
-    # case resolution-state semantics become independent later.
-    resolved: bool
-    reason: str = ""
-
-
-def to_gray(image: np.ndarray) -> np.ndarray:
-    """Convert once to authoritative 8-bit grayscale."""
-    if image.ndim == 2:
-        return image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8)
-    if image.ndim == 3 and image.shape[2] == 3:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if image.ndim == 3 and image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported image shape: {image.shape}")
-
-
-def resize_img(
+RESIZE_IMG = r'''def resize_img(
     img: np.ndarray,
     size: tuple[int | None, int | None],
 ) -> np.ndarray:
@@ -430,16 +315,16 @@ def resize_img(
         interpolation=interpolation,
     )
     return resized.astype(original_dtype, copy=False)
+'''
 
-
-def nearest_positive_odd(value: float) -> int:
+NEAREST_ODD = r'''def nearest_positive_odd(value: float) -> int:
     """Return the nearest positive odd integer; exact ties choose the lower odd."""
     if value <= 0:
         raise ValueError("value must be positive")
     return 2 * math.ceil(value / 2) - 1
+'''
 
-
-def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
+HISTOGRAM = r'''def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
     """Return the left valley preceding the rightmost 3-bin-smoothed histogram mode."""
     histogram = np.bincount(work_res_gray.ravel(), minlength=256).astype(np.float64)
     signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
@@ -457,64 +342,9 @@ def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
         if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
             return index
     return 0
+'''
 
-
-def brightest_supported_component_point(
-    gray: np.ndarray,
-    component: np.ndarray,
-    support_kernel: np.ndarray,
-) -> tuple[int, int] | None:
-    """Return the brightest support-eligible component pixel; depth breaks ties.
-
-    The caller owns support geometry and the meaning of an unavailable point. Empty
-    or unsupported components return ``None``; malformed caller inputs remain errors.
-    """
-    source = (np.asarray(component) != 0).astype(np.uint8)
-    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
-    if gray.shape != source.shape:
-        raise ValueError("gray and component must have identical shapes")
-    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
-        raise ValueError("support kernel must be a non-empty two-dimensional mask")
-    if not np.any(source):
-        return None
-
-    supported = cv2.erode(source, support_kernel, iterations=1) != 0
-    if not np.any(supported):
-        return None
-
-    max_gray = int(gray[supported].max())
-    brightest = supported & (gray == max_gray)
-    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
-    scores = np.where(brightest, distance, -1.0)
-    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
-    return int(x), int(y)
-
-
-def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
-    """Return the largest 8-connected bright component enclosed by the raster."""
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (binary != 0).astype(np.uint8), 8
-    )
-    height, width = binary.shape
-    best = None
-    for label in range(1, count):
-        x, y, component_width, component_height, area = map(int, stats[label])
-        if (
-            x == 0
-            or y == 0
-            or x + component_width >= width
-            or y + component_height >= height
-        ):
-            continue
-        candidate = (area, label)
-        if best is None or candidate > best:
-            best = candidate
-    if best is None:
-        return None
-    return labels == best[1]
-
-
-def find_work_res_solar_component(
+FIND_WORK = r'''def find_work_res_solar_component(
     work_res_gray: np.ndarray,
     start_T: int,
     work_res_seed_kernel: np.ndarray,
@@ -561,9 +391,9 @@ def find_work_res_solar_component(
         )
 
     return work_res_T, work_res_component
+'''
 
-
-def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
+DILATE = r'''def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
     """Return every raster pixel within ``margin`` L2 pixels of the component."""
     component = np.asarray(component_mask, dtype=bool)
     if component.ndim != 2:
@@ -579,9 +409,9 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     outside = np.where(component, 0, 255).astype(np.uint8)
     distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
     return distance <= margin
+'''
 
-
-def find_lowest_full_res_threshold(
+FIND_LOWEST_FULL = r'''def find_lowest_full_res_threshold(
     full_res_gray: np.ndarray,
     start_T: int,
     full_res_seed: tuple[int, int],
@@ -657,9 +487,9 @@ def find_lowest_full_res_threshold(
     raise ThresholdResolutionError(
         "Tracked full-resolution solar component never became enclosed by the 10% guard"
     )
+'''
 
-
-def find_auto_threshold(
+FIND_AUTO = r'''def find_auto_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
 ) -> int:
@@ -768,31 +598,9 @@ def find_auto_threshold(
 
     image_state["auto_threshold_result"] = result
     return topology_selection.threshold
+'''
 
-
-# ---------------------------------------------------------------------------
-# Cleanup morphology candidates
-# ---------------------------------------------------------------------------
-CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
-
-
-
-
-def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Apply exactly one binary OPEN followed by one CLOSE with ``kernel``."""
-    component = np.asarray(component, dtype=bool)
-    kernel = np.asarray(kernel, dtype=np.uint8)
-    if component.ndim != 2 or not np.any(component):
-        raise ValueError("component mask must be a non-empty two-dimensional mask")
-    if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
-        raise ValueError("cleanup kernel must be a non-empty two-dimensional mask")
-    u8 = np.where(component, 255, 0).astype(np.uint8)
-    opened = cv2.morphologyEx(u8, cv2.MORPH_OPEN, kernel, iterations=1)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return closed != 0
-
-
-def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray]:
+CLEANUP_MORPHOLOGY = r'''def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray]:
     """Build raw, direct 3/5/7, and progressive 3->5 / 3->5->7 candidates."""
     raw = np.asarray(component, dtype=bool)
     if raw.ndim != 2 or not np.any(raw):
@@ -817,9 +625,9 @@ def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray
         "P35": p35,
         "P357": p357,
     }
+'''
 
-
-def seed_connected_cleanup_candidates(
+SEED_CONNECTED = r'''def seed_connected_cleanup_candidates(
     component: np.ndarray,
     seed_point: tuple[int, int],
 ) -> dict[str, np.ndarray]:
@@ -847,9 +655,9 @@ def seed_connected_cleanup_candidates(
         valid[name] = flood == 128
 
     return valid
+'''
 
-
-def evaluate_cleanup_candidates(
+EVALUATE_CLEANUP = r'''def evaluate_cleanup_candidates(
     component: np.ndarray,
     seed_point: tuple[int, int],
     threshold: int,
@@ -915,12 +723,9 @@ def evaluate_cleanup_candidates(
             )
         )
     return tuple(rows)
+'''
 
-
-# ---------------------------------------------------------------------------
-# Final-T full-resolution solar resolution and persistence
-# ---------------------------------------------------------------------------
-def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
+REFINE = r'''def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
     """Apply the agreed 7x7 Euclidean OPEN then CLOSE to one solar component."""
     component = np.asarray(component, dtype=bool)
     if component.ndim != 2:
@@ -942,28 +747,9 @@ def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
         iterations=1,
     )
     return refined != 0
+'''
 
-
-@dataclass(frozen=True)
-class SolarData:
-    """Refined solar geometry established at exactly one full-resolution threshold T."""
-
-    threshold: int
-    seed_point: tuple[int, int]
-    component_mask: bytes
-    roi_6_5_mask: bytes
-    guard_19_5_mask: bytes
-    component_contour: np.ndarray
-
-
-def compress_full_mask(mask: np.ndarray) -> bytes:
-    """Pack a full-resolution boolean mask to one bit/pixel, then zlib level 1."""
-    mask_bool = np.asarray(mask, dtype=bool)
-    packed = np.packbits(mask_bool.reshape(-1))
-    return zlib.compress(packed.tobytes(), level=1)
-
-
-def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
+DECOMPRESS = r'''def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
     """Restore a compressed full-resolution mask using the current image shape."""
     if len(shape) != 2:
         raise ValueError("mask shape must be (height, width)")
@@ -981,27 +767,9 @@ def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
     packed = np.frombuffer(raw, dtype=np.uint8)
     bits = np.unpackbits(packed, count=pixel_count)
     return bits.reshape((height, width)) != 0
+'''
 
-
-def _ordered_external_component_contour(component: np.ndarray) -> np.ndarray:
-    """Return the ordered external CHAIN_APPROX_NONE contour as uint16 XY pairs."""
-    component_u8 = np.where(component, 255, 0).astype(np.uint8)
-    contours, _ = cv2.findContours(
-        component_u8,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-    if not contours:
-        raise ThresholdResolutionError("Solar component has no external contour")
-    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    if contour.size == 0:
-        raise ThresholdResolutionError("Solar component external contour is empty")
-    if int(contour.max()) > np.iinfo(np.uint16).max:
-        raise ThresholdResolutionError("Solar contour coordinates exceed uint16 range")
-    return contour.astype(np.uint16, copy=False)
-
-
-def resolve_threshold(
+RESOLVE = r'''def resolve_threshold(
     full_res_gray: np.ndarray,
     threshold: int,
     image_state: dict[str, object],
@@ -1103,246 +871,9 @@ def resolve_threshold(
     # Publish only after every final-T resolution step has succeeded.
     image_state["solar_data"] = solar_data
     return refined_component
+'''
 
-
-class DetectorApp:
-    """Own GUI state, per-image settings, cached auto thresholds, and previews.
-
-    Public methods represent application actions. Underscore-prefixed methods are
-    Tk callback or rendering internals. Threshold acquisition and final-T resolution
-    both write their agreed derived objects into the current per-image state; this
-    class coordinates those operations with the processing settings shown by the GUI.
-    """
-
-    def __init__(self, root: tk.Tk, image_paths: list[str], args: argparse.Namespace):
-        self.root = root
-        self.args = args
-        self.image_paths = [os.path.abspath(path) for path in image_paths]
-        self.current_index = -1
-        self.current_path: str | None = None
-        self.color_image = None
-        self.gray_image = None
-
-        # Per-image state keeps settings, the cached automatic threshold result,
-        # and post-threshold SolarData when solar geometry has been built.
-        # No ImageState wrapper class is needed: the outer dictionary directly
-        # expresses the image-to-state hierarchy.
-        self.image_state: dict[str, dict[str, object]] = {}
-
-        self.canvas_redraw_job = None
-
-        # Keyboard auto-repeat can emit intermediate release/press pairs on some
-        # Tk platforms. Keep one deferred refresh job so only the final key-up
-        # commits a slider-driven preview refresh.
-        self.slider_keyboard_commit_job = None
-        self.slider_keyboard_widget = None
-        self.slider_keyboard_start_value = None
-
-        self.threshold = tk.IntVar(value=args.threshold)
-        self.min_radius = tk.IntVar(value=round(args.min_radius))
-        self.max_radius = tk.IntVar(value=round(args.max_radius))
-        self.max_error = tk.DoubleVar(value=args.max_error * 100.0)
-        self.min_coverage = tk.IntVar(value=round(args.min_coverage * 100.0))
-        self.morphology = tk.BooleanVar(value=False)
-        self.outer_limb_assistance = tk.BooleanVar(value=False)
-        self.use_horizon = tk.BooleanVar(value=True)
-
-        # Mutually exclusive by construction: both Radiobuttons share this one
-        # StringVar. Light is the requested default.
-        self.center_target = tk.StringVar(value="light")
-        self.center_preview_label = tk.StringVar()
-
-        # Ordinary controls use these values as sparse baselines. Threshold is
-        # different: once initialized, its exact current integer is always stored.
-        self.default_settings = ImageSettings(
-            min_radius=self.min_radius.get(),
-            max_radius=self.max_radius.get(),
-            max_error=self.max_error.get(),
-            min_coverage=self.min_coverage.get(),
-            morphology=self.morphology.get(),
-            outer_limb_assistance=self.outer_limb_assistance.get(),
-            use_horizon=self.use_horizon.get(),
-            center_target=self.center_target.get(),
-        )
-        self.setting_variables = {
-            "threshold": self.threshold,
-            "min_radius": self.min_radius,
-            "max_radius": self.max_radius,
-            "max_error": self.max_error,
-            "min_coverage": self.min_coverage,
-            "morphology": self.morphology,
-            "outer_limb_assistance": self.outer_limb_assistance,
-            "use_horizon": self.use_horizon,
-            "center_target": self.center_target,
-        }
-
-        self.status = tk.StringVar(value="Threshold finder integrated. Load images to inspect automatic T selection.")
-        self.image_info = tk.StringVar(value="No image loaded")
-
-        root.title("Ellipse / Arc Detector — threshold finder")
-        root.minsize(1050, 760)
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(2, weight=1)
-        root.protocol("WM_DELETE_WINDOW", self.close)
-
-        self._build_navigation_bar()
-        self._build_settings_panel()
-        self._build_preview_panes()
-        self._update_center_preview_label()
-
-        # Tk's toplevel bindtag receives mouse events from every child widget.
-        # Use it to clear slider keyboard focus as soon as the user clicks
-        # anywhere outside the currently focused slider.
-        root.bind("<ButtonPress-1>", self._release_slider_focus_if_clicked_elsewhere, add="+")
-        root.bind("<Return>", self.apply_full_resolution)
-        root.bind("<Escape>", self.close)
-
-        if self.image_paths:
-            self.load_image_at(0)
-        else:
-            self.update_navigation_state()
-
-    # ------------------------------------------------------------------
-    # Image list / navigation (GUI support only)
-    # ------------------------------------------------------------------
-    def load_images(self):
-        selected = filedialog.askopenfilenames(
-            parent=self.root,
-            title="Select eclipse images",
-            filetypes=IMAGE_FILE_TYPES,
-        )
-        if not selected:
-            return
-        self.image_paths = [os.path.abspath(path) for path in selected]
-        self.current_index = -1
-        self.current_path = None
-        self.color_image = None
-        self.gray_image = None
-        self.load_image_at(0)
-
-
-    def load_image_at(self, index: int):
-        if not 0 <= index < len(self.image_paths):
-            return
-
-        path = self.image_paths[index]
-        image = cv2.imread(path, cv2.IMREAD_COLOR)
-        self.current_index = index
-        self.current_path = path
-
-        if image is None:
-            self.color_image = None
-            self.gray_image = None
-            if hasattr(self, "threshold_canvas"):
-                self.render_canvas_content(self.threshold_canvas, transparent_bgra())
-            if hasattr(self, "color_canvas"):
-                self.render_canvas_content(self.color_canvas, transparent_bgra())
-            self.status.set(f"Could not load image: {path}")
-            self.update_navigation_state()
-            return
-
-        self.color_image = opaque_bgra(image)
-        self.gray_image = to_gray(image)
-
-        if path in self.image_state:
-            state = self.image_state[path]
-            state.setdefault("auto_threshold_result", None)
-            state.setdefault("solar_data", None)
-        else:
-            state = {
-                "settings": ImageSettings(),
-                "auto_threshold_result": None,
-                "solar_data": None,
-            }
-            self.image_state[path] = state
-
-        settings = state["settings"]
-        for setting_name, variable in self.setting_variables.items():
-            if setting_name == "threshold":
-                continue
-            baseline = getattr(self.default_settings, setting_name)
-            override = getattr(settings, setting_name)
-            variable.set(baseline if override is None else override)
-
-        self._update_center_preview_label()
-        if hasattr(self, "color_canvas"):
-            self.render_canvas_content(self.color_canvas, self.color_image)
-
-        if settings.threshold is None:
-            # None has one meaning only: this image has never had T initialized.
-            try:
-                threshold = find_auto_threshold(self.gray_image, state)
-            except ThresholdResolutionError as exc:
-                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-            else:
-                self.commit_setting_change("threshold", threshold)
-        else:
-            self.threshold.set(settings.threshold)
-            self.refresh_preview(changed_setting="image load")
-
-        self.update_navigation_state()
-
-
-    def previous_image(self):
-        if self.current_index > 0:
-            self.load_image_at(self.current_index - 1)
-
-    def next_image(self):
-        if 0 <= self.current_index < len(self.image_paths) - 1:
-            self.load_image_at(self.current_index + 1)
-
-    def update_navigation_state(self):
-        count = len(self.image_paths)
-        has_current = 0 <= self.current_index < count
-        readable = has_current and self.color_image is not None
-
-        self.previous_button.config(
-            state=tk.NORMAL if has_current and self.current_index > 0 else tk.DISABLED
-        )
-        self.next_button.config(
-            state=tk.NORMAL if has_current and self.current_index < count - 1 else tk.DISABLED
-        )
-        self.preview_button.config(state=tk.NORMAL if readable else tk.DISABLED)
-        self.full_button.config(state=tk.NORMAL if readable else tk.DISABLED)
-
-        if has_current:
-            self.image_info.set(
-                f"{self.current_index + 1} / {count}   {os.path.basename(self.current_path or '')}"
-            )
-        else:
-            self.image_info.set("No image loaded" if not count else f"0 / {count}")
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
-    def _build_navigation_bar(self):
-        frame = tk.Frame(self.root, padx=10)
-        frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
-        frame.columnconfigure(4, weight=1)
-
-        tk.Button(frame, text="Load images...", width=14, command=self.load_images).grid(
-            row=0, column=0, padx=(0, 8)
-        )
-        self.save_centered_button = tk.Button(
-            frame,
-            text="Save centered images",
-            width=20,
-            command=self.save_centered_images,
-        )
-        self.save_centered_button.grid(row=0, column=1, padx=(0, 10))
-        self.previous_button = tk.Button(
-            frame, text="◀ Previous", width=12, command=self.previous_image
-        )
-        self.previous_button.grid(row=0, column=2, padx=(0, 5))
-        self.next_button = tk.Button(
-            frame, text="Next ▶", width=12, command=self.next_image
-        )
-        self.next_button.grid(row=0, column=3, padx=(0, 10))
-        tk.Label(frame, textvariable=self.image_info, anchor="w").grid(
-            row=0, column=4, sticky="ew"
-        )
-
-    def _build_settings_panel(self):
+BUILD_SETTINGS = r'''    def _build_settings_panel(self):
         frame = tk.Frame(self.root, padx=10, pady=8)
         frame.grid(row=1, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
@@ -1447,8 +978,9 @@ class DetectorApp:
             justify="left",
             wraplength=1150,
         ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+'''
 
-    def _add_slider(
+ADD_SLIDER = r'''    def _add_slider(
         self,
         parent,
         row,
@@ -1497,8 +1029,9 @@ class DetectorApp:
 
         variable.trace_add("write", update_value)
         update_value()
+'''
 
-    def _format_slider_value(self, setting_name, value) -> str:
+FORMAT_SLIDER = r'''    def _format_slider_value(self, setting_name, value) -> str:
         """Format one slider's typed Tk variable value for its adjacent label."""
         if setting_name == "threshold":
             return str(value)
@@ -1509,178 +1042,9 @@ class DetectorApp:
         if setting_name == "min_coverage":
             return f"{value}% (~{value * 3.6:.0f}°)"
         raise ValueError(f"unknown slider setting: {setting_name}")
+'''
 
-    @staticmethod
-    def _focus_slider(event):
-        """Keep a clicked slider focused so arrow keys continue to adjust it."""
-        event.widget.focus_set()
-
-    @staticmethod
-    def _begin_slider_mouse_change(event):
-        """Remember the value before a mouse slider interaction begins."""
-        event.widget._preview_mouse_start_value = event.widget.get()
-
-    def _finish_slider_mouse_change(self, event):
-        """Refresh once after a mouse slider change has actually finished."""
-        start_value = getattr(event.widget, "_preview_mouse_start_value", None)
-        if start_value is not None and event.widget.get() != start_value:
-            self.commit_setting_change(event.widget._setting_name, event.widget.get())
-
-    def _cancel_pending_slider_keyboard_commit(self):
-        """Cancel a release callback superseded by continuing keyboard input."""
-        if self.slider_keyboard_commit_job is not None:
-            self.root.after_cancel(self.slider_keyboard_commit_job)
-            self.slider_keyboard_commit_job = None
-
-    def _begin_slider_keyboard_change(self, event):
-        """Begin or continue one keyboard slider interaction."""
-        self._cancel_pending_slider_keyboard_commit()
-        if self.slider_keyboard_widget is not event.widget:
-            self.slider_keyboard_widget = event.widget
-            self.slider_keyboard_start_value = event.widget.get()
-
-    def _schedule_slider_keyboard_commit(self, event):
-        """Schedule completion after a KeyRelease survives the repeat window."""
-        if self.slider_keyboard_widget is not event.widget:
-            self.slider_keyboard_widget = event.widget
-            self.slider_keyboard_start_value = event.widget.get()
-        self._cancel_pending_slider_keyboard_commit()
-        self.slider_keyboard_commit_job = self.root.after(
-            SLIDER_KEY_RELEASE_SETTLE_MS, self._finish_slider_keyboard_change
-        )
-
-    def _finish_slider_keyboard_change(self):
-        """Commit one preview refresh after keyboard slider input becomes idle."""
-        self.slider_keyboard_commit_job = None
-        widget = self.slider_keyboard_widget
-        start_value = self.slider_keyboard_start_value
-        self.slider_keyboard_widget = None
-        self.slider_keyboard_start_value = None
-        if widget is not None and start_value is not None and widget.get() != start_value:
-            self.commit_setting_change(widget._setting_name, widget.get())
-
-    def _release_slider_focus_if_clicked_elsewhere(self, event):
-        """Release slider focus immediately when the mouse clicks elsewhere.
-
-        Clicking the focused slider itself keeps focus. Clicking a different slider
-        transfers focus through that slider's own ButtonPress binding, so this
-        handler also leaves it alone. Any non-slider click removes the keyboard
-        focus ring from the previously focused slider.
-        """
-        focused = self.root.focus_get()
-        if isinstance(focused, tk.Scale) and event.widget is not focused:
-            self.root.focus_set()
-
-    def _build_preview_panes(self):
-        frame = tk.Frame(self.root, padx=10)
-        frame.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
-        frame.rowconfigure(1, weight=1)
-        frame.columnconfigure(0, weight=1, uniform="preview")
-        frame.columnconfigure(1, weight=1, uniform="preview")
-
-        tk.Label(
-            frame,
-            text="Threshold preview: arcs / ellipses / detected horizon",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Label(
-            frame,
-            textvariable=self.center_preview_label,
-        ).grid(row=0, column=1, sticky="w", pady=(0, 4))
-
-        # The canvas is only a display surface. Transparency is retained in the
-        # BGRA preview raster itself; it is not simulated by matching Tk colors.
-        self.threshold_canvas = tk.Canvas(
-            frame, bg="#202020", highlightthickness=1, highlightbackground="#808080"
-        )
-        self.color_canvas = tk.Canvas(
-            frame, bg="#202020", highlightthickness=1, highlightbackground="#808080"
-        )
-        self.threshold_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-        self.color_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-        self.threshold_canvas.bind("<Configure>", self._schedule_canvas_redraw)
-        self.color_canvas.bind("<Configure>", self._schedule_canvas_redraw)
-
-    # ------------------------------------------------------------------
-    # Application actions and threshold preview
-    # ------------------------------------------------------------------
-    def save_centered_images(self):
-        self.status.set(
-            "Save centered images: export functionality is not implemented in the threshold-finder stage."
-        )
-
-    def auto_select_threshold(self):
-        """Restore/recompute image-only Auto T, then commit it like any other T change."""
-        if self.gray_image is None or self.current_path is None:
-            self.status.set("Auto select threshold: no readable image is loaded.")
-            return
-
-        state = self.image_state[self.current_path]
-        result = state.get("auto_threshold_result")
-        if (
-            isinstance(result, AutoThresholdResult)
-            and result.resolved
-            and result.threshold is not None
-        ):
-            selected_threshold = result.threshold
-        else:
-            try:
-                selected_threshold = find_auto_threshold(self.gray_image, state)
-            except ThresholdResolutionError as exc:
-                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-                return
-            result = state["auto_threshold_result"]
-
-        self.commit_setting_change("threshold", selected_threshold)
-
-        solar_data = state.get("solar_data")
-        if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
-            self.status.set(
-                "Automatic grayscale threshold selected: "
-                f"T={selected_threshold} (work-res T={result.work_res_threshold}, "
-                f"histogram start={result.histogram_start_threshold}); refined component displayed."
-            )
-
-
-    def auto_select_radius(self):
-        self.status.set(
-            "Auto select radius range: algorithm not implemented in the threshold-finder stage."
-        )
-
-
-
-
-    def commit_setting_change(self, setting_name, value):
-        """Synchronize one completed setting change, persist it, then refresh once."""
-        variable = self.setting_variables[setting_name]
-        variable.set(value)
-        value = variable.get()
-
-        if self.current_path is None or self.current_path not in self.image_state:
-            return
-
-        state = self.image_state[self.current_path]
-        settings = state["settings"]
-
-        if setting_name == "threshold":
-            # Threshold is never sparse once initialized. None means never initialized.
-            threshold = value
-            settings.threshold = threshold
-            existing = state.get("solar_data")
-            if isinstance(existing, SolarData) and existing.threshold != threshold:
-                state["solar_data"] = None
-        else:
-            baseline = getattr(self.default_settings, setting_name)
-            setattr(settings, setting_name, None if value == baseline else value)
-
-        if self.gray_image is not None:
-            self.refresh_preview(changed_setting=setting_name)
-
-
-    def _selected_center_target_name(self):
-        """Return the user-facing name of the selected centering target."""
-        return "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
-
-    def _handle_morphology_change(self):
+CHECKBOX_HANDLERS = r'''    def _handle_morphology_change(self):
         """Commit the morphology checkbox immediately."""
         self.commit_setting_change("morphology", self.morphology.get())
 
@@ -1694,107 +1058,14 @@ class DetectorApp:
     def _handle_horizon_change(self):
         """Commit the horizon checkbox immediately."""
         self.commit_setting_change("use_horizon", self.use_horizon.get())
+'''
 
-    def _handle_center_target_change(self):
-        self._update_center_preview_label()
-        self.commit_setting_change("center_target", self.center_target.get())
-        self.status.set(
-            f"Centering target set to {self._selected_center_target_name()}. "
-            "Actual centering will be implemented with ellipse detection."
-        )
-
-
-    def _update_center_preview_label(self):
-        target = self._selected_center_target_name()
-        self.center_preview_label.set(f"Full-color image — center on {target}")
-
-    def refresh_preview(self, changed_setting: str | None = None, full_resolution: bool = False):
-        """Display raw current-T B/W, resolve/persist SolarData, then display refinement.
-
-        ``full_resolution`` is intentionally a placeholder today: both modes use the
-        same authoritative full-resolution grayscale and the same resolver.
-        """
-        if self.gray_image is None or self.current_path is None:
-            action = "Apply Full Resolution" if full_resolution else "Refresh Preview"
-            self.status.set(f"{action}: no readable image is loaded.")
-            return
-
-        state = self.image_state[self.current_path]
-        settings = state["settings"]
-        if settings.threshold is None:
-            self.status.set("Threshold is not initialized for the current image.")
-            return
-
-        threshold = settings.threshold
-        existing = state.get("solar_data")
-        reused = isinstance(existing, SolarData) and existing.threshold == threshold
-        if isinstance(existing, SolarData) and existing.threshold != threshold:
-            state["solar_data"] = None
-
-        threshold_mask = self.gray_image > threshold
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, threshold_mask)
-
-        try:
-            refined_component = resolve_threshold(
-                self.gray_image,
-                threshold,
-                state,
-            )
-        except (ThresholdResolutionError, ValueError) as exc:
-            self.status.set(
-                f"Pure threshold remains displayed at T={threshold}; SolarData could not be "
-                f"established ({exc})."
-            )
-            return
-
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, refined_component)
-
-        if full_resolution:
-            self.status.set(
-                "Full-resolution refined solar-component preview applied at "
-                f"T={threshold}. Ellipse detector backend not implemented yet."
-            )
-        elif changed_setting is not None:
-            self.status.set(
-                f"{changed_setting} committed; refined current preview displayed at T={threshold}."
-            )
-        elif reused:
-            self.status.set(
-                f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
-            )
-        else:
-            self.status.set(
-                f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
-            )
-
-
-    def apply_full_resolution(self, _event=None):
+APPLY_FULL = r'''    def apply_full_resolution(self, _event=None):
         # Reuse the same authoritative preview/resolution path with full-resolution status text.
         self.refresh_preview(full_resolution=True)
+'''
 
-
-    def _schedule_canvas_redraw(self, _event=None):
-        if self.canvas_redraw_job is not None:
-            self.root.after_cancel(self.canvas_redraw_job)
-        self.canvas_redraw_job = self.root.after(
-            CANVAS_REDRAW_DELAY_MS, self._redraw_cached_canvases
-        )
-
-    def _redraw_cached_canvases(self):
-        """Refit each canvas's retained unscaled raster after a canvas resize."""
-        self.canvas_redraw_job = None
-        for canvas_name in ("threshold_canvas", "color_canvas"):
-            if not hasattr(self, canvas_name):
-                continue
-            canvas = getattr(self, canvas_name)
-            unscaled_raster = getattr(canvas, "_unscaled_render_raster", None)
-            if unscaled_raster is not None:
-                self.render_canvas_content(canvas, unscaled_raster)
-
-
-    def render_canvas_content(self, canvas, content):
+RENDER_CANVAS = r'''    def render_canvas_content(self, canvas, content):
         """Render supplied content, retain its unscaled raster, flush Tk repaint work."""
         if content is None:
             # Use the canonical transparent placeholder when no raster is supplied.
@@ -1865,50 +1136,174 @@ class DetectorApp:
 
         # Make the raw threshold stage paintable before sequential final-T processing continues.
         self.root.update_idletasks()
+'''
 
-
-    def close(self, _event=None):
+CLOSE = r'''    def close(self, _event=None):
         self.root.destroy()
+'''
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(description="threshold-finder stage for the eclipse detector rebuild.")
-    parser.add_argument(
-        "images",
-        nargs="*",
-        help="Optional ordered input image list; more images can be loaded in the GUI",
+def apply_production_cleanup(source: str) -> str:
+    # Move/generate the generic kernel function before constants that instantiate kernels.
+    source = replace_module_function(source, 'generate_kernel', '')
+    marker = '# ---------------------------------------------------------------------------\n# Per-image processing settings\n'
+    if marker not in source:
+        raise RuntimeError('settings marker not found')
+    source = source.replace(marker, GENERATE_KERNEL + '\n\n' + marker, 1)
+
+    replacements = {
+        'transparent_bgra': TRANSPARENT_BGRA,
+        'opaque_bgra': OPAQUE_BGRA,
+        '_component_descriptor': COMPONENT_DESCRIPTOR,
+        'topology_trajectory_from_separated_component': TOPOLOGY_TRAJECTORY,
+        'select_topology_knee': SELECT_TOPOLOGY_KNEE,
+        'optimize_separated_threshold': OPTIMIZE_SEPARATED,
+        'resize_img': RESIZE_IMG,
+        'find_histogram_start_threshold': HISTOGRAM,
+        'find_work_res_solar_component': FIND_WORK,
+        'dilate_component_mask': DILATE,
+        'find_lowest_full_res_threshold': FIND_LOWEST_FULL,
+        'find_auto_threshold': FIND_AUTO,
+        'cleanup_morphology_candidates': CLEANUP_MORPHOLOGY,
+        'seed_connected_cleanup_candidates': SEED_CONNECTED,
+        'evaluate_cleanup_candidates': EVALUATE_CLEANUP,
+        'refine_solar_component_mask': REFINE,
+        'decompress_full_mask': DECOMPRESS,
+        'resolve_threshold': RESOLVE,
+    }
+    for name, replacement in replacements.items():
+        source = replace_module_function(source, name, replacement)
+
+    # nearest_positive_odd belongs with resize/search primitives and has two real callers.
+    resize_end = RESIZE_IMG.rstrip() + '\n'
+    if source.count(resize_end) != 1:
+        raise RuntimeError('updated resize_img block not found exactly once')
+    source = source.replace(resize_end, resize_end + '\n\n' + NEAREST_ODD.rstrip() + '\n', 1)
+
+    old_constants = '''WORK_MAX_DIM = 1200\nPEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)\nROI_DILATION_FRACTION = 0.065\nGUARD_DILATION_FRACTION = 0.195\nAUTO_T_GUARD_DILATION_FRACTION = 0.10\nTOPOLOGY_OPTIMIZATION_STEPS = 5\nTRACKING_SEED_KERNEL_SIZE = 5\nSOLAR_COMPONENT_KERNEL_SIZE = 7\nSOLAR_COMPONENT_KERNEL = cv2.getStructuringElement(\n    cv2.MORPH_ELLIPSE,\n    (SOLAR_COMPONENT_KERNEL_SIZE, SOLAR_COMPONENT_KERNEL_SIZE),\n)\nREFINEMENT_ITERATIONS = 1'''
+    new_constants = '''WORK_RES_MAX_DIM = 1200\nPEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)\nROI_DILATION_FRACTION = 0.065\nGUARD_DILATION_FRACTION = 0.195\nAUTO_T_GUARD_DILATION_FRACTION = 0.10\nTOPOLOGY_OPTIMIZATION_STEPS = 5\n\n# Build the fixed final-T Euclidean cleanup kernel once and reuse it.\nSOLAR_COMPONENT_KERNEL = generate_kernel((7, 7), round_kernel=True)'''
+    if source.count(old_constants) != 1:
+        raise RuntimeError(f'constant block match count={source.count(old_constants)}')
+    source = source.replace(old_constants, new_constants, 1)
+
+    # The cleanup-size tuple was never used by production; keep only the candidate order.
+    source = source.replace('CLEANUP_KERNEL_SIZES = (3, 5, 7)\n', '', 1)
+
+    # Document the currently redundant explicit resolution state.
+    old_result = '''    full_res_seed_point: tuple[int, int] | None\n    resolved: bool\n    reason: str = ""'''
+    new_result = '''    full_res_seed_point: tuple[int, int] | None\n    # Currently equivalent to ``threshold is not None``. Kept explicit for now in\n    # case resolution-state semantics become independent later.\n    resolved: bool\n    reason: str = ""'''
+    if source.count(old_result) != 1:
+        raise RuntimeError('AutoThresholdResult field block not found')
+    source = source.replace(old_result, new_result, 1)
+
+    # GUI method replacements.
+    source = replace_class_method(source, 'DetectorApp', '_build_settings_panel', BUILD_SETTINGS)
+    source = replace_class_method(source, 'DetectorApp', '_add_slider', ADD_SLIDER)
+    source = replace_class_method(source, 'DetectorApp', 'apply_full_resolution', APPLY_FULL)
+    source = replace_class_method(source, 'DetectorApp', 'render_canvas_content', RENDER_CANVAS)
+    source = replace_class_method(source, 'DetectorApp', 'close', CLOSE)
+
+    # Insert the slider formatter after _add_slider and checkbox callbacks before center-target callback.
+    source = replace_class_method(
+        source,
+        'DetectorApp',
+        '_add_slider',
+        ADD_SLIDER.rstrip() + '\n\n' + FORMAT_SLIDER.rstrip(),
     )
-    parser.add_argument("--threshold", type=int, default=8)
-    parser.add_argument("--min-radius", type=float, default=1000.0)
-    parser.add_argument("--max-radius", type=float, default=1500.0)
-    parser.add_argument("--max-error", type=float, default=0.08)
-    parser.add_argument("--min-coverage", type=float, default=0.08)
-    return parser
+    center_marker = '    def _handle_center_target_change(self):\n'
+    if source.count(center_marker) != 1:
+        raise RuntimeError('center target handler marker not found')
+    source = source.replace(center_marker, CHECKBOX_HANDLERS.rstrip() + '\n\n' + center_marker, 1)
+
+    # Remove callback lambdas by allowing the existing actions to receive Tk events directly.
+    source = source.replace(
+        '        root.bind("<Return>", lambda _event: self.apply_full_resolution())\n'
+        '        root.bind("<Escape>", lambda _event: self.close())',
+        '        root.bind("<Return>", self.apply_full_resolution)\n'
+        '        root.bind("<Escape>", self.close)',
+        1,
+    )
+
+    # Typed Tk values need no round-trip coercion when stored or reused.
+    source = source.replace('            min_radius=int(self.min_radius.get()),', '            min_radius=self.min_radius.get(),')
+    source = source.replace('            max_radius=int(self.max_radius.get()),', '            max_radius=self.max_radius.get(),')
+    source = source.replace('            max_error=float(self.max_error.get()),', '            max_error=self.max_error.get(),')
+    source = source.replace('            min_coverage=int(self.min_coverage.get()),', '            min_coverage=self.min_coverage.get(),')
+    source = source.replace('            morphology=bool(self.morphology.get()),', '            morphology=self.morphology.get(),')
+    source = source.replace('            outer_limb_assistance=bool(self.outer_limb_assistance.get()),', '            outer_limb_assistance=self.outer_limb_assistance.get(),')
+    source = source.replace('            use_horizon=bool(self.use_horizon.get()),', '            use_horizon=self.use_horizon.get(),')
+    source = source.replace('            self.threshold.set(int(settings.threshold))', '            self.threshold.set(settings.threshold)')
+    source = source.replace('            selected_threshold = int(result.threshold)', '            selected_threshold = result.threshold')
+    source = source.replace('            threshold = int(value)', '            threshold = value')
+    source = source.replace('        threshold = int(settings.threshold)', '        threshold = settings.threshold')
+    source = source.replace('        raw_component = self.gray_image > threshold', '        threshold_mask = self.gray_image > threshold')
+    source = source.replace('self.render_canvas_content(self.threshold_canvas, raw_component)', 'self.render_canvas_content(self.threshold_canvas, threshold_mask)')
+
+    # Normalize resolution-qualified naming throughout production.
+    source = source.replace('WORK_MAX_DIM', 'WORK_RES_MAX_DIM')
+
+    # Current production should contain no lambda expressions after the GUI cleanup.
+    if 'lambda ' in source:
+        raise RuntimeError('lambda expression remains in production source')
+
+    return source
 
 
-def validate_args(args, parser):
-    if not 0 <= args.threshold <= 255:
-        parser.error("--threshold must be 0..255")
-    if args.min_radius <= 0:
-        parser.error("--min-radius must be > 0")
-    if args.max_radius <= 0:
-        parser.error("--max-radius must be > 0")
-    if args.max_radius < args.min_radius:
-        parser.error("--max-radius must be >= --min-radius")
-    if args.max_error <= 0:
-        parser.error("--max-error must be > 0")
-    if not 0 <= args.min_coverage <= 1:
-        parser.error("--min-coverage must be 0..1")
+def synchronize_retained_patch(text: str) -> str:
+    """Make the historical streamlined patch delegate to the current cleanup pass.
+
+    The large embedded strings intentionally reconstruct the pre-cleanup streamlined
+    architecture from its historical base. Keeping a second fully duplicated copy of
+    every later readability change would create two authoritative implementations.
+    Instead, the retained script applies that historical structural step and then
+    delegates the resulting source to ``apply_readability_cleanup.py``.
+    """
+    if "import runpy\n" not in text:
+        text = text.replace("import re\n", "import re\nimport runpy\n", 1)
+
+    old_main = (
+        'def main() -> None:\n'
+        '    target = Path(sys.argv[1] if len(sys.argv) > 1 else "circle_arc_detector.py")\n'
+        '    patch_source(target)'
+    )
+    new_main = (
+        'def main() -> None:\n'
+        '    target = Path(sys.argv[1] if len(sys.argv) > 1 else "circle_arc_detector.py")\n\n'
+        '    # Reconstruct the approved streamlined Auto-T architecture from its historical base.\n'
+        '    patch_source(target)\n\n'
+        '    # Apply the current readability/invariant cleanup once rather than duplicating\n'
+        '    # that implementation inside this historical transformation script.\n'
+        '    cleanup_path = Path(__file__).with_name("apply_readability_cleanup.py")\n'
+        '    cleanup = runpy.run_path(str(cleanup_path))\n'
+        '    source = target.read_text(encoding="utf-8")\n'
+        '    target.write_text(\n'
+        '        cleanup["apply_production_cleanup"](source),\n'
+        '        encoding="utf-8",\n'
+        '    )'
+    )
+    if text.count(old_main) != 1:
+        raise RuntimeError("retained streamlined patch main block not found")
+    text = text.replace(old_main, new_main, 1)
+
+    marker = "GENERATE_KERNEL = r'''def generate_kernel"
+    if marker in text and "Intermediate reconstruction only" not in text:
+        text = text.replace(
+            marker,
+            "# Intermediate reconstruction only; main() delegates final cleanup afterward.\n" + marker,
+            1,
+        )
+    return text
+
+def main() -> None:
+    source = SOURCE_PATH.read_text(encoding='utf-8')
+    updated = apply_production_cleanup(source)
+    ast.parse(updated)
+    SOURCE_PATH.write_text(updated, encoding='utf-8')
+
+    if RETAINED_PATCH_PATH.exists():
+        retained = RETAINED_PATCH_PATH.read_text(encoding='utf-8')
+        RETAINED_PATCH_PATH.write_text(synchronize_retained_patch(retained), encoding='utf-8')
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-    validate_args(args, parser)
-    root = tk.Tk()
-    DetectorApp(root, args.images, args)
-    root.mainloop()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

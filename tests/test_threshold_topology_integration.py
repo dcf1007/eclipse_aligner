@@ -26,33 +26,29 @@ def auto(gray):
 
 def base_separated_t(gray):
     full_res_height, full_res_width = gray.shape
-    if max(full_res_height, full_res_width) > tf.WORK_MAX_DIM:
-        scale = tf.WORK_MAX_DIM / float(max(full_res_height, full_res_width))
+    if max(full_res_height, full_res_width) > tf.WORK_RES_MAX_DIM:
+        scale = tf.WORK_RES_MAX_DIM / max(full_res_height, full_res_width)
         work_res_size = (
-            max(1, round(full_res_width * scale)),
-            max(1, round(full_res_height * scale)),
+            round(full_res_width * scale),
+            round(full_res_height * scale),
         )
     else:
         work_res_size = (full_res_width, full_res_height)
     work_res_gray = tf.resize_img(gray, work_res_size)
     start_T = tf.find_histogram_start_threshold(work_res_gray)
     work_res_T, work_res_component = tf.find_work_res_solar_component(
-        work_res_gray, start_T, tf.generate_kernel((tf.TRACKING_SEED_KERNEL_SIZE, tf.TRACKING_SEED_KERNEL_SIZE))
+        work_res_gray, start_T, tf.generate_kernel((5, 5))
     )
     full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height))
     assert full_res_search_mask.shape == gray.shape
 
-    mapped = tf.TRACKING_SEED_KERNEL_SIZE * max(gray.shape) / float(max(work_res_gray.shape))
-    low = max(1, int(math.floor(mapped)))
-    if low % 2 == 0:
-        low -= 1
-    high = low + 2
-    kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
+    mapped = 5 * max(gray.shape) / max(work_res_gray.shape)
+    kernel_size = tf.nearest_positive_odd(mapped)
     full_res_seed = tf.brightest_supported_component_point(
         gray, full_res_search_mask, tf.generate_kernel((kernel_size, kernel_size))
     )
     assert full_res_seed is not None
-    image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
+    image_scale = math.sqrt(full_res_width * full_res_height)
     guard = tf.dilate_component_mask(
         full_res_search_mask, tf.AUTO_T_GUARD_DILATION_FRACTION * image_scale
     )

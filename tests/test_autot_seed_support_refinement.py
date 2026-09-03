@@ -13,7 +13,7 @@ def test_seed_helper_uses_explicit_kernel_and_returns_none_without_fallback():
 
 
 def test_work_seed_kernel_is_generated_as_fixed_5x5_square():
-    kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
+    kernel = cad.generate_kernel((5, 5), round_kernel=False)
     assert kernel.shape == (5, 5)
     assert np.all(kernel == 1)
 
@@ -21,12 +21,8 @@ def test_work_seed_kernel_is_generated_as_fixed_5x5_square():
 def test_full_seed_support_maps_6016_to_25_square():
     full_shape = (4000, 6016)
     work_shape = (798, 1200)
-    mapped = cad.TRACKING_SEED_KERNEL_SIZE * max(full_shape) / float(max(work_shape))
-    low = max(1, int(np.floor(mapped)))
-    if low % 2 == 0:
-        low -= 1
-    high = low + 2
-    size = low if abs(mapped - low) <= abs(high - mapped) else high
+    mapped = 5 * max(full_shape) / max(work_shape)
+    size = cad.nearest_positive_odd(mapped)
     kernel = cad.generate_kernel((size, size), round_kernel=False)
     assert kernel.shape == (25, 25)
     assert np.all(kernel == 1)
@@ -35,8 +31,8 @@ def test_full_seed_support_maps_6016_to_25_square():
 def test_full_seed_support_stays_5_if_no_downscale():
     full_shape = (800, 1200)
     work_shape = full_shape
-    mapped = cad.TRACKING_SEED_KERNEL_SIZE * max(full_shape) / float(max(work_shape))
-    assert round(mapped) == 5
+    mapped = 5 * max(full_shape) / max(work_shape)
+    assert cad.nearest_positive_odd(mapped) == 5
     assert cad.generate_kernel((5, 5)).shape == (5, 5)
 
 

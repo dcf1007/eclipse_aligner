@@ -58,7 +58,7 @@ def test_sqrt_pixel_scale_preserves_linear_scaling_and_10_percent_guard():
 def test_working_resize_is_1200_max_and_grayscale_area():
     gray = np.arange(2000 * 1000, dtype=np.uint32).reshape(2000, 1000)
     gray = (gray % 256).astype(np.uint8)
-    scale = tf.WORK_MAX_DIM / float(max(gray.shape))
+    scale = tf.WORK_RES_MAX_DIM / max(gray.shape)
     work_size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
     work = tf.resize_img(gray, work_size)
     assert max(work.shape) == 1200

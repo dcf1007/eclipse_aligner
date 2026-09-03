@@ -63,7 +63,7 @@ def disk_gray(size=81, radius=20, threshold=100):
 
 
 def test_seed_support_is_explicit_5x5_square_with_no_fallback():
-    kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE), round_kernel=False)
+    kernel = cad.generate_kernel((5, 5), round_kernel=False)
     assert kernel.shape == (5, 5)
     assert np.all(kernel == 1)
     gray = np.zeros((21, 21), np.uint8)

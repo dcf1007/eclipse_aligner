@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import runpy
 import sys
 
 
@@ -464,6 +465,7 @@ def find_auto_threshold(
     return int(result.threshold)
 '''
 
+# Intermediate reconstruction only; main() delegates final cleanup afterward.
 GENERATE_KERNEL = r'''def generate_kernel(size: tuple[int, int], round_kernel: bool = False) -> np.ndarray:
     """Return a centered positive odd square or discrete Euclidean-disk kernel."""
     width, height = map(int, size)
@@ -721,7 +723,19 @@ def patch_source(path: Path) -> None:
 
 def main() -> None:
     target = Path(sys.argv[1] if len(sys.argv) > 1 else "circle_arc_detector.py")
+
+    # Reconstruct the approved streamlined Auto-T architecture from its historical base.
     patch_source(target)
+
+    # Apply the current readability/invariant cleanup once rather than duplicating
+    # that implementation inside this historical transformation script.
+    cleanup_path = Path(__file__).with_name("apply_readability_cleanup.py")
+    cleanup = runpy.run_path(str(cleanup_path))
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        cleanup["apply_production_cleanup"](source),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
