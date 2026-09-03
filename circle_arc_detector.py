@@ -121,33 +121,21 @@ def to_gray(image: np.ndarray) -> np.ndarray:
 
 def resize_img(
     img: np.ndarray,
-    size: tuple[int | None, int | None],
+    size: tuple[int, int],
+    mask: bool = False,
 ) -> np.ndarray:
-    """Resize to ``(width, height)``, inferring one omitted dimension if requested."""
+    """Resize to an explicit ``(width, height)``; masks always use exact nearest."""
     original_dtype = img.dtype
     original_height, original_width = img.shape[:2]
     width, height = size
-
-    if width is None and height is None:
-        raise ValueError("resize size must provide width, height, or both")
-    if width is None:
-        if height <= 0:
-            raise ValueError("resize height must be positive")
-        width = round(original_width * height / original_height)
-    elif height is None:
-        if width <= 0:
-            raise ValueError("resize width must be positive")
-        height = round(original_height * width / original_width)
 
     if width <= 0 or height <= 0:
         raise ValueError("resize dimensions must be positive")
     if (width, height) == (original_width, original_height):
         return img.copy()
 
-    is_binary = np.all((img == img.min()) | (img == img.max()))
-    if is_binary:
-        # OpenCV does not resize boolean arrays, but integer binary rasters must keep
-        # their exact original values instead of being truncated through uint8.
+    if mask:
+        # OpenCV cannot resize bool directly; preserve mask membership with exact nearest.
         resize_source = img.astype(np.uint8) if img.dtype == bool else img
         interpolation = cv2.INTER_NEAREST_EXACT
     elif width < original_width or height < original_height:
@@ -164,6 +152,66 @@ def resize_img(
     )
     return resized.astype(original_dtype, copy=False)
 
+
+def normalize_master_bgra16(image: np.ndarray) -> np.ndarray:
+    """Normalize an unchanged OpenCV load to lossless contiguous uint16 BGRA."""
+    source = np.asarray(image)
+    if source.dtype not in (np.uint8, np.uint16):
+        raise ValueError(f"master image dtype must be uint8 or uint16, got {source.dtype}")
+
+    if source.ndim == 2:
+        bgra = cv2.cvtColor(source, cv2.COLOR_GRAY2BGRA)
+    elif source.ndim == 3 and source.shape[2] == 3:
+        bgra = cv2.cvtColor(source, cv2.COLOR_BGR2BGRA)
+    elif source.ndim == 3 and source.shape[2] == 4:
+        bgra = source
+    else:
+        raise ValueError(f"unsupported master image shape: {source.shape}")
+
+    # Expanding uint8 by exactly 257 preserves every source code value in uint16.
+    if bgra.dtype == np.uint8:
+        bgra = bgra.astype(np.uint16) * 257
+    return np.ascontiguousarray(bgra, dtype=np.uint16)
+
+
+def master_bgra16_to_gray8(master_bgra16: np.ndarray) -> np.ndarray:
+    """Derive authoritative uint8 gray directly from the lossless uint16 BGRA master."""
+    master = np.asarray(master_bgra16)
+    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
+        raise ValueError("master image must be uint16 BGRA")
+
+    gray16 = cv2.cvtColor(master, cv2.COLOR_BGRA2GRAY)
+    # Fixed full-range mapping keeps T=0..255 comparable across all images.
+    return ((gray16.astype(np.uint32) + 128) // 257).astype(np.uint8)
+
+
+def master_bgra16_to_display_bgra8(master_bgra16: np.ndarray) -> np.ndarray:
+    """Derive a fixed-range uint8 BGRA display raster without modifying the master."""
+    master = np.asarray(master_bgra16)
+    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
+        raise ValueError("master image must be uint16 BGRA")
+    return ((master.astype(np.uint32) + 128) // 257).astype(np.uint8)
+
+
+def compress_master_bgra16(master_bgra16: np.ndarray) -> bytes:
+    """Compress one contiguous uint16 BGRA master with fast lossless zlib level 1."""
+    master = np.asarray(master_bgra16)
+    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
+        raise ValueError("master image must be uint16 BGRA")
+    return zlib.compress(np.ascontiguousarray(master).tobytes(), level=1)
+
+
+def decompress_master_bgra16(payload: bytes, shape: tuple[int, int, int]) -> np.ndarray:
+    """Restore a compressed uint16 BGRA master as a read-only ndarray view."""
+    if len(shape) != 3 or shape[2] != 4 or shape[0] <= 0 or shape[1] <= 0:
+        raise ValueError("master shape must be positive (height, width, 4)")
+    raw = zlib.decompress(payload)
+    expected_bytes = shape[0] * shape[1] * shape[2] * np.dtype(np.uint16).itemsize
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"compressed master has {len(raw)} bytes; expected {expected_bytes}"
+        )
+    return np.frombuffer(raw, dtype=np.uint16).reshape(shape)
 
 def nearest_positive_odd(value: float) -> int:
     """Return the nearest positive odd integer; exact ties choose the lower odd."""
@@ -193,9 +241,9 @@ class ImageSettings:
 # ---------------------------------------------------------------------------
 # Auto-T Stage A: source separation
 # ---------------------------------------------------------------------------
-# Stage A establishes one authoritative full-resolution seed-connected component
-# and the lowest threshold at which that component remains separated inside one
-# fixed 10% L2 guard. Stage A does not perform topology/morphology optimization.
+# Stage A establishes one fixed full-resolution seed/guard pair and the lowest T at
+# which a D7-cleaned seed-connected component remains separated. The temporary
+# proof component is discarded; Stage B rebuilds every component it evaluates.
 WORK_RES_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 AUTO_T_GUARD_DILATION_FRACTION = 0.10
@@ -372,8 +420,8 @@ def find_lowest_full_res_threshold(
     start_T: int,
     full_res_seed: tuple[int, int],
     full_res_guard_mask: np.ndarray,
-) -> tuple[int, np.ndarray]:
-    """Find the lowest enclosed full-res T by searching only the monotonic direction."""
+) -> int:
+    """Return the lowest T whose D7-cleaned seeded component remains separated."""
     if full_res_gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
     if not 0 <= start_T <= 255:
@@ -394,8 +442,9 @@ def find_lowest_full_res_threshold(
 
     guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
 
-    # Build the fixed one-pixel guard boundary once before either directional loop.
+    # Build the fixed guard boundary and strongest Stage-A cleanup kernel once.
     boundary_kernel = generate_kernel((3, 3), round_kernel=False)
+    separation_cleanup_kernel = generate_kernel((7, 7), round_kernel=True)
     eroded_guard = cv2.erode(
         guard_u8,
         boundary_kernel,
@@ -405,43 +454,81 @@ def find_lowest_full_res_threshold(
     ) != 0
     full_res_guard_boundary = guard & ~eroded_guard
 
-    # Evaluate the starting work-resolution T on the authoritative source raster.
+    # Evaluate the starting T after the same maximum cleanup allowed by Stage A.
     binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
-    cv2.bitwise_and(binary, guard_u8, dst=binary)
     if binary[seed_y, seed_x] == 0:
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed is not light at start T={start_T}"
         )
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        separation_cleanup_kernel,
+        iterations=1,
+    )
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        separation_cleanup_kernel,
+        iterations=1,
+    )
+    if binary[seed_y, seed_x] == 0:
+        raise ThresholdResolutionError(
+            f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
+        )
+    cv2.bitwise_and(binary, guard_u8, dst=binary)
     cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
     component = binary == 128
     enclosed = not np.any(component & full_res_guard_boundary)
 
     if enclosed:
         best_T = start_T
-        best_component = component
         for threshold in range(start_T - 1, -1, -1):
             binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_OPEN,
+                separation_cleanup_kernel,
+                iterations=1,
+            )
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_CLOSE,
+                separation_cleanup_kernel,
+                iterations=1,
+            )
             cv2.bitwise_and(binary, guard_u8, dst=binary)
             cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
             component = binary == 128
             if np.any(component & full_res_guard_boundary):
                 break
             best_T = threshold
-            best_component = component
-        return best_T, best_component
+        return best_T
 
     for threshold in range(start_T + 1, 256):
         binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-        cv2.bitwise_and(binary, guard_u8, dst=binary)
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_OPEN,
+            separation_cleanup_kernel,
+            iterations=1,
+        )
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            separation_cleanup_kernel,
+            iterations=1,
+        )
         if binary[seed_y, seed_x] == 0:
             break
+        cv2.bitwise_and(binary, guard_u8, dst=binary)
         cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
         component = binary == 128
         if not np.any(component & full_res_guard_boundary):
-            return threshold, component
+            return threshold
 
     raise ThresholdResolutionError(
-        "Tracked full-resolution solar component never became enclosed by the 10% guard"
+        "Tracked full-resolution solar component never became separated after D7 cleanup"
     )
 
 
@@ -488,6 +575,7 @@ def find_auto_threshold(
         full_res_search_mask = resize_img(
             work_res_component,
             (full_res_width, full_res_height),
+            mask=True,
         )
 
         # Preserve the 5-pixel work support footprint at the realized source scale.
@@ -520,7 +608,7 @@ def find_auto_threshold(
         )
 
         # Find the exact source separation boundary by searching only the required monotonic direction.
-        full_res_T, full_res_component = find_lowest_full_res_threshold(
+        full_res_T = find_lowest_full_res_threshold(
             full_res_gray,
             work_res_T,
             full_res_seed,
@@ -539,13 +627,13 @@ def find_auto_threshold(
         image_state["auto_threshold_result"] = result
         raise
 
-    # Stage A is complete: these are the proven source-separation T, component, and seed.
-    # Stage B may raise T to an optimization knee but must never lower this Stage-A result.
+    # Stage A is complete: only the minimum separation T, fixed seed, and fixed guard cross the boundary.
+    # Stage B rebuilds and evaluates its own components and may raise T, but never lower Stage A's result.
     topology_selection = optimize_separated_threshold(
         full_res_gray,
         full_res_T,
         full_res_seed,
-        full_res_component,
+        full_res_guard_mask,
     )
     result = AutoThresholdResult(
         threshold=topology_selection.threshold,
@@ -631,45 +719,44 @@ def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTop
     )
 
 
-def topology_trajectory_from_separated_component(
+def topology_trajectory_from_separation_threshold(
     full_res_gray: np.ndarray,
     base_threshold: int,
     seed_point: tuple[int, int],
-    base_component: np.ndarray,
+    full_res_guard_mask: np.ndarray,
     max_delta: int = TOPOLOGY_OPTIMIZATION_STEPS,
 ) -> tuple[ThresholdTopology, ...]:
-    """Measure exact seeded topology for T..T+max_delta in the base-component crop."""
-    base_component = np.asarray(base_component, dtype=bool)
-    if base_component.ndim != 2 or not np.any(base_component):
-        raise ValueError("base component must be a non-empty two-dimensional mask")
+    """Measure the current D7-cleaned Stage-B baseline from T through T+max_delta."""
+    if full_res_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
     if not 0 <= base_threshold <= 255:
         raise ValueError("base threshold must be 0..255")
     if max_delta < 0:
         raise ValueError("max_delta must be non-negative")
 
-    ys, xs = np.nonzero(base_component)
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    base_crop = base_component[y0:y1, x0:x1]
-    gray_crop = full_res_gray[y0:y1, x0:x1]
+    guard = np.asarray(full_res_guard_mask, dtype=bool)
+    if guard.shape != full_res_gray.shape or not np.any(guard):
+        raise ValueError("Stage-B guard must be a non-empty mask matching grayscale")
     seed_x, seed_y = seed_point
-    sx = seed_x - x0
-    sy = seed_y - y0
-    if not (0 <= sx < gray_crop.shape[1] and 0 <= sy < gray_crop.shape[0]):
-        raise ValueError("seed lies outside base component crop")
+    height, width = full_res_gray.shape
+    if not (0 <= seed_x < width and 0 <= seed_y < height) or not guard[seed_y, seed_x]:
+        raise ValueError("Stage-B seed must lie inside the guard")
 
+    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
+    cleanup_kernel = generate_kernel((7, 7), round_kernel=True)
     trajectory: list[ThresholdTopology] = []
     max_threshold = min(255, base_threshold + max_delta)
     for threshold in range(base_threshold, max_threshold + 1):
-        light = base_crop & (gray_crop > threshold)
-        if not light[sy, sx]:
+        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cleanup_kernel, iterations=1)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cleanup_kernel, iterations=1)
+        if binary[seed_y, seed_x] == 0:
             break
+        cv2.bitwise_and(binary, guard_u8, dst=binary)
+        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+        component = binary == 128
 
-        flood = np.where(light, 255, 0).astype(np.uint8)
-        cv2.floodFill(flood, None, (sx, sy), 128, flags=8)
-        component = flood == 128
-
-        # Measure the fixed seed's connected component at this threshold.
+        # Measure a fresh Stage-B component at each T; Stage A provides no reference mask.
         trajectory.append(_component_descriptor(component, threshold))
 
     if not trajectory:
@@ -756,16 +843,17 @@ def optimize_separated_threshold(
     full_res_gray: np.ndarray,
     base_threshold: int,
     seed_point: tuple[int, int],
-    base_component: np.ndarray,
+    full_res_guard_mask: np.ndarray,
     max_delta: int = TOPOLOGY_OPTIMIZATION_STEPS,
 ) -> ThresholdTopologySelection:
-    """Optimize a proven separated threshold without ever lowering it."""
-    # Measure the fixed seed's topology from the proven separated T upward.
-    trajectory = topology_trajectory_from_separated_component(
+    """Run the current Stage-B baseline from Stage A's T/seed/guard contract."""
+    # Rebuild each topology sample from grayscale, T, seed, and guard; no Stage-A
+    # component is authoritative or passed across the stage boundary.
+    trajectory = topology_trajectory_from_separation_threshold(
         full_res_gray,
         base_threshold,
         seed_point,
-        base_component,
+        full_res_guard_mask,
         max_delta=max_delta,
     )
 
@@ -1147,7 +1235,8 @@ class DetectorApp:
         self.image_paths = [os.path.abspath(path) for path in image_paths]
         self.current_index = -1
         self.current_path: str | None = None
-        self.color_image = None
+        self.master_image_payload: bytes | None = None
+        self.master_image_shape: tuple[int, int, int] | None = None
         self.gray_image = None
 
         # Per-image state keeps settings, the cached automatic threshold result,
@@ -1243,7 +1332,8 @@ class DetectorApp:
         self.image_paths = [os.path.abspath(path) for path in selected]
         self.current_index = -1
         self.current_path = None
-        self.color_image = None
+        self.master_image_payload = None
+        self.master_image_shape = None
         self.gray_image = None
         self.load_image_at(0)
 
@@ -1253,12 +1343,15 @@ class DetectorApp:
             return
 
         path = self.image_paths[index]
-        image = cv2.imread(path, cv2.IMREAD_COLOR)
+
+        # Load source pixels without changing their channel count or integer depth.
+        unchanged_image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         self.current_index = index
         self.current_path = path
 
-        if image is None:
-            self.color_image = None
+        if unchanged_image is None:
+            self.master_image_payload = None
+            self.master_image_shape = None
             self.gray_image = None
             if hasattr(self, "threshold_canvas"):
                 self.render_canvas_content(self.threshold_canvas, transparent_bgra())
@@ -1268,8 +1361,14 @@ class DetectorApp:
             self.update_navigation_state()
             return
 
-        self.color_image = opaque_bgra(image)
-        self.gray_image = to_gray(image)
+        # Normalize once to the lossless uint16 BGRA master used by future transforms.
+        master_image = normalize_master_bgra16(unchanged_image)
+
+        # Derive the authoritative uint8 processing grayscale directly from that master.
+        self.gray_image = master_bgra16_to_gray8(master_image)
+
+        # Derive a temporary uint8 color raster only for the Tk canvas display path.
+        display_image = master_bgra16_to_display_bgra8(master_image)
 
         if path in self.image_state:
             state = self.image_state[path]
@@ -1293,7 +1392,12 @@ class DetectorApp:
 
         self._update_center_preview_label()
         if hasattr(self, "color_canvas"):
-            self.render_canvas_content(self.color_canvas, self.color_image)
+            self.render_canvas_content(self.color_canvas, display_image)
+
+        # The canvas retains its own display raster. Keep only a compressed exact master
+        # until full-color transform/export code starts consuming the master directly.
+        self.master_image_shape = master_image.shape
+        self.master_image_payload = compress_master_bgra16(master_image)
 
         if settings.threshold is None:
             # None has one meaning only: this image has never had T initialized.
@@ -1321,7 +1425,12 @@ class DetectorApp:
     def update_navigation_state(self):
         count = len(self.image_paths)
         has_current = 0 <= self.current_index < count
-        readable = has_current and self.color_image is not None
+        readable = (
+            has_current
+            and self.gray_image is not None
+            and self.master_image_payload is not None
+            and self.master_image_shape is not None
+        )
 
         self.previous_button.config(
             state=tk.NORMAL if has_current and self.current_index > 0 else tk.DISABLED

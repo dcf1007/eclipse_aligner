@@ -38,10 +38,10 @@ def test_nearest_positive_odd_preserves_lower_tie_rule():
         cad.nearest_positive_odd(0)
 
 
-def test_uint16_binary_resize_preserves_exact_values():
+def test_uint16_binary_resize_preserves_exact_values_when_declared_mask():
     mask = np.zeros((5, 7), dtype=np.uint16)
     mask[1:4, 2:6] = 65535
-    resized = cad.resize_img(mask, (17, 13))
+    resized = cad.resize_img(mask, (17, 13), mask=True)
     assert resized.dtype == np.uint16
     assert set(np.unique(resized)) == {0, 65535}
 
@@ -67,7 +67,7 @@ def test_topology_optimizer_has_no_silent_fallback(monkeypatch):
     def fail(*_args, **_kwargs):
         raise ValueError("descriptor invariant failed")
 
-    monkeypatch.setattr(cad, "topology_trajectory_from_separated_component", fail)
+    monkeypatch.setattr(cad, "topology_trajectory_from_separation_threshold", fail)
     with pytest.raises(ValueError, match="descriptor invariant failed"):
         cad.optimize_separated_threshold(
             np.ones((9, 9), dtype=np.uint8),

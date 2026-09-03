@@ -17,7 +17,7 @@ def _state():
 
 def test_resize_img_binary_uses_exact_nearest_coordinate_mapping():
     source = np.array([[0, 0, 255, 0, 0]], dtype=np.uint8)
-    resized = cad.resize_img(source, (3, 1))
+    resized = cad.resize_img(source, (3, 1), mask=True)
     assert resized.dtype == source.dtype
     assert resized.shape == (1, 3)
     assert resized.tolist() == [[0, 255, 0]]
@@ -30,10 +30,12 @@ def test_resize_img_preserves_bgra_uint16_dtype_channels_and_aspect_ratio():
     assert resized.shape == (2, 3, 4)
 
 
-def test_resize_img_calculates_one_missing_dimension():
+def test_resize_img_requires_complete_explicit_size():
     image = np.arange(4 * 6, dtype=np.uint8).reshape(4, 6)
-    assert cad.resize_img(image, (3, None)).shape == (2, 3)
-    assert cad.resize_img(image, (None, 2)).shape == (2, 3)
+    with pytest.raises((TypeError, ValueError)):
+        cad.resize_img(image, (3, None))
+    with pytest.raises((TypeError, ValueError)):
+        cad.resize_img(image, (None, 2))
 
 def test_histogram_start_threshold_returns_only_preceding_left_valley():
     gray = np.concatenate(
@@ -117,32 +119,28 @@ def _guard(shape=(21, 21)):
 
 def test_full_res_threshold_search_moves_down_only_when_start_is_enclosed():
     gray = np.zeros((21, 21), np.uint8)
-    gray[8:13, 8:13] = 30
-    gray[10, 12:18] = 10  # joins the guard boundary only when T drops below 10
-    T, component = cad.find_lowest_full_res_threshold(
+    gray[6:15, 6:15] = 30
+    gray[7:14, 14:18] = 10  # D7-surviving bridge reaches guard only below T10
+    T = cad.find_lowest_full_res_threshold(
         gray,
         10,
         (10, 10),
         _guard(),
     )
     assert T == 10
-    assert component[10, 10]
-    assert not component[10, 17]
 
 
 def test_full_res_threshold_search_moves_up_only_when_start_touches_guard():
     gray = np.zeros((21, 21), np.uint8)
-    gray[8:13, 8:13] = 30
-    gray[10, 12:18] = 11  # light at T10, dark at T11
-    T, component = cad.find_lowest_full_res_threshold(
+    gray[6:15, 6:15] = 30
+    gray[7:14, 14:18] = 11  # D7-surviving bridge is light at T10, dark at T11
+    T = cad.find_lowest_full_res_threshold(
         gray,
         10,
         (10, 10),
         _guard(),
     )
     assert T == 11
-    assert component[10, 10]
-    assert not component[10, 17]
 
 
 def test_dilate_component_mask_returns_only_one_full_resolution_mask():
@@ -205,12 +203,12 @@ def test_auto_maps_work_component_directly_to_exact_full_res_size(monkeypatch):
     monkeypatch.setattr(
         cad,
         "find_lowest_full_res_threshold",
-        lambda _gray, start_T, _seed, _guard: (start_T, np.ones(full_res_gray.shape, bool)),
+        lambda _gray, start_T, _seed, _guard: start_T,
     )
     monkeypatch.setattr(
         cad,
         "optimize_separated_threshold",
-        lambda _gray, base_T, _seed, _component: cad.ThresholdTopologySelection(
+        lambda _gray, base_T, _seed, _guard: cad.ThresholdTopologySelection(
             threshold=base_T,
             base_threshold=base_T,
             delta=0,

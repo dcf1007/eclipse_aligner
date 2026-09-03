@@ -747,6 +747,15 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    # Apply the final pre-freeze Stage-A/input contract after the layout finalizer.
+    prefreeze_path = Path(__file__).with_name("apply_stage_a_prefreeze_updates.py")
+    prefreeze = runpy.run_path(str(prefreeze_path))
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        prefreeze["apply_prefreeze_updates"](source),
+        encoding="utf-8",
+    )
+
 
 if __name__ == "__main__":
     main()

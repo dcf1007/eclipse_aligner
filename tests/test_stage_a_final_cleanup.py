@@ -75,9 +75,7 @@ def test_stage_b_threshold_resolution_error_is_not_classified_as_stage_a_failure
         return np.ones(component.shape, dtype=bool)
 
     def source_boundary(_gray, _start_T, _seed, _guard):
-        component = np.zeros(gray.shape, dtype=bool)
-        component[8:23, 8:23] = True
-        return 6, component
+        return 6
 
     def fail_stage_b(*_args, **_kwargs):
         raise cad.ThresholdResolutionError("stage-b sentinel")

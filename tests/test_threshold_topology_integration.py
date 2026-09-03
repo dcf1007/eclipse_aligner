@@ -39,7 +39,7 @@ def base_separated_t(gray):
     work_res_T, work_res_component = tf.find_work_res_solar_component(
         work_res_gray, start_T, tf.generate_kernel((5, 5))
     )
-    full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height))
+    full_res_search_mask = tf.resize_img(work_res_component, (full_res_width, full_res_height), mask=True)
     assert full_res_search_mask.shape == gray.shape
 
     mapped = 5 * max(gray.shape) / max(work_res_gray.shape)
@@ -52,7 +52,7 @@ def base_separated_t(gray):
     guard = tf.dilate_component_mask(
         full_res_search_mask, tf.AUTO_T_GUARD_DILATION_FRACTION * image_scale
     )
-    separated_t, _component = tf.find_lowest_full_res_threshold(
+    separated_t = tf.find_lowest_full_res_threshold(
         gray, work_res_T, full_res_seed, guard
     )
     return separated_t
