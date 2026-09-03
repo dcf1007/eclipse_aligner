@@ -737,6 +737,16 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    # Apply the final Stage-A ownership/layout pass so rebuilding from the historical
+    # base cannot recreate the pre-boundary source organization.
+    finalizer_path = Path(__file__).with_name("apply_stage_a_final_cleanup.py")
+    finalizer = runpy.run_path(str(finalizer_path))
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        finalizer["finalize_stage_a_source"](source),
+        encoding="utf-8",
+    )
+
 
 if __name__ == "__main__":
     main()

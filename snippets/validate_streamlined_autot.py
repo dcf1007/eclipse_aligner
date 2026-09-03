@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Report the streamlined Auto-T stages for supplied image files.
+"""Report current Stage-A and Stage-B Auto-T checkpoints for supplied images.
 
 Usage:
     python snippets/validate_streamlined_autot.py image1.jpg image2.jpg ...
 
-The report intentionally exposes the work-resolution T and the base full-resolution
-10%-guard separation T before Stage B so difficult-case regressions can be compared
-without adding transient fields to AutoThresholdResult.
+The report exposes the histogram start T, mature work-resolution T, mapped
+source support size/seed, the Stage-A full-resolution separation T, and the
+currently selected Stage-B T without adding transient fields to
+AutoThresholdResult.
 """
 
 from __future__ import annotations
@@ -16,65 +17,90 @@ import math
 import sys
 
 import cv2
-import numpy as np
 
 import circle_arc_detector as cad
 
 
 def stages(path: Path):
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    # Match the production GUI's current canonical 8-bit BGR input path.
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"could not read {path}")
     full_res_gray = cad.to_gray(image)
     full_res_height, full_res_width = full_res_gray.shape
-    if max(full_res_height, full_res_width) > cad.WORK_MAX_DIM:
-        scale = cad.WORK_MAX_DIM / float(max(full_res_height, full_res_width))
+    full_res_max_dim = max(full_res_height, full_res_width)
+
+    # Build the explicit work-resolution raster size used by Stage A.
+    if full_res_max_dim > cad.WORK_RES_MAX_DIM:
+        scale = cad.WORK_RES_MAX_DIM / full_res_max_dim
         work_res_size = (
-            max(1, round(full_res_width * scale)),
-            max(1, round(full_res_height * scale)),
+            round(full_res_width * scale),
+            round(full_res_height * scale),
         )
     else:
         work_res_size = (full_res_width, full_res_height)
     work_res_gray = cad.resize_img(full_res_gray, work_res_size)
+
+    # Establish and track the current 5x5-supported work-resolution identity.
     start_T = cad.find_histogram_start_threshold(work_res_gray)
-    work_kernel = cad.generate_kernel((cad.TRACKING_SEED_KERNEL_SIZE, cad.TRACKING_SEED_KERNEL_SIZE))
+    work_kernel = cad.generate_kernel((5, 5), round_kernel=False)
     work_res_T, work_res_component = cad.find_work_res_solar_component(
-        work_res_gray, start_T, work_kernel
+        work_res_gray,
+        start_T,
+        work_kernel,
     )
+
+    # Transfer only mature component geometry onto the exact source grid.
     full_res_search_mask = cad.resize_img(
         work_res_component,
         (full_res_width, full_res_height),
     )
 
-    mapped = (
-        cad.TRACKING_SEED_KERNEL_SIZE
-        * max(full_res_gray.shape)
-        / float(max(work_res_gray.shape))
+    # Map the work support footprint to the realized source scale.
+    mapped_kernel_size = 5 * max(full_res_gray.shape) / max(work_res_gray.shape)
+    kernel_size = cad.nearest_positive_odd(mapped_kernel_size)
+    full_kernel = cad.generate_kernel(
+        (kernel_size, kernel_size),
+        round_kernel=False,
     )
-    low = max(1, int(math.floor(mapped)))
-    if low % 2 == 0:
-        low -= 1
-    high = low + 2
-    kernel_size = low if abs(mapped - low) <= abs(high - mapped) else high
-    full_kernel = cad.generate_kernel((kernel_size, kernel_size))
+
+    # Select the fixed supported source seed inside the transferred mature mask.
     full_res_seed = cad.brightest_supported_component_point(
-        full_res_gray, full_res_search_mask, full_kernel
+        full_res_gray,
+        full_res_search_mask,
+        full_kernel,
     )
     if full_res_seed is None:
         raise RuntimeError("no full-resolution supported seed")
 
-    image_scale = math.sqrt(float(full_res_width) * float(full_res_height))
+    # Build the fixed 10% L2 guard and find Stage A's source separation boundary.
+    image_scale = math.sqrt(full_res_width * full_res_height)
     guard = cad.dilate_component_mask(
         full_res_search_mask,
         cad.AUTO_T_GUARD_DILATION_FRACTION * image_scale,
     )
     full_res_T, full_res_component = cad.find_lowest_full_res_threshold(
-        full_res_gray, work_res_T, full_res_seed, guard
+        full_res_gray,
+        work_res_T,
+        full_res_seed,
+        guard,
     )
+
+    # Apply the current Stage-B selector only after Stage A is fully resolved.
     selection = cad.optimize_separated_threshold(
-        full_res_gray, full_res_T, full_res_seed, full_res_component
+        full_res_gray,
+        full_res_T,
+        full_res_seed,
+        full_res_component,
     )
-    return start_T, work_res_T, kernel_size, full_res_seed, full_res_T, selection.threshold
+    return (
+        start_T,
+        work_res_T,
+        kernel_size,
+        full_res_seed,
+        full_res_T,
+        selection.threshold,
+    )
 
 
 def main():

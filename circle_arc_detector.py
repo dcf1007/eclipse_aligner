@@ -27,7 +27,7 @@ writes ``AutoThresholdResult`` into the current image state and returns T; it do
 not build SolarData. ``refresh_preview()`` first displays the pure full-resolution
 ``gray > T`` raster, then sequentially calls ``resolve_threshold()``. That one atomic
 final-T function identifies the full-resolution solar component, selects the
-authoritative seed from the unrefined component, applies 7x7 elliptical OPEN/CLOSE,
+authoritative seed from the unrefined component, applies a 7x7 Euclidean OPEN/CLOSE,
 validates that the seed survives, constructs/stores SolarData from that same refined
 mask, and returns the mask for final display. Auto, manual, and restored thresholds
 therefore share exactly the same final-T path. ``full_resolution`` remains a future
@@ -38,7 +38,7 @@ The threshold algorithm uses authoritative 8-bit grayscale with fixed semantics
 raster, starts from the left valley of the rightmost locally smoothed histogram mode,
 establishes one 5x5-supported work-resolution solar seed, and tracks that same
 8-connected component downward. The tracked work-resolution component is resized to
-full resolution only to delimit the full-resolution seed search and a rounded 10%
+full resolution only to delimit the full-resolution seed search and the fixed 10% L2-distance
 guard. Auto-T then starts from the work-resolution T and searches only in the
 monotonic direction needed to find the lowest full-resolution threshold whose seeded
 component stays inside that fixed guard. If no supported work-resolution seed can be
@@ -70,6 +70,9 @@ SLIDER_KEY_RELEASE_SETTLE_MS = 45
 CANVAS_REDRAW_DELAY_MS = 60
 
 
+# ---------------------------------------------------------------------------
+# Generic image and kernel utilities
+# ---------------------------------------------------------------------------
 def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
     """Return a BGRA frame whose pixels are fully transparent (alpha = 0)."""
     if width <= 0 or height <= 0:
@@ -105,6 +108,70 @@ def generate_kernel(
     return ellipse.astype(np.uint8)
 
 
+def to_gray(image: np.ndarray) -> np.ndarray:
+    """Convert once to authoritative 8-bit grayscale."""
+    if image.ndim == 2:
+        return image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8)
+    if image.ndim == 3 and image.shape[2] == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim == 3 and image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    raise ValueError(f"Unsupported image shape: {image.shape}")
+
+
+def resize_img(
+    img: np.ndarray,
+    size: tuple[int | None, int | None],
+) -> np.ndarray:
+    """Resize to ``(width, height)``, inferring one omitted dimension if requested."""
+    original_dtype = img.dtype
+    original_height, original_width = img.shape[:2]
+    width, height = size
+
+    if width is None and height is None:
+        raise ValueError("resize size must provide width, height, or both")
+    if width is None:
+        if height <= 0:
+            raise ValueError("resize height must be positive")
+        width = round(original_width * height / original_height)
+    elif height is None:
+        if width <= 0:
+            raise ValueError("resize width must be positive")
+        height = round(original_height * width / original_width)
+
+    if width <= 0 or height <= 0:
+        raise ValueError("resize dimensions must be positive")
+    if (width, height) == (original_width, original_height):
+        return img.copy()
+
+    is_binary = np.all((img == img.min()) | (img == img.max()))
+    if is_binary:
+        # OpenCV does not resize boolean arrays, but integer binary rasters must keep
+        # their exact original values instead of being truncated through uint8.
+        resize_source = img.astype(np.uint8) if img.dtype == bool else img
+        interpolation = cv2.INTER_NEAREST_EXACT
+    elif width < original_width or height < original_height:
+        resize_source = img
+        interpolation = cv2.INTER_AREA
+    else:
+        resize_source = img
+        interpolation = cv2.INTER_LANCZOS4
+
+    resized = cv2.resize(
+        resize_source,
+        (width, height),
+        interpolation=interpolation,
+    )
+    return resized.astype(original_dtype, copy=False)
+
+
+def nearest_positive_odd(value: float) -> int:
+    """Return the nearest positive odd integer; exact ties choose the lower odd."""
+    if value <= 0:
+        raise ValueError("value must be positive")
+    return 2 * math.ceil(value / 2) - 1
+
+
 # ---------------------------------------------------------------------------
 # Per-image processing settings
 # ---------------------------------------------------------------------------
@@ -124,17 +191,382 @@ class ImageSettings:
 
 
 # ---------------------------------------------------------------------------
-# Grayscale automatic threshold finder
+# Auto-T Stage A: source separation
 # ---------------------------------------------------------------------------
+# Stage A establishes one authoritative full-resolution seed-connected component
+# and the lowest threshold at which that component remains separated inside one
+# fixed 10% L2 guard. Stage A does not perform topology/morphology optimization.
 WORK_RES_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
-ROI_DILATION_FRACTION = 0.065
-GUARD_DILATION_FRACTION = 0.195
 AUTO_T_GUARD_DILATION_FRACTION = 0.10
-TOPOLOGY_OPTIMIZATION_STEPS = 5
 
-# Build the fixed final-T Euclidean cleanup kernel once and reuse it.
-SOLAR_COMPONENT_KERNEL = generate_kernel((7, 7), round_kernel=True)
+
+class ThresholdResolutionError(RuntimeError):
+    """Expected inability to establish/track a separated solar component."""
+
+
+@dataclass(frozen=True)
+class AutoThresholdResult:
+    threshold: int | None
+    histogram_start_threshold: int
+    work_res_threshold: int | None
+    full_res_seed_point: tuple[int, int] | None
+    # Currently equivalent to ``threshold is not None``. Kept explicit for now in
+    # case resolution-state semantics become independent later.
+    resolved: bool
+    reason: str = ""
+
+
+def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
+    """Return the left valley preceding the rightmost 3-bin-smoothed histogram mode."""
+    histogram = np.bincount(work_res_gray.ravel(), minlength=256).astype(np.float64)
+    signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
+
+    rightmost_peak = None
+    for index in range(1, len(signal) - 1):
+        if signal[index] >= signal[index - 1] and signal[index] > signal[index + 1]:
+            rightmost_peak = index
+    if signal[-1] > signal[-2]:
+        rightmost_peak = len(signal) - 1
+    if rightmost_peak is None:
+        rightmost_peak = int(np.argmax(signal))
+
+    for index in range(rightmost_peak - 1, 0, -1):
+        if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
+            return index
+    return 0
+
+
+def brightest_supported_component_point(
+    gray: np.ndarray,
+    component: np.ndarray,
+    support_kernel: np.ndarray,
+) -> tuple[int, int] | None:
+    """Return the brightest support-eligible component pixel; depth breaks ties.
+
+    The caller owns support geometry and the meaning of an unavailable point. Empty
+    or unsupported components return ``None``; malformed caller inputs remain errors.
+    """
+    source = (np.asarray(component) != 0).astype(np.uint8)
+    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
+    if gray.shape != source.shape:
+        raise ValueError("gray and component must have identical shapes")
+    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
+        raise ValueError("support kernel must be a non-empty two-dimensional mask")
+    if not np.any(source):
+        return None
+
+    supported = cv2.erode(
+        source,
+        support_kernel,
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    ) != 0
+    if not np.any(supported):
+        return None
+
+    max_gray = int(gray[supported].max())
+    brightest = supported & (gray == max_gray)
+    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+    scores = np.where(brightest, distance, -1.0)
+    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    return int(x), int(y)
+
+
+def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
+    """Return the largest 8-connected bright component enclosed by the raster."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (binary != 0).astype(np.uint8),
+        connectivity=8,
+    )
+    height, width = binary.shape
+    best_label = None
+    best_area = None
+    for label in range(1, count):
+        x, y, component_width, component_height, area = stats[label]
+        if (
+            x == 0
+            or y == 0
+            or x + component_width >= width
+            or y + component_height >= height
+        ):
+            continue
+        if best_label is None or area > best_area:
+            best_area = area
+            best_label = label
+    if best_label is None:
+        return None
+    return labels == best_label
+
+
+def find_work_res_solar_component(
+    work_res_gray: np.ndarray,
+    start_T: int,
+    work_res_seed_kernel: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    """Establish one supported work-res seed, then track only that identity downward."""
+    seed: tuple[int, int] | None = None
+    work_res_T: int | None = None
+    work_res_component: np.ndarray | None = None
+
+    for threshold in range(start_T, -1, -1):
+        if seed is None:
+            # Before identity is established, propose the largest enclosed bright component.
+            component = largest_enclosed_bright_component(work_res_gray > threshold)
+            if component is not None:
+                # Accept the first candidate with the required full seed-support footprint.
+                seed = brightest_supported_component_point(
+                    work_res_gray,
+                    component,
+                    work_res_seed_kernel,
+                )
+                if seed is not None:
+                    work_res_T = threshold
+                    work_res_component = component
+        else:
+            binary = work_res_gray > threshold
+            flooded = np.where(binary, 255, 0).astype(np.uint8)
+            cv2.floodFill(flooded, None, seed, 128, flags=8)
+            component = flooded == 128
+
+            if (
+                np.any(component[0])
+                or np.any(component[-1])
+                or np.any(component[:, 0])
+                or np.any(component[:, -1])
+            ):
+                break
+
+            work_res_T = threshold
+            work_res_component = component
+
+    if seed is None or work_res_T is None or work_res_component is None:
+        raise ThresholdResolutionError(
+            "No 5x5-supported enclosed bright component exists through T=0"
+        )
+
+    return work_res_T, work_res_component
+
+
+def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
+    """Return every raster pixel within ``margin`` L2 pixels of the component."""
+    component = np.asarray(component_mask, dtype=bool)
+    if component.ndim != 2:
+        raise ValueError("component mask must be two-dimensional")
+    if not np.any(component):
+        raise ThresholdResolutionError("Cannot dilate empty solar component")
+    if margin < 0:
+        raise ValueError("dilation margin must be non-negative")
+
+    # distanceTransform measures each non-component pixel's L2 distance to the
+    # nearest zero pixel, so encode the component itself as zero and threshold the
+    # resulting full-frame distance field at the requested dilation margin.
+    outside = np.where(component, 0, 255).astype(np.uint8)
+    distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
+    return distance <= margin
+
+
+def find_lowest_full_res_threshold(
+    full_res_gray: np.ndarray,
+    start_T: int,
+    full_res_seed: tuple[int, int],
+    full_res_guard_mask: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    """Find the lowest enclosed full-res T by searching only the monotonic direction."""
+    if full_res_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
+    if not 0 <= start_T <= 255:
+        raise ValueError("start threshold must be 0..255")
+
+    guard = np.asarray(full_res_guard_mask, dtype=bool)
+    if guard.shape != full_res_gray.shape:
+        raise ValueError("full-resolution guard and grayscale image must have identical shapes")
+    if not np.any(guard):
+        raise ThresholdResolutionError("Full-resolution Auto-T guard is empty")
+
+    seed_x, seed_y = full_res_seed
+    height, width = full_res_gray.shape
+    if not (0 <= seed_x < width and 0 <= seed_y < height):
+        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the image")
+    if not guard[seed_y, seed_x]:
+        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
+
+    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
+
+    # Build the fixed one-pixel guard boundary once before either directional loop.
+    boundary_kernel = generate_kernel((3, 3), round_kernel=False)
+    eroded_guard = cv2.erode(
+        guard_u8,
+        boundary_kernel,
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    ) != 0
+    full_res_guard_boundary = guard & ~eroded_guard
+
+    # Evaluate the starting work-resolution T on the authoritative source raster.
+    binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
+    cv2.bitwise_and(binary, guard_u8, dst=binary)
+    if binary[seed_y, seed_x] == 0:
+        raise ThresholdResolutionError(
+            f"Full-resolution tracking seed is not light at start T={start_T}"
+        )
+    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+    component = binary == 128
+    enclosed = not np.any(component & full_res_guard_boundary)
+
+    if enclosed:
+        best_T = start_T
+        best_component = component
+        for threshold in range(start_T - 1, -1, -1):
+            binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+            cv2.bitwise_and(binary, guard_u8, dst=binary)
+            cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+            component = binary == 128
+            if np.any(component & full_res_guard_boundary):
+                break
+            best_T = threshold
+            best_component = component
+        return best_T, best_component
+
+    for threshold in range(start_T + 1, 256):
+        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+        cv2.bitwise_and(binary, guard_u8, dst=binary)
+        if binary[seed_y, seed_x] == 0:
+            break
+        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
+        component = binary == 128
+        if not np.any(component & full_res_guard_boundary):
+            return threshold, component
+
+    raise ThresholdResolutionError(
+        "Tracked full-resolution solar component never became enclosed by the 10% guard"
+    )
+
+
+def find_auto_threshold(
+    full_res_gray: np.ndarray,
+    image_state: dict[str, object],
+) -> int:
+    """Determine Auto T and cache only search state; ``resolve_threshold`` owns SolarData."""
+    if full_res_gray.ndim != 2:
+        raise ValueError("grayscale image must be two-dimensional")
+
+    # Auto-T limits the longest work-resolution dimension to 1200 pixels while
+    # passing the complete target size explicitly to resize_img().
+    full_res_height, full_res_width = full_res_gray.shape
+    full_res_max_dim = max(full_res_height, full_res_width)
+    if full_res_max_dim > WORK_RES_MAX_DIM:
+        work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
+        work_res_size = (
+            round(full_res_width * work_res_scale),
+            round(full_res_height * work_res_scale),
+        )
+    else:
+        work_res_size = (full_res_width, full_res_height)
+
+    # Build the work-resolution grayscale raster used only for component identity tracking.
+    work_res_gray = resize_img(full_res_gray, work_res_size)
+
+    # Start the downward work-resolution search at the histogram valley before the bright mode.
+    histogram_start_T = find_histogram_start_threshold(work_res_gray)
+
+    # Generate the current work-resolution support kernel in the parent so its
+    # footprint can be adjusted alongside WORK_RES_MAX_DIM without changing child tracking logic.
+    work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
+
+    try:
+        # Establish one supported seed, then track only that connected identity downward.
+        work_res_T, work_res_component = find_work_res_solar_component(
+            work_res_gray,
+            histogram_start_T,
+            work_res_seed_kernel,
+        )
+
+        # Transfer only the mature work component geometry onto the exact source raster.
+        full_res_search_mask = resize_img(
+            work_res_component,
+            (full_res_width, full_res_height),
+        )
+
+        # Preserve the 5-pixel work support footprint at the realized source scale.
+        mapped_kernel_size = 5 * max(full_res_gray.shape) / max(work_res_gray.shape)
+        full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
+
+        # Generate the equivalent source support kernel once before selecting the fixed source seed.
+        full_res_seed_kernel = generate_kernel(
+            (full_res_kernel_size, full_res_kernel_size),
+            round_kernel=False,
+        )
+
+        # Select the brightest deeply supported source seed anywhere in the transferred mature component.
+        full_res_seed = brightest_supported_component_point(
+            full_res_gray,
+            full_res_search_mask,
+            full_res_seed_kernel,
+        )
+        if full_res_seed is None:
+            raise ThresholdResolutionError(
+                f"Transferred solar component has no {full_res_kernel_size}x"
+                f"{full_res_kernel_size}-supported full-resolution seed"
+            )
+
+        # Expand the transferred component by the fixed 10% L2 margin to make the source guard.
+        image_scale = math.sqrt(full_res_width * full_res_height)
+        full_res_guard_mask = dilate_component_mask(
+            full_res_search_mask,
+            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
+        )
+
+        # Find the exact source separation boundary by searching only the required monotonic direction.
+        full_res_T, full_res_component = find_lowest_full_res_threshold(
+            full_res_gray,
+            work_res_T,
+            full_res_seed,
+            full_res_guard_mask,
+        )
+
+    except ThresholdResolutionError as exc:
+        result = AutoThresholdResult(
+            threshold=None,
+            histogram_start_threshold=histogram_start_T,
+            work_res_threshold=None,
+            full_res_seed_point=None,
+            resolved=False,
+            reason=str(exc),
+        )
+        image_state["auto_threshold_result"] = result
+        raise
+
+    # Stage A is complete: these are the proven source-separation T, component, and seed.
+    # Stage B may raise T to an optimization knee but must never lower this Stage-A result.
+    topology_selection = optimize_separated_threshold(
+        full_res_gray,
+        full_res_T,
+        full_res_seed,
+        full_res_component,
+    )
+    result = AutoThresholdResult(
+        threshold=topology_selection.threshold,
+        histogram_start_threshold=histogram_start_T,
+        work_res_threshold=work_res_T,
+        full_res_seed_point=full_res_seed,
+        resolved=True,
+    )
+
+    image_state["auto_threshold_result"] = result
+    return topology_selection.threshold
+
+
+# ---------------------------------------------------------------------------
+# Auto-T Stage B: threshold optimization
+# ---------------------------------------------------------------------------
+# Stage B receives Stage A's proven full-resolution T, component, and seed. It may
+# optimize upward from that boundary, but it must never redefine Stage-A identity
+# or lower the proven separation threshold. This block is the experimental redesign
+# boundary for the next phase of work.
+TOPOLOGY_OPTIMIZATION_STEPS = 5
 
 
 @dataclass(frozen=True)
@@ -146,26 +578,6 @@ class ThresholdTopology:
     roughness: float
     solidity: float
     internal_dark_fraction: float = 0.0
-
-
-@dataclass(frozen=True)
-class CleanupMetrics:
-    """Unweighted cleanup benefit/cost terms measured against one raw component."""
-
-    contour_cleanup: float
-    roughness_cleanup: float
-    solidity_gain: float
-    internal_dark_cleanup: float
-    area_loss: float
-    solidity_loss: float
-
-
-@dataclass(frozen=True)
-class CleanupCandidateEvaluation:
-    name: str
-    mask: np.ndarray
-    topology: ThresholdTopology
-    metrics: CleanupMetrics
 
 
 @dataclass(frozen=True)
@@ -361,421 +773,28 @@ def optimize_separated_threshold(
     return select_topology_knee(trajectory)
 
 
-class ThresholdResolutionError(RuntimeError):
-    """Expected inability to establish/track a separated solar component."""
-
-
-@dataclass(frozen=True)
-class AutoThresholdResult:
-    threshold: int | None
-    histogram_start_threshold: int
-    work_res_threshold: int | None
-    full_res_seed_point: tuple[int, int] | None
-    # Currently equivalent to ``threshold is not None``. Kept explicit for now in
-    # case resolution-state semantics become independent later.
-    resolved: bool
-    reason: str = ""
-
-
-def to_gray(image: np.ndarray) -> np.ndarray:
-    """Convert once to authoritative 8-bit grayscale."""
-    if image.ndim == 2:
-        return image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8)
-    if image.ndim == 3 and image.shape[2] == 3:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if image.ndim == 3 and image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported image shape: {image.shape}")
-
-
-def resize_img(
-    img: np.ndarray,
-    size: tuple[int | None, int | None],
-) -> np.ndarray:
-    """Resize to ``(width, height)``, inferring one omitted dimension if requested."""
-    original_dtype = img.dtype
-    original_height, original_width = img.shape[:2]
-    width, height = size
-
-    if width is None and height is None:
-        raise ValueError("resize size must provide width, height, or both")
-    if width is None:
-        if height <= 0:
-            raise ValueError("resize height must be positive")
-        width = round(original_width * height / original_height)
-    elif height is None:
-        if width <= 0:
-            raise ValueError("resize width must be positive")
-        height = round(original_height * width / original_width)
-
-    if width <= 0 or height <= 0:
-        raise ValueError("resize dimensions must be positive")
-
-    is_binary = np.all((img == img.min()) | (img == img.max()))
-    if is_binary:
-        # OpenCV does not resize boolean arrays, but integer binary rasters must keep
-        # their exact original values instead of being truncated through uint8.
-        resize_source = img.astype(np.uint8) if img.dtype == bool else img
-        interpolation = cv2.INTER_NEAREST_EXACT
-    elif width < original_width:
-        resize_source = img
-        interpolation = cv2.INTER_AREA
-    else:
-        resize_source = img
-        interpolation = cv2.INTER_LANCZOS4
-
-    resized = cv2.resize(
-        resize_source,
-        (width, height),
-        interpolation=interpolation,
-    )
-    return resized.astype(original_dtype, copy=False)
-
-
-def nearest_positive_odd(value: float) -> int:
-    """Return the nearest positive odd integer; exact ties choose the lower odd."""
-    if value <= 0:
-        raise ValueError("value must be positive")
-    return 2 * math.ceil(value / 2) - 1
-
-
-def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
-    """Return the left valley preceding the rightmost 3-bin-smoothed histogram mode."""
-    histogram = np.bincount(work_res_gray.ravel(), minlength=256).astype(np.float64)
-    signal = np.convolve(histogram, PEAK_KERNEL, mode="same")
-
-    rightmost_peak = None
-    for index in range(1, len(signal) - 1):
-        if signal[index] >= signal[index - 1] and signal[index] > signal[index + 1]:
-            rightmost_peak = index
-    if len(signal) >= 2 and signal[-1] > signal[-2]:
-        rightmost_peak = len(signal) - 1
-    if rightmost_peak is None:
-        rightmost_peak = int(np.argmax(signal))
-
-    for index in range(rightmost_peak - 1, 0, -1):
-        if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
-            return index
-    return 0
-
-
-def brightest_supported_component_point(
-    gray: np.ndarray,
-    component: np.ndarray,
-    support_kernel: np.ndarray,
-) -> tuple[int, int] | None:
-    """Return the brightest support-eligible component pixel; depth breaks ties.
-
-    The caller owns support geometry and the meaning of an unavailable point. Empty
-    or unsupported components return ``None``; malformed caller inputs remain errors.
-    """
-    source = (np.asarray(component) != 0).astype(np.uint8)
-    support_kernel = np.asarray(support_kernel, dtype=np.uint8)
-    if gray.shape != source.shape:
-        raise ValueError("gray and component must have identical shapes")
-    if support_kernel.ndim != 2 or support_kernel.size == 0 or not np.any(support_kernel):
-        raise ValueError("support kernel must be a non-empty two-dimensional mask")
-    if not np.any(source):
-        return None
-
-    supported = cv2.erode(source, support_kernel, iterations=1) != 0
-    if not np.any(supported):
-        return None
-
-    max_gray = int(gray[supported].max())
-    brightest = supported & (gray == max_gray)
-    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
-    scores = np.where(brightest, distance, -1.0)
-    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
-    return int(x), int(y)
-
-
-def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
-    """Return the largest 8-connected bright component enclosed by the raster."""
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (binary != 0).astype(np.uint8), 8
-    )
-    height, width = binary.shape
-    best = None
-    for label in range(1, count):
-        x, y, component_width, component_height, area = map(int, stats[label])
-        if (
-            x == 0
-            or y == 0
-            or x + component_width >= width
-            or y + component_height >= height
-        ):
-            continue
-        candidate = (area, label)
-        if best is None or candidate > best:
-            best = candidate
-    if best is None:
-        return None
-    return labels == best[1]
-
-
-def find_work_res_solar_component(
-    work_res_gray: np.ndarray,
-    start_T: int,
-    work_res_seed_kernel: np.ndarray,
-) -> tuple[int, np.ndarray]:
-    """Establish one supported work-res seed, then track only that identity downward."""
-    seed: tuple[int, int] | None = None
-    work_res_T: int | None = None
-    work_res_component: np.ndarray | None = None
-
-    for threshold in range(start_T, -1, -1):
-        if seed is None:
-            # Before identity is established, propose the largest enclosed bright component.
-            component = largest_enclosed_bright_component(work_res_gray > threshold)
-            if component is not None:
-                # Accept the first candidate with the required full seed-support footprint.
-                seed = brightest_supported_component_point(
-                    work_res_gray,
-                    component,
-                    work_res_seed_kernel,
-                )
-                if seed is not None:
-                    work_res_T = threshold
-                    work_res_component = component
-        else:
-            binary = work_res_gray > threshold
-            flooded = np.where(binary, 255, 0).astype(np.uint8)
-            cv2.floodFill(flooded, None, seed, 128, flags=8)
-            component = flooded == 128
-
-            if (
-                np.any(component[0])
-                or np.any(component[-1])
-                or np.any(component[:, 0])
-                or np.any(component[:, -1])
-            ):
-                break
-
-            work_res_T = threshold
-            work_res_component = component
-
-    if seed is None or work_res_T is None or work_res_component is None:
-        raise ThresholdResolutionError(
-            "No 5x5-supported enclosed bright component exists through T=0"
-        )
-
-    return work_res_T, work_res_component
-
-
-def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
-    """Return every raster pixel within ``margin`` L2 pixels of the component."""
-    component = np.asarray(component_mask, dtype=bool)
-    if component.ndim != 2:
-        raise ValueError("component mask must be two-dimensional")
-    if not np.any(component):
-        raise ThresholdResolutionError("Cannot dilate empty solar component")
-    if margin < 0:
-        raise ValueError("dilation margin must be non-negative")
-
-    # distanceTransform measures each non-component pixel's L2 distance to the
-    # nearest zero pixel, so encode the component itself as zero and threshold the
-    # resulting full-frame distance field at the requested dilation margin.
-    outside = np.where(component, 0, 255).astype(np.uint8)
-    distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
-    return distance <= margin
-
-
-def find_lowest_full_res_threshold(
-    full_res_gray: np.ndarray,
-    start_T: int,
-    full_res_seed: tuple[int, int],
-    full_res_guard_mask: np.ndarray,
-) -> tuple[int, np.ndarray]:
-    """Find the lowest enclosed full-res T by searching only the monotonic direction."""
-    if full_res_gray.ndim != 2:
-        raise ValueError("grayscale image must be two-dimensional")
-    if not 0 <= start_T <= 255:
-        raise ValueError("start threshold must be 0..255")
-
-    guard = np.asarray(full_res_guard_mask, dtype=bool)
-    if guard.shape != full_res_gray.shape:
-        raise ValueError("full-resolution guard and grayscale image must have identical shapes")
-    if not np.any(guard):
-        raise ThresholdResolutionError("Full-resolution Auto-T guard is empty")
-
-    seed_x, seed_y = full_res_seed
-    height, width = full_res_gray.shape
-    if not (0 <= seed_x < width and 0 <= seed_y < height):
-        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the image")
-    if not guard[seed_y, seed_x]:
-        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
-
-    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
-
-    # Build the fixed one-pixel guard boundary once before either directional loop.
-    boundary_kernel = generate_kernel((3, 3), round_kernel=False)
-    eroded_guard = cv2.erode(
-        guard_u8,
-        boundary_kernel,
-        iterations=1,
-        borderType=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ) != 0
-    full_res_guard_boundary = guard & ~eroded_guard
-
-    # Evaluate the starting work-resolution T on the authoritative source raster.
-    binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
-    cv2.bitwise_and(binary, guard_u8, dst=binary)
-    if binary[seed_y, seed_x] == 0:
-        raise ThresholdResolutionError(
-            f"Full-resolution tracking seed is not light at start T={start_T}"
-        )
-    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-    component = binary == 128
-    enclosed = not np.any(component & full_res_guard_boundary)
-
-    if enclosed:
-        best_T = start_T
-        best_component = component
-        for threshold in range(start_T - 1, -1, -1):
-            binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-            cv2.bitwise_and(binary, guard_u8, dst=binary)
-            cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-            component = binary == 128
-            if np.any(component & full_res_guard_boundary):
-                break
-            best_T = threshold
-            best_component = component
-        return best_T, best_component
-
-    for threshold in range(start_T + 1, 256):
-        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-        cv2.bitwise_and(binary, guard_u8, dst=binary)
-        if binary[seed_y, seed_x] == 0:
-            break
-        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-        component = binary == 128
-        if not np.any(component & full_res_guard_boundary):
-            return threshold, component
-
-    raise ThresholdResolutionError(
-        "Tracked full-resolution solar component never became enclosed by the 10% guard"
-    )
-
-
-def find_auto_threshold(
-    full_res_gray: np.ndarray,
-    image_state: dict[str, object],
-) -> int:
-    """Determine Auto T and cache only search state; ``resolve_threshold`` owns SolarData."""
-    if full_res_gray.ndim != 2:
-        raise ValueError("grayscale image must be two-dimensional")
-
-    # Auto-T limits the longest work-resolution dimension to 1200 pixels while
-    # passing the complete target size explicitly to resize_img().
-    full_res_height, full_res_width = full_res_gray.shape
-    full_res_max_dim = max(full_res_height, full_res_width)
-    if full_res_max_dim > WORK_RES_MAX_DIM:
-        work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
-        work_res_size = (
-            round(full_res_width * work_res_scale),
-            round(full_res_height * work_res_scale),
-        )
-    else:
-        work_res_size = (full_res_width, full_res_height)
-
-    # Build the work-resolution grayscale raster used only for component identity tracking.
-    work_res_gray = resize_img(full_res_gray, work_res_size)
-
-    # Start the downward work-resolution search at the histogram valley before the bright mode.
-    histogram_start_T = find_histogram_start_threshold(work_res_gray)
-
-    # Generate the fixed square work-resolution support kernel once and reuse it through the search.
-    work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
-
-    try:
-        # Establish one supported seed, then track only that connected identity downward.
-        work_res_T, work_res_component = find_work_res_solar_component(
-            work_res_gray,
-            histogram_start_T,
-            work_res_seed_kernel,
-        )
-
-        # Transfer only the mature work component geometry onto the exact source raster.
-        full_res_search_mask = resize_img(
-            work_res_component,
-            (full_res_width, full_res_height),
-        )
-
-        # Preserve the 5-pixel work support footprint at the realized source scale.
-        mapped_kernel_size = 5 * max(full_res_gray.shape) / max(work_res_gray.shape)
-        full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
-
-        # Generate the equivalent source support kernel once before selecting the fixed source seed.
-        full_res_seed_kernel = generate_kernel(
-            (full_res_kernel_size, full_res_kernel_size),
-            round_kernel=False,
-        )
-
-        # Select the brightest deeply supported source seed anywhere in the transferred mature component.
-        full_res_seed = brightest_supported_component_point(
-            full_res_gray,
-            full_res_search_mask,
-            full_res_seed_kernel,
-        )
-        if full_res_seed is None:
-            raise ThresholdResolutionError(
-                f"Transferred solar component has no {full_res_kernel_size}x"
-                f"{full_res_kernel_size}-supported full-resolution seed"
-            )
-
-        # Expand the transferred component by the fixed 10% L2 margin to make the source guard.
-        image_scale = math.sqrt(full_res_width * full_res_height)
-        full_res_guard_mask = dilate_component_mask(
-            full_res_search_mask,
-            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
-        )
-
-        # Find the exact source separation boundary by searching only the required monotonic direction.
-        full_res_T, full_res_component = find_lowest_full_res_threshold(
-            full_res_gray,
-            work_res_T,
-            full_res_seed,
-            full_res_guard_mask,
-        )
-
-        # Stage B may raise T to a topology knee but never lowers the proven separated threshold.
-        topology_selection = optimize_separated_threshold(
-            full_res_gray,
-            full_res_T,
-            full_res_seed,
-            full_res_component,
-        )
-        result = AutoThresholdResult(
-            threshold=topology_selection.threshold,
-            histogram_start_threshold=histogram_start_T,
-            work_res_threshold=work_res_T,
-            full_res_seed_point=full_res_seed,
-            resolved=True,
-        )
-    except ThresholdResolutionError as exc:
-        result = AutoThresholdResult(
-            threshold=None,
-            histogram_start_threshold=histogram_start_T,
-            work_res_threshold=None,
-            full_res_seed_point=None,
-            resolved=False,
-            reason=str(exc),
-        )
-        image_state["auto_threshold_result"] = result
-        raise
-
-    image_state["auto_threshold_result"] = result
-    return topology_selection.threshold
-
-
-# ---------------------------------------------------------------------------
-# Cleanup morphology candidates
-# ---------------------------------------------------------------------------
+# Morphology candidate measurements retained for the Stage-B redesign.
 CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
 
 
+@dataclass(frozen=True)
+class CleanupMetrics:
+    """Unweighted cleanup benefit/cost terms measured against one raw component."""
+
+    contour_cleanup: float
+    roughness_cleanup: float
+    solidity_gain: float
+    internal_dark_cleanup: float
+    area_loss: float
+    solidity_loss: float
+
+
+@dataclass(frozen=True)
+class CleanupCandidateEvaluation:
+    name: str
+    mask: np.ndarray
+    topology: ThresholdTopology
+    metrics: CleanupMetrics
 
 
 def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
@@ -920,6 +939,14 @@ def evaluate_cleanup_candidates(
 # ---------------------------------------------------------------------------
 # Final-T full-resolution solar resolution and persistence
 # ---------------------------------------------------------------------------
+# These constants belong to downstream SolarData construction, not Auto-T Stage A.
+ROI_DILATION_FRACTION = 0.065
+GUARD_DILATION_FRACTION = 0.195
+
+# Build the fixed final-T Euclidean cleanup kernel once and reuse it.
+SOLAR_COMPONENT_KERNEL = generate_kernel((7, 7), round_kernel=True)
+
+
 def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
     """Apply the agreed 7x7 Euclidean OPEN then CLOSE to one solar component."""
     component = np.asarray(component, dtype=bool)
