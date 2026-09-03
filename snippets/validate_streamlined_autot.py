@@ -44,7 +44,7 @@ def stages(path: Path):
     )
 
     # Map the work support footprint to the realized source scale.
-    mapped_kernel_size = 5 * max(full_res_gray.shape) / max(work_res_gray.shape)
+    mapped_kernel_size = max(work_kernel.shape) * max(full_res_gray.shape) / max(work_res_gray.shape)
     kernel_size = cad.nearest_positive_odd(mapped_kernel_size)
     full_kernel = cad.generate_kernel((kernel_size, kernel_size), round_kernel=False)
 

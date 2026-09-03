@@ -756,6 +756,15 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    # Apply the final Stage-A freeze cleanup after the pre-freeze input contract.
+    freezer_path = Path(__file__).with_name("apply_stage_a_freeze_cleanup.py")
+    freezer = runpy.run_path(str(freezer_path))
+    source = target.read_text(encoding="utf-8")
+    target.write_text(
+        freezer["apply_freeze_cleanup"](source),
+        encoding="utf-8",
+    )
+
 
 if __name__ == "__main__":
     main()

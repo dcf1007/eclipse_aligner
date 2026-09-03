@@ -40,8 +40,8 @@ establishes one 5x5-supported work-resolution solar seed, and tracks that same
 8-connected component downward. The tracked work-resolution component is resized to
 full resolution only to delimit the full-resolution seed search and the fixed 10% L2-distance
 guard. Auto-T then starts from the work-resolution T and searches only in the
-monotonic direction needed to find the lowest full-resolution threshold whose seeded
-component stays inside that fixed guard. If no supported work-resolution seed can be
+monotonic direction needed to find the lowest full-resolution threshold whose
+D7-cleaned seeded component stays inside that fixed guard. If no supported work-resolution seed can be
 established through T=0, Auto-T fails explicitly instead of substituting a histogram
 fallback. No HSV/color thresholding, Otsu thresholding, ellipse-fit score,
 bright-pixel dominance, competitor gain, or horizon special case is part of
@@ -107,16 +107,6 @@ def generate_kernel(
     ellipse = (xx / x_radius) ** 2 + (yy / y_radius) ** 2 <= 1.0
     return ellipse.astype(np.uint8)
 
-
-def to_gray(image: np.ndarray) -> np.ndarray:
-    """Convert once to authoritative 8-bit grayscale."""
-    if image.ndim == 2:
-        return image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8)
-    if image.ndim == 3 and image.shape[2] == 3:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if image.ndim == 3 and image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-    raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
 def resize_img(
@@ -390,8 +380,10 @@ def find_work_res_solar_component(
             work_res_component = component
 
     if seed is None or work_res_T is None or work_res_component is None:
+        kernel_height, kernel_width = work_res_seed_kernel.shape
         raise ThresholdResolutionError(
-            "No 5x5-supported enclosed bright component exists through T=0"
+            f"No {kernel_width}x{kernel_height}-supported enclosed bright component "
+            "exists through T=0"
         )
 
     return work_res_T, work_res_component
@@ -456,10 +448,6 @@ def find_lowest_full_res_threshold(
 
     # Evaluate the starting T after the same maximum cleanup allowed by Stage A.
     binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
-    if binary[seed_y, seed_x] == 0:
-        raise ThresholdResolutionError(
-            f"Full-resolution tracking seed is not light at start T={start_T}"
-        )
     binary = cv2.morphologyEx(
         binary,
         cv2.MORPH_OPEN,
@@ -539,6 +527,8 @@ def find_auto_threshold(
     """Determine Auto T and cache only search state; ``resolve_threshold`` owns SolarData."""
     if full_res_gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
+    if full_res_gray.dtype != np.uint8:
+        raise ValueError("automatic thresholding requires authoritative uint8 grayscale")
 
     # Auto-T limits the longest work-resolution dimension to 1200 pixels while
     # passing the complete target size explicitly to resize_img().
@@ -578,8 +568,13 @@ def find_auto_threshold(
             mask=True,
         )
 
-        # Preserve the 5-pixel work support footprint at the realized source scale.
-        mapped_kernel_size = 5 * max(full_res_gray.shape) / max(work_res_gray.shape)
+        # Preserve the actual work seed-support footprint at the realized source scale.
+        work_res_support_size = max(work_res_seed_kernel.shape)
+        mapped_kernel_size = (
+            work_res_support_size
+            * max(full_res_gray.shape)
+            / max(work_res_gray.shape)
+        )
         full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
 
         # Generate the equivalent source support kernel once before selecting the fixed source seed.
@@ -650,7 +645,7 @@ def find_auto_threshold(
 # ---------------------------------------------------------------------------
 # Auto-T Stage B: threshold optimization
 # ---------------------------------------------------------------------------
-# Stage B receives Stage A's proven full-resolution T, component, and seed. It may
+# Stage B receives Stage A's proven full-resolution T, fixed seed, and fixed guard. It may
 # optimize upward from that boundary, but it must never redefine Stage-A identity
 # or lower the proven separation threshold. This block is the experimental redesign
 # boundary for the next phase of work.
