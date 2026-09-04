@@ -229,11 +229,11 @@ class ImageSettings:
 
 
 # ---------------------------------------------------------------------------
-# Auto-T Stage A: source separation
+# Automatic threshold: coarse separation and deterministic refinement
 # ---------------------------------------------------------------------------
-# Stage A establishes one fixed full-resolution seed/guard pair and the lowest T at
-# which a D7-cleaned seed-connected component remains separated. The temporary
-# proof component is discarded; Stage B rebuilds every component it evaluates.
+# The coarse search establishes one fixed full-resolution seed/guard pair and the
+# lowest separated T. Fine refinement may only raise that T while preserving the
+# same component identity and fixed guard.
 WORK_RES_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 AUTO_T_GUARD_DILATION_FRACTION = 0.10
@@ -252,6 +252,7 @@ class AutoThresholdResult:
     # Currently equivalent to ``threshold is not None``. Kept explicit for now in
     # case resolution-state semantics become independent later.
     resolved: bool
+    cleaned_component_mask: bytes | None = None
     reason: str = ""
 
 
@@ -338,22 +339,96 @@ def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     return labels == best_label
 
 
+MAX_T_REFINEMENT_STEPS = 10
+
+EDGE_RADIUS = 25
+EDGE_RECOVERY_FRACTION = 0.25
+EDGE_RECOVERY_PERSISTENCE = 4
+EDGE_MIN_SAMPLE_STRIDE = 8
+EDGE_TARGET_PROFILE_COUNT = 2000
+EDGE_TANGENT_SPAN = 12
+
+GUARD_BOUNDARY_KERNEL = generate_kernel((3, 3), round_kernel=False)
+SEPARATION_KERNEL = generate_kernel((7, 7), round_kernel=True)
+SOLAR_CLEANUP_KERNELS = (
+    generate_kernel((3, 3), round_kernel=True),
+    generate_kernel((5, 5), round_kernel=True),
+    SEPARATION_KERNEL,
+)
+
+
+@dataclass(frozen=True)
+class ThresholdMeasurement:
+    """All retained measurements and score terms for one cleaned threshold candidate."""
+
+    threshold: int
+    component_area: int
+    filled_area: int
+    roughness: float
+    solidity: float
+    internal_dark_fraction: float
+    edge_alignment: float
+    edge_credible_fraction: float
+    edge_transition_monotonicity: float
+    q_roughness: float = 0.0
+    q_holes: float = 0.0
+    q_area: float = 0.0
+    q_solidity: float = 0.0
+    q_edge: float = 0.0
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class ThresholdRefinementResult:
+    """Selected fine threshold plus the authoritative full-resolution cleaned mask."""
+
+    threshold: int
+    base_threshold: int
+    refinement_steps: int
+    score: float
+    edge_reliability: float
+    edge_weight: float
+    raw_reference_threshold: int
+    cleaned_component_mask: bytes
+    trajectory: tuple[ThresholdMeasurement, ...]
+
+
+def extract_component(
+    binary_mask: np.ndarray,
+    seed_point: tuple[int, int],
+) -> np.ndarray | None:
+    """Return the 8-connected component of ``binary_mask`` containing ``seed_point``."""
+    source = np.asarray(binary_mask)
+    if source.ndim != 2:
+        raise ValueError("binary mask must be two-dimensional")
+
+    seed_x, seed_y = seed_point
+    height, width = source.shape
+    if not (0 <= seed_x < width and 0 <= seed_y < height):
+        raise ValueError("seed lies outside binary-mask raster")
+    if source[seed_y, seed_x] == 0:
+        return None
+
+    flood = np.where(source != 0, 255, 0).astype(np.uint8)
+    cv2.floodFill(flood, None, (seed_x, seed_y), 128, flags=8)
+    component = flood == 128
+    return component if np.any(component) else None
+
+
 def find_work_res_solar_component(
     work_res_gray: np.ndarray,
     start_T: int,
     work_res_seed_kernel: np.ndarray,
 ) -> tuple[int, np.ndarray]:
-    """Establish one supported work-res seed, then track only that identity downward."""
+    """Establish one supported work-resolution seed, then track that identity downward."""
     seed: tuple[int, int] | None = None
     work_res_T: int | None = None
     work_res_component: np.ndarray | None = None
 
     for threshold in range(start_T, -1, -1):
         if seed is None:
-            # Before identity is established, propose the largest enclosed bright component.
             component = largest_enclosed_bright_component(work_res_gray > threshold)
             if component is not None:
-                # Accept the first candidate with the required full seed-support footprint.
                 seed = brightest_supported_component_point(
                     work_res_gray,
                     component,
@@ -363,11 +438,9 @@ def find_work_res_solar_component(
                     work_res_T = threshold
                     work_res_component = component
         else:
-            binary = work_res_gray > threshold
-            flooded = np.where(binary, 255, 0).astype(np.uint8)
-            cv2.floodFill(flooded, None, seed, 128, flags=8)
-            component = flooded == 128
-
+            component = extract_component(work_res_gray > threshold, seed)
+            if component is None:
+                break
             if (
                 np.any(component[0])
                 or np.any(component[-1])
@@ -375,7 +448,6 @@ def find_work_res_solar_component(
                 or np.any(component[:, -1])
             ):
                 break
-
             work_res_T = threshold
             work_res_component = component
 
@@ -385,7 +457,6 @@ def find_work_res_solar_component(
             f"No {kernel_width}x{kernel_height}-supported enclosed bright component "
             "exists through T=0"
         )
-
     return work_res_T, work_res_component
 
 
@@ -407,112 +478,117 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     return distance <= margin
 
 
+def clean_solar_component(
+    binary_mask: np.ndarray,
+    seed_point: tuple[int, int],
+    guard_mask: np.ndarray,
+) -> np.ndarray | None:
+    """Clean the full threshold mask, apply the fixed guard, and return its solar component.
+
+    Each Euclidean kernel performs exactly one OPEN followed by one CLOSE.  Morphology
+    operates on the unguarded threshold mask.  The fixed guard is applied only after the
+    complete 3/5/7 cleanup, then component identity is resolved once by extracting the
+    8-connected region containing the authoritative seed.
+    """
+    source = np.asarray(binary_mask)
+    guard = np.asarray(guard_mask, dtype=bool)
+    if source.ndim != 2:
+        raise ValueError("binary mask must be two-dimensional")
+    if guard.shape != source.shape or not np.any(guard):
+        raise ValueError("guard must be a non-empty mask matching binary mask")
+    if not np.any(source):
+        return None
+
+    cleaned = np.where(source != 0, 255, 0).astype(np.uint8)
+    for kernel in SOLAR_CLEANUP_KERNELS:
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    cleaned[~guard] = 0
+    return extract_component(cleaned, seed_point)
+
+
+def find_guard_boundary(guard: np.ndarray) -> np.ndarray:
+    source = np.asarray(guard, dtype=bool)
+    if source.ndim != 2 or not np.any(source):
+        raise ValueError("guard must be a non-empty two-dimensional mask")
+    u8 = np.where(source, 255, 0).astype(np.uint8)
+    eroded = cv2.erode(
+        u8,
+        GUARD_BOUNDARY_KERNEL,
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    ) != 0
+    return source & ~eroded
+
+
 def find_lowest_full_res_threshold(
     full_res_gray: np.ndarray,
     start_T: int,
     full_res_seed: tuple[int, int],
     full_res_guard_mask: np.ndarray,
 ) -> int:
-    """Return the lowest T whose D7-cleaned seeded component remains separated."""
-    if full_res_gray.ndim != 2:
+    """Return the lowest T whose D7-cleaned solar component is separated by the fixed guard.
+
+    The guard semantics intentionally match :func:`refine_threshold`: threshold first,
+    morphology on the unguarded full-resolution mask, then fixed-guard clipping, then
+    :func:`extract_component`, then the common guard-boundary separation test.
+    """
+    gray = np.asarray(full_res_gray)
+    guard = np.asarray(full_res_guard_mask, dtype=bool)
+    if gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
+    if gray.dtype != np.uint8:
+        raise ValueError("separation search requires authoritative uint8 grayscale")
     if not 0 <= start_T <= 255:
         raise ValueError("start threshold must be 0..255")
-
-    guard = np.asarray(full_res_guard_mask, dtype=bool)
-    if guard.shape != full_res_gray.shape:
+    if guard.shape != gray.shape:
         raise ValueError("full-resolution guard and grayscale image must have identical shapes")
     if not np.any(guard):
         raise ThresholdResolutionError("Full-resolution Auto-T guard is empty")
 
     seed_x, seed_y = full_res_seed
-    height, width = full_res_gray.shape
+    height, width = gray.shape
     if not (0 <= seed_x < width and 0 <= seed_y < height):
         raise ThresholdResolutionError("Full-resolution tracking seed lies outside the image")
     if not guard[seed_y, seed_x]:
         raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
 
-    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
+    boundary = find_guard_boundary(guard)
+    separation_kernel = SEPARATION_KERNEL
 
-    # Build the fixed guard boundary and strongest Stage-A cleanup kernel once.
-    boundary_kernel = generate_kernel((3, 3), round_kernel=False)
-    separation_cleanup_kernel = generate_kernel((7, 7), round_kernel=True)
-    eroded_guard = cv2.erode(
-        guard_u8,
-        boundary_kernel,
-        iterations=1,
-        borderType=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ) != 0
-    full_res_guard_boundary = guard & ~eroded_guard
+    def component_at(threshold: int) -> np.ndarray | None:
+        binary = cv2.compare(gray, threshold, cv2.CMP_GT)
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_OPEN, separation_kernel, iterations=1
+        )
+        binary = cv2.morphologyEx(
+            binary, cv2.MORPH_CLOSE, separation_kernel, iterations=1
+        )
+        binary[~guard] = 0
+        return extract_component(binary, full_res_seed)
 
-    # Evaluate the starting T after the same maximum cleanup allowed by Stage A.
-    binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        separation_cleanup_kernel,
-        iterations=1,
-    )
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_CLOSE,
-        separation_cleanup_kernel,
-        iterations=1,
-    )
-    if binary[seed_y, seed_x] == 0:
+    component = component_at(start_T)
+    if component is None:
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
         )
-    cv2.bitwise_and(binary, guard_u8, dst=binary)
-    cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-    component = binary == 128
-    enclosed = not np.any(component & full_res_guard_boundary)
 
-    if enclosed:
-        best_T = start_T
+    if not np.any(component & boundary):
+        best_threshold = start_T
         for threshold in range(start_T - 1, -1, -1):
-            binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-            binary = cv2.morphologyEx(
-                binary,
-                cv2.MORPH_OPEN,
-                separation_cleanup_kernel,
-                iterations=1,
-            )
-            binary = cv2.morphologyEx(
-                binary,
-                cv2.MORPH_CLOSE,
-                separation_cleanup_kernel,
-                iterations=1,
-            )
-            cv2.bitwise_and(binary, guard_u8, dst=binary)
-            cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-            component = binary == 128
-            if np.any(component & full_res_guard_boundary):
+            component = component_at(threshold)
+            if component is None or np.any(component & boundary):
                 break
-            best_T = threshold
-        return best_T
+            best_threshold = threshold
+        return best_threshold
 
     for threshold in range(start_T + 1, 256):
-        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            separation_cleanup_kernel,
-            iterations=1,
-        )
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_CLOSE,
-            separation_cleanup_kernel,
-            iterations=1,
-        )
-        if binary[seed_y, seed_x] == 0:
+        component = component_at(threshold)
+        if component is None:
             break
-        cv2.bitwise_and(binary, guard_u8, dst=binary)
-        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-        component = binary == 128
-        if not np.any(component & full_res_guard_boundary):
+        if not np.any(component & boundary):
             return threshold
 
     raise ThresholdResolutionError(
@@ -520,18 +596,486 @@ def find_lowest_full_res_threshold(
     )
 
 
+def find_external_contour(component: np.ndarray) -> np.ndarray:
+    """Return the longest external CHAIN_APPROX_NONE contour of a non-empty component."""
+    source = np.asarray(component, dtype=bool)
+    contours, _ = cv2.findContours(
+        np.where(source, 255, 0).astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if not contours:
+        raise ThresholdResolutionError("solar component has no external contour")
+    return max(contours, key=cv2.contourArea)
+
+
+def _lattice_boundary_points(contour: np.ndarray) -> int:
+    points = contour[:, 0, :].astype(np.int64)
+    following = np.roll(points, -1, axis=0)
+    distance = np.abs(following - points)
+    return int(np.gcd(distance[:, 0], distance[:, 1]).sum())
+
+
+def measure_filled_area(contour: np.ndarray) -> int:
+    """Return raster-equivalent area enclosed by the external lattice contour."""
+    polygon_area = float(cv2.contourArea(contour))
+    boundary_points = _lattice_boundary_points(contour)
+    filled_area = int(round(polygon_area + 0.5 * boundary_points + 1.0))
+    if filled_area <= 0:
+        raise ThresholdResolutionError("filled external contour area is empty")
+    return filled_area
+
+
+def measure_roughness(contour: np.ndarray, filled_area: int) -> float:
+    """Return perimeter normalized by the equal-area circle using filled external area."""
+    if filled_area <= 0:
+        raise ValueError("filled area must be positive")
+    perimeter = float(cv2.arcLength(contour, True))
+    return perimeter / (2.0 * math.sqrt(math.pi * filled_area))
+
+
+def measure_solidity(contour: np.ndarray, filled_area: int) -> float:
+    """Return filled external area divided by raster-filled convex-hull area."""
+    if filled_area <= 0:
+        raise ValueError("filled area must be positive")
+    hull = cv2.convexHull(contour)
+    x, y, width, height = cv2.boundingRect(hull)
+    local_hull = hull.astype(np.int32, copy=True)
+    local_hull[:, 0, 0] -= x
+    local_hull[:, 0, 1] -= y
+    raster = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(raster, local_hull, 1)
+    filled_hull_area = int(np.count_nonzero(raster))
+    if filled_hull_area <= 0:
+        raise ThresholdResolutionError("filled convex hull is empty")
+    return filled_area / filled_hull_area
+
+
+def measure_internal_dark_fraction(component_area: int, filled_area: int) -> float:
+    """Return the fraction of the filled external silhouette absent from the component."""
+    if filled_area <= 0:
+        raise ValueError("filled area must be positive")
+    if component_area < 0 or component_area > filled_area:
+        raise ValueError("component area must be between zero and filled area")
+    return (filled_area - component_area) / filled_area
+
+
+def _nearest_mask(mask: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    x = np.rint(xy[:, 0]).astype(np.int32)
+    y = np.rint(xy[:, 1]).astype(np.int32)
+    height, width = mask.shape
+    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    output = np.zeros(len(x), dtype=bool)
+    valid_indices = np.flatnonzero(valid)
+    output[valid_indices] = mask[y[valid_indices], x[valid_indices]]
+    return output
+
+
+def _contour_normals(
+    component: np.ndarray,
+    contour: np.ndarray,
+    sample_stride: int,
+    tangent_span: int = EDGE_TANGENT_SPAN,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = contour[:, 0, :].astype(np.float32)
+    count = len(points)
+    if count < 2 * tangent_span + 3:
+        tangent_span = max(1, count // 8)
+
+    indices = np.arange(0, count, max(1, sample_stride), dtype=np.int32)
+    sampled = points[indices]
+    previous = points[(indices - tangent_span) % count]
+    following = points[(indices + tangent_span) % count]
+    tangent = following - previous
+    lengths = np.linalg.norm(tangent, axis=1)
+    usable = lengths > 1e-6
+    sampled = sampled[usable]
+    tangent = tangent[usable] / lengths[usable, None]
+    normal = np.column_stack((-tangent[:, 1], tangent[:, 0])).astype(np.float32)
+
+    positive_inside = np.zeros(len(sampled), np.int16)
+    negative_inside = np.zeros(len(sampled), np.int16)
+    for distance in (1.0, 2.0, 3.0, 4.0, 5.0):
+        positive_inside += _nearest_mask(component, sampled + normal * distance).astype(np.int16)
+        negative_inside += _nearest_mask(component, sampled - normal * distance).astype(np.int16)
+
+    positive_is_inward = positive_inside > negative_inside
+    tied = positive_inside == negative_inside
+    if np.any(tied):
+        positive2 = _nearest_mask(component, sampled[tied] + normal[tied] * 2.0)
+        negative2 = _nearest_mask(component, sampled[tied] - normal[tied] * 2.0)
+        tie_choice = positive2 & ~negative2
+        tie_resolved = positive2 ^ negative2
+        tied_indices = np.flatnonzero(tied)
+        positive_is_inward[tied_indices[tie_resolved]] = tie_choice[tie_resolved]
+        keep = np.ones(len(sampled), dtype=bool)
+        keep[tied_indices[~tie_resolved]] = False
+        sampled = sampled[keep]
+        normal = normal[keep]
+        positive_is_inward = positive_is_inward[keep]
+
+    outward = normal.copy()
+    outward[positive_is_inward] *= -1.0
+    return sampled, outward
+
+
+def _linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    if len(x) < 2:
+        return math.nan, math.nan
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+    denominator = float(np.sum((x - x_mean) ** 2))
+    if denominator <= 1e-12:
+        return 0.0, y_mean
+    slope = float(np.sum((x - x_mean) * (y - y_mean)) / denominator)
+    return slope, y_mean - slope * x_mean
+
+
+def _sample_edge_profiles(
+    gray: np.ndarray,
+    component: np.ndarray,
+    contour: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    stride = max(
+        EDGE_MIN_SAMPLE_STRIDE,
+        math.ceil(max(1, len(contour)) / EDGE_TARGET_PROFILE_COUNT),
+    )
+    points, outward = _contour_normals(component, contour, stride)
+    if len(points) == 0:
+        raise ThresholdResolutionError("no oriented contour samples for photometric edge")
+
+    distances = np.arange(-EDGE_RADIUS, EDGE_RADIUS + 1, dtype=np.float32)
+    xy = points[:, None, :] + outward[:, None, :] * distances[None, :, None]
+    height, width = gray.shape
+    x = xy[:, :, 0]
+    y = xy[:, :, 1]
+    complete = (
+        (x.min(axis=1) >= 0)
+        & (x.max(axis=1) <= width - 1)
+        & (y.min(axis=1) >= 0)
+        & (y.max(axis=1) <= height - 1)
+    )
+    xy = xy[complete]
+    if len(xy) == 0:
+        raise ThresholdResolutionError("all photometric edge profiles leave the image")
+
+    source = gray.astype(np.float32, copy=False)
+    map_x = xy[:, :, 0].astype(np.float32)
+    map_y = xy[:, :, 1].astype(np.float32)
+    profile_chunks = []
+    for start in range(0, len(map_x), 15000):
+        stop = min(len(map_x), start + 15000)
+        profile_chunks.append(
+            cv2.remap(
+                source,
+                map_x[start:stop],
+                map_y[start:stop],
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        )
+    profiles = np.vstack(profile_chunks)
+    profiles = cv2.GaussianBlur(profiles, (7, 1), sigmaX=1.25, sigmaY=0)
+    return profiles, distances
+
+
+def measure_edge_alignment(
+    gray: np.ndarray,
+    component: np.ndarray,
+    contour: np.ndarray,
+) -> tuple[float, float, float]:
+    """Measure edge quality plus credibility and transition-monotonicity confidence.
+
+    Returns ``(alignment, credible_fraction, transition_monotonicity)``.  Alignment
+    is 1 at zero median absolute outer-edge offset and falls linearly to 0 at
+    ``EDGE_RADIUS`` pixels.  The endpoint is the 25%-of-peak derivative-recovery
+    location with four-pixel persistence.
+    """
+    profiles, distances = _sample_edge_profiles(gray, component, contour)
+    profile_count = len(profiles)
+    drop = (profiles[:, :-2] - profiles[:, 2:]) * 0.5
+    derivative_positions = distances[1:-1]
+    peak_indices = np.argmax(drop, axis=1)
+    rows = np.arange(profile_count)
+    peak_drop = drop[rows, peak_indices]
+    peak_position = distances[peak_indices + 1]
+
+    inner = np.median(profiles[:, :6], axis=1)
+    outer = np.median(profiles[:, -6:], axis=1)
+    total_drop = inner - outer
+    credible = (total_drop >= 1.0) & (peak_drop >= 0.12)
+    credible_count = int(np.count_nonzero(credible))
+    credible_fraction = credible_count / profile_count if profile_count else 0.0
+    if credible_count == 0:
+        return 0.0, float(credible_fraction), 0.0
+
+    endpoints = np.full(profile_count, np.nan, dtype=np.float32)
+    monotonicity = np.full(profile_count, np.nan, dtype=np.float32)
+
+    for index in np.flatnonzero(credible):
+        peak_derivative_index = int(peak_indices[index])
+        recovery_limit = max(0.02, EDGE_RECOVERY_FRACTION * float(peak_drop[index]))
+        for derivative_index in range(
+            peak_derivative_index + 1,
+            len(derivative_positions) - EDGE_RECOVERY_PERSISTENCE + 1,
+        ):
+            segment = drop[
+                index,
+                derivative_index : derivative_index + EDGE_RECOVERY_PERSISTENCE,
+            ]
+            if (
+                len(segment) == EDGE_RECOVERY_PERSISTENCE
+                and np.all(segment <= recovery_limit)
+            ):
+                endpoints[index] = derivative_positions[derivative_index]
+                break
+
+        peak_profile_index = peak_derivative_index + 1
+        transition_low = max(0, peak_profile_index - 3)
+        transition_high = min(len(distances), peak_profile_index + 4)
+        transition_slope, transition_intercept = _linear_fit(
+            distances[transition_low:transition_high],
+            profiles[index, transition_low:transition_high],
+        )
+        outer_slope, outer_intercept = _linear_fit(
+            distances[-7:], profiles[index, -7:]
+        )
+        inner_slope, inner_intercept = _linear_fit(
+            distances[:7], profiles[index, :7]
+        )
+
+        tangent_outer = math.nan
+        tangent_inner = math.nan
+        if (
+            math.isfinite(transition_slope)
+            and transition_slope < -1e-3
+            and math.isfinite(outer_slope)
+            and abs(transition_slope - outer_slope) > 1e-4
+        ):
+            value = (outer_intercept - transition_intercept) / (
+                transition_slope - outer_slope
+            )
+            if distances[0] - 5 <= value <= distances[-1] + 5:
+                tangent_outer = value
+        if (
+            math.isfinite(transition_slope)
+            and transition_slope < -1e-3
+            and math.isfinite(inner_slope)
+            and abs(transition_slope - inner_slope) > 1e-4
+        ):
+            value = (inner_intercept - transition_intercept) / (
+                transition_slope - inner_slope
+            )
+            if distances[0] - 5 <= value <= distances[-1] + 5:
+                tangent_inner = value
+
+        x0 = tangent_inner if math.isfinite(tangent_inner) else peak_position[index] - 6
+        x1 = tangent_outer if math.isfinite(tangent_outer) else peak_position[index] + 6
+        if x1 > x0:
+            transition = (derivative_positions >= x0) & (derivative_positions <= x1)
+            if np.any(transition):
+                monotonicity[index] = float(
+                    np.mean(drop[index, transition] >= -0.03)
+                )
+
+    valid_endpoints = endpoints[np.isfinite(endpoints) & credible]
+    valid_monotonicity = monotonicity[np.isfinite(monotonicity) & credible]
+    median_abs_offset = (
+        float(np.median(np.abs(valid_endpoints)))
+        if len(valid_endpoints)
+        else float(EDGE_RADIUS)
+    )
+    transition_monotonicity = (
+        float(np.median(valid_monotonicity))
+        if len(valid_monotonicity)
+        else 0.0
+    )
+    alignment = 1.0 - min(median_abs_offset / EDGE_RADIUS, 1.0)
+    return (
+        float(alignment),
+        float(credible_fraction),
+        float(transition_monotonicity),
+    )
+
+
+def refine_threshold(
+    full_res_gray: np.ndarray,
+    base_threshold: int,
+    seed_point: tuple[int, int],
+    full_res_guard_mask: np.ndarray,
+    max_steps: int = MAX_T_REFINEMENT_STEPS,
+) -> ThresholdRefinementResult:
+    """Fine-tune one separated threshold using deterministic full-resolution cleanup."""
+    gray = np.asarray(full_res_gray)
+    guard = np.asarray(full_res_guard_mask, dtype=bool)
+    if gray.ndim != 2 or gray.dtype != np.uint8:
+        raise ValueError("threshold refinement requires authoritative uint8 grayscale")
+    if guard.shape != gray.shape or not np.any(guard):
+        raise ValueError("guard must be a non-empty mask matching grayscale")
+    if not 0 <= base_threshold <= 255:
+        raise ValueError("base threshold must be 0..255")
+    if max_steps < 0:
+        raise ValueError("max_steps must be non-negative")
+
+    seed_x, seed_y = seed_point
+    height, width = gray.shape
+    if not (0 <= seed_x < width and 0 <= seed_y < height):
+        raise ValueError("seed lies outside grayscale raster")
+    if not guard[seed_y, seed_x]:
+        raise ValueError("seed must lie inside the fixed guard")
+
+    boundary = find_guard_boundary(guard)
+
+    preliminary: list[ThresholdMeasurement] = []
+    compressed_masks: dict[int, bytes] = {}
+    raw_reference_threshold: int | None = None
+    raw_reference_area: int | None = None
+    raw_reference_roughness: float | None = None
+
+    max_threshold = min(255, base_threshold + max_steps)
+    for threshold in range(base_threshold, max_threshold + 1):
+        threshold_mask = cv2.compare(gray, threshold, cv2.CMP_GT)
+
+        cleaned = clean_solar_component(threshold_mask, seed_point, guard)
+        if cleaned is not None and not np.any(cleaned & boundary):
+            contour = find_external_contour(cleaned)
+            filled_area = measure_filled_area(contour)
+            roughness = measure_roughness(contour, filled_area)
+            solidity = measure_solidity(contour, filled_area)
+            component_area = int(np.count_nonzero(cleaned))
+            internal_dark_fraction = measure_internal_dark_fraction(
+                component_area, filled_area
+            )
+            edge_alignment, credible_fraction, transition_monotonicity = (
+                measure_edge_alignment(gray, cleaned, contour)
+            )
+
+            preliminary.append(
+                ThresholdMeasurement(
+                    threshold=threshold,
+                    component_area=component_area,
+                    filled_area=filled_area,
+                    roughness=roughness,
+                    solidity=solidity,
+                    internal_dark_fraction=internal_dark_fraction,
+                    edge_alignment=edge_alignment,
+                    edge_credible_fraction=credible_fraction,
+                    edge_transition_monotonicity=transition_monotonicity,
+                )
+            )
+            compressed_masks[threshold] = compress_full_mask(cleaned)
+
+        # Raw geometry exists only to anchor the large/rough end of the score scale.
+        # Find the first separated raw component once, measure area/roughness, then
+        # never extract or measure another raw component in this refinement pass.
+        if raw_reference_threshold is None:
+            raw_mask = threshold_mask.copy()
+            raw_mask[~guard] = 0
+            raw_component = extract_component(raw_mask, seed_point)
+            if raw_component is not None and not np.any(raw_component & boundary):
+                raw_contour = find_external_contour(raw_component)
+                raw_reference_area = measure_filled_area(raw_contour)
+                raw_reference_roughness = measure_roughness(
+                    raw_contour, raw_reference_area
+                )
+                raw_reference_threshold = threshold
+
+    if not preliminary:
+        raise ThresholdResolutionError(
+            "no separated cleaned solar component exists in the refinement window"
+        )
+    if raw_reference_threshold is None:
+        raise ThresholdResolutionError(
+            "no separated raw reference exists in the refinement window"
+        )
+    assert raw_reference_area is not None
+    assert raw_reference_roughness is not None
+
+    max_roughness = max(
+        raw_reference_roughness,
+        *(measurement.roughness for measurement in preliminary),
+    )
+    max_area = max(
+        raw_reference_area,
+        *(measurement.filled_area for measurement in preliminary),
+    )
+    if not math.isfinite(max_roughness) or max_roughness <= 0.0 or max_area <= 0:
+        raise ThresholdResolutionError("invalid within-image score scale")
+
+    reliability_samples = [
+        measurement.edge_credible_fraction
+        * measurement.edge_transition_monotonicity
+        for measurement in preliminary
+    ]
+    edge_reliability = float(np.median(reliability_samples))
+    edge_reliability = (
+        float(np.clip(edge_reliability, 0.0, 1.0))
+        if math.isfinite(edge_reliability)
+        else 0.0
+    )
+    edge_weight = edge_reliability**2
+
+    scored: list[ThresholdMeasurement] = []
+    for measurement in preliminary:
+        q_roughness = 1.0 - measurement.roughness / max_roughness
+        q_holes = 1.0 - measurement.internal_dark_fraction
+        q_area = measurement.filled_area / max_area
+        q_solidity = measurement.solidity
+        q_edge = measurement.edge_alignment
+        score = (
+            q_roughness
+            + q_holes
+            + 0.5 * q_area
+            + 0.5 * q_solidity
+            + edge_weight * q_edge
+        )
+        scored.append(
+            ThresholdMeasurement(
+                threshold=measurement.threshold,
+                component_area=measurement.component_area,
+                filled_area=measurement.filled_area,
+                roughness=measurement.roughness,
+                solidity=measurement.solidity,
+                internal_dark_fraction=measurement.internal_dark_fraction,
+                edge_alignment=measurement.edge_alignment,
+                edge_credible_fraction=measurement.edge_credible_fraction,
+                edge_transition_monotonicity=measurement.edge_transition_monotonicity,
+                q_roughness=q_roughness,
+                q_holes=q_holes,
+                q_area=q_area,
+                q_solidity=q_solidity,
+                q_edge=q_edge,
+                score=score,
+            )
+        )
+
+    best_score = max(measurement.score for measurement in scored)
+    # Trajectory order is ascending T, so the first exact maximum is the lower-T
+    # deterministic tie-break without introducing any tolerance rule.
+    chosen = next(measurement for measurement in scored if measurement.score == best_score)
+
+    return ThresholdRefinementResult(
+        threshold=chosen.threshold,
+        base_threshold=base_threshold,
+        refinement_steps=chosen.threshold - base_threshold,
+        score=chosen.score,
+        edge_reliability=edge_reliability,
+        edge_weight=edge_weight,
+        raw_reference_threshold=raw_reference_threshold,
+        cleaned_component_mask=compressed_masks[chosen.threshold],
+        trajectory=tuple(scored),
+    )
+
 def find_auto_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
 ) -> int:
-    """Determine Auto T and cache only search state; ``resolve_threshold`` owns SolarData."""
+    """Determine automatic T, retain its seed, and cache the winning cleaned mask."""
     if full_res_gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
     if full_res_gray.dtype != np.uint8:
         raise ValueError("automatic thresholding requires authoritative uint8 grayscale")
 
-    # Auto-T limits the longest work-resolution dimension to 1200 pixels while
-    # passing the complete target size explicitly to resize_img().
     full_res_height, full_res_width = full_res_gray.shape
     full_res_max_dim = max(full_res_height, full_res_width)
     if full_res_max_dim > WORK_RES_MAX_DIM:
@@ -543,32 +1087,25 @@ def find_auto_threshold(
     else:
         work_res_size = (full_res_width, full_res_height)
 
-    # Build the work-resolution grayscale raster used only for component identity tracking.
     work_res_gray = resize_img(full_res_gray, work_res_size)
-
-    # Start the downward work-resolution search at the histogram valley before the bright mode.
     histogram_start_T = find_histogram_start_threshold(work_res_gray)
-
-    # Generate the current work-resolution support kernel in the parent so its
-    # footprint can be adjusted alongside WORK_RES_MAX_DIM without changing child tracking logic.
     work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
 
     try:
-        # Establish one supported seed, then track only that connected identity downward.
+        # Coarse search: establish and track one supported work-resolution identity.
         work_res_T, work_res_component = find_work_res_solar_component(
             work_res_gray,
             histogram_start_T,
             work_res_seed_kernel,
         )
 
-        # Transfer only the mature work component geometry onto the exact source raster.
+        # Transfer the mature component only to delimit full-resolution seed/guard state.
         full_res_search_mask = resize_img(
             work_res_component,
             (full_res_width, full_res_height),
             mask=True,
         )
 
-        # Preserve the actual work seed-support footprint at the realized source scale.
         work_res_support_size = max(work_res_seed_kernel.shape)
         mapped_kernel_size = (
             work_res_support_size
@@ -576,14 +1113,11 @@ def find_auto_threshold(
             / max(work_res_gray.shape)
         )
         full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
-
-        # Generate the equivalent source support kernel once before selecting the fixed source seed.
         full_res_seed_kernel = generate_kernel(
             (full_res_kernel_size, full_res_kernel_size),
             round_kernel=False,
         )
 
-        # Select the brightest deeply supported source seed anywhere in the transferred mature component.
         full_res_seed = brightest_supported_component_point(
             full_res_gray,
             full_res_search_mask,
@@ -595,15 +1129,15 @@ def find_auto_threshold(
                 f"{full_res_kernel_size}-supported full-resolution seed"
             )
 
-        # Expand the transferred component by the fixed 10% L2 margin to make the source guard.
+        # Construct the fixed 10% L2 guard once. Both coarse separation and fine
+        # refinement consume this exact immutable guard with identical clipping semantics.
         image_scale = math.sqrt(full_res_width * full_res_height)
         full_res_guard_mask = dilate_component_mask(
             full_res_search_mask,
             AUTO_T_GUARD_DILATION_FRACTION * image_scale,
         )
 
-        # Find the exact source separation boundary by searching only the required monotonic direction.
-        full_res_T = find_lowest_full_res_threshold(
+        separation_T = find_lowest_full_res_threshold(
             full_res_gray,
             work_res_T,
             full_res_seed,
@@ -617,412 +1151,35 @@ def find_auto_threshold(
             work_res_threshold=None,
             full_res_seed_point=None,
             resolved=False,
+            cleaned_component_mask=None,
             reason=str(exc),
         )
         image_state["auto_threshold_result"] = result
         raise
 
-    # Stage A is complete: only the minimum separation T, fixed seed, and fixed guard cross the boundary.
-    # Stage B rebuilds and evaluates its own components and may raise T, but never lower Stage A's result.
-    topology_selection = optimize_separated_threshold(
+    refinement = refine_threshold(
         full_res_gray,
-        full_res_T,
+        separation_T,
         full_res_seed,
         full_res_guard_mask,
     )
+
     result = AutoThresholdResult(
-        threshold=topology_selection.threshold,
+        threshold=refinement.threshold,
         histogram_start_threshold=histogram_start_T,
         work_res_threshold=work_res_T,
         full_res_seed_point=full_res_seed,
         resolved=True,
+        cleaned_component_mask=refinement.cleaned_component_mask,
     )
-
     image_state["auto_threshold_result"] = result
-    return topology_selection.threshold
-
-
-# ---------------------------------------------------------------------------
-# Auto-T Stage B: threshold optimization
-# ---------------------------------------------------------------------------
-# Stage B receives Stage A's proven full-resolution T, fixed seed, and fixed guard. It may
-# optimize upward from that boundary, but it must never redefine Stage-A identity
-# or lower the proven separation threshold. This block is the experimental redesign
-# boundary for the next phase of work.
-TOPOLOGY_OPTIMIZATION_STEPS = 5
-
-
-@dataclass(frozen=True)
-class ThresholdTopology:
-    threshold: int
-    area: int
-    contour_n: int
-    perimeter: float
-    roughness: float
-    solidity: float
-    internal_dark_fraction: float = 0.0
-
-
-@dataclass(frozen=True)
-class ThresholdTopologySelection:
-    threshold: int
-    base_threshold: int
-    delta: int
-    trajectory: tuple[ThresholdTopology, ...]
-    net_quality: tuple[float, ...]
-    knee_curve: tuple[float, ...]
-
-
-def _component_descriptor(component: np.ndarray, threshold: int) -> ThresholdTopology:
-    component = np.asarray(component, dtype=bool)
-    area = np.count_nonzero(component)
-    if area <= 0:
-        raise ValueError("empty component")
-
-    component_u8 = np.where(component, 255, 0).astype(np.uint8)
-    contours, _ = cv2.findContours(component_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        raise ValueError("component has no external contour")
-
-    contour = max(contours, key=cv2.contourArea)
-    contour_n = len(contour)
-    perimeter = cv2.arcLength(contour, True)
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = area / hull_area if hull_area > 0.0 else 0.0
-    roughness = perimeter / (2.0 * math.sqrt(math.pi * area))
-
-    # Internal dark fraction is measured in raster pixels, not contourArea. Fill
-    # the selected external contour, then count original component pixels (N1) and
-    # missing/dark pixels (N0) inside that fill.
-    filled = np.zeros(component.shape, dtype=np.uint8)
-    cv2.drawContours(filled, [contour], -1, 1, thickness=cv2.FILLED)
-    filled_bool = filled != 0
-    n1 = np.count_nonzero(component & filled_bool)
-    n0 = np.count_nonzero(filled_bool & ~component)
-    total = n0 + n1
-    internal_dark_fraction = n0 / total if total else 0.0
-
-    return ThresholdTopology(
-        threshold=threshold,
-        area=area,
-        contour_n=contour_n,
-        perimeter=perimeter,
-        roughness=roughness,
-        solidity=solidity,
-        internal_dark_fraction=internal_dark_fraction,
-    )
-
-
-def topology_trajectory_from_separation_threshold(
-    full_res_gray: np.ndarray,
-    base_threshold: int,
-    seed_point: tuple[int, int],
-    full_res_guard_mask: np.ndarray,
-    max_delta: int = TOPOLOGY_OPTIMIZATION_STEPS,
-) -> tuple[ThresholdTopology, ...]:
-    """Measure the current D7-cleaned Stage-B baseline from T through T+max_delta."""
-    if full_res_gray.ndim != 2:
-        raise ValueError("grayscale image must be two-dimensional")
-    if not 0 <= base_threshold <= 255:
-        raise ValueError("base threshold must be 0..255")
-    if max_delta < 0:
-        raise ValueError("max_delta must be non-negative")
-
-    guard = np.asarray(full_res_guard_mask, dtype=bool)
-    if guard.shape != full_res_gray.shape or not np.any(guard):
-        raise ValueError("Stage-B guard must be a non-empty mask matching grayscale")
-    seed_x, seed_y = seed_point
-    height, width = full_res_gray.shape
-    if not (0 <= seed_x < width and 0 <= seed_y < height) or not guard[seed_y, seed_x]:
-        raise ValueError("Stage-B seed must lie inside the guard")
-
-    guard_u8 = np.where(guard, 255, 0).astype(np.uint8)
-    cleanup_kernel = generate_kernel((7, 7), round_kernel=True)
-    trajectory: list[ThresholdTopology] = []
-    max_threshold = min(255, base_threshold + max_delta)
-    for threshold in range(base_threshold, max_threshold + 1):
-        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cleanup_kernel, iterations=1)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cleanup_kernel, iterations=1)
-        if binary[seed_y, seed_x] == 0:
-            break
-        cv2.bitwise_and(binary, guard_u8, dst=binary)
-        cv2.floodFill(binary, None, (seed_x, seed_y), 128, flags=8)
-        component = binary == 128
-
-        # Measure a fresh Stage-B component at each T; Stage A provides no reference mask.
-        trajectory.append(_component_descriptor(component, threshold))
-
-    if not trajectory:
-        raise ValueError("no valid topology samples")
-    return tuple(trajectory)
-
-
-def select_topology_knee(
-    trajectory: tuple[ThresholdTopology, ...] | list[ThresholdTopology],
-) -> ThresholdTopologySelection:
-    """Select the first cleanup-versus-erosion knee in the topology trajectory."""
-    rows = tuple(trajectory)
-    if not rows:
-        raise ValueError("empty topology trajectory")
-    if len(rows) == 1:
-        return ThresholdTopologySelection(
-            threshold=rows[0].threshold,
-            base_threshold=rows[0].threshold,
-            delta=0,
-            trajectory=rows,
-            net_quality=(0.0,),
-            knee_curve=(0.0,),
-        )
-
-    base = rows[0]
-    if base.area <= 0 or base.contour_n <= 0:
-        raise ValueError("base topology must have positive area and contour length")
-
-    base_area = base.area
-    base_contour = base.contour_n
-    base_roughness = base.roughness
-    base_solidity = base.solidity
-    solidity_headroom = 1.0 - base_solidity
-
-    net: list[float] = []
-    for row in rows:
-        # Benefit terms count improvements only; worsening is not mislabeled as cleanup.
-        contour_cleanup = max(0.0, 1.0 - row.contour_n / base_contour)
-        roughness_cleanup = (
-            max(0.0, 1.0 - row.roughness / base_roughness)
-            if base_roughness > 0.0
-            else 0.0
-        )
-        solidity_gain = (
-            max(0.0, (row.solidity - base_solidity) / solidity_headroom)
-            if solidity_headroom > 0.0
-            else 0.0
-        )
-        benefit = (contour_cleanup + roughness_cleanup + solidity_gain) / 3.0
-
-        # Cost terms likewise count erosion/damage only when it actually worsens.
-        area_loss = max(0.0, 1.0 - row.area / base_area)
-        solidity_loss = (
-            max(0.0, (base_solidity - row.solidity) / base_solidity)
-            if base_solidity > 0.0
-            else 0.0
-        )
-        cost = (area_loss + solidity_loss) / 2.0
-        net.append(benefit - cost)
-
-    best_so_far = np.maximum.accumulate(np.asarray(net))
-    best_value = np.max(best_so_far)
-    if not math.isfinite(best_value) or best_value <= 0.0:
-        selected_index = 0
-        knee = np.zeros(len(rows))
-    else:
-        quality_progress = best_so_far / best_value
-        threshold_progress = np.linspace(0.0, 1.0, len(rows))
-        knee = quality_progress - threshold_progress
-        selected_index = int(np.argmax(knee))
-
-    selected = rows[selected_index]
-    return ThresholdTopologySelection(
-        threshold=selected.threshold,
-        base_threshold=base.threshold,
-        delta=selected.threshold - base.threshold,
-        trajectory=rows,
-        net_quality=tuple(net),
-        knee_curve=tuple(knee.tolist()),
-    )
-
-
-def optimize_separated_threshold(
-    full_res_gray: np.ndarray,
-    base_threshold: int,
-    seed_point: tuple[int, int],
-    full_res_guard_mask: np.ndarray,
-    max_delta: int = TOPOLOGY_OPTIMIZATION_STEPS,
-) -> ThresholdTopologySelection:
-    """Run the current Stage-B baseline from Stage A's T/seed/guard contract."""
-    # Rebuild each topology sample from grayscale, T, seed, and guard; no Stage-A
-    # component is authoritative or passed across the stage boundary.
-    trajectory = topology_trajectory_from_separation_threshold(
-        full_res_gray,
-        base_threshold,
-        seed_point,
-        full_res_guard_mask,
-        max_delta=max_delta,
-    )
-
-    # If only the input T survives, the knee selector returns that input unchanged.
-    return select_topology_knee(trajectory)
-
-
-# Morphology candidate measurements retained for the Stage-B redesign.
-CLEANUP_CANDIDATE_ORDER = ("raw", "D3", "D5", "D7", "P35", "P357")
-
-
-@dataclass(frozen=True)
-class CleanupMetrics:
-    """Unweighted cleanup benefit/cost terms measured against one raw component."""
-
-    contour_cleanup: float
-    roughness_cleanup: float
-    solidity_gain: float
-    internal_dark_cleanup: float
-    area_loss: float
-    solidity_loss: float
-
-
-@dataclass(frozen=True)
-class CleanupCandidateEvaluation:
-    name: str
-    mask: np.ndarray
-    topology: ThresholdTopology
-    metrics: CleanupMetrics
-
-
-def open_close_component(component: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Apply exactly one binary OPEN followed by one CLOSE with ``kernel``."""
-    component = np.asarray(component, dtype=bool)
-    kernel = np.asarray(kernel, dtype=np.uint8)
-    if component.ndim != 2 or not np.any(component):
-        raise ValueError("component mask must be a non-empty two-dimensional mask")
-    if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
-        raise ValueError("cleanup kernel must be a non-empty two-dimensional mask")
-    u8 = np.where(component, 255, 0).astype(np.uint8)
-    opened = cv2.morphologyEx(u8, cv2.MORPH_OPEN, kernel, iterations=1)
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return closed != 0
-
-
-def cleanup_morphology_candidates(component: np.ndarray) -> dict[str, np.ndarray]:
-    """Build raw, direct 3/5/7, and progressive 3->5 / 3->5->7 candidates."""
-    raw = np.asarray(component, dtype=bool)
-    if raw.ndim != 2 or not np.any(raw):
-        raise ValueError("component mask must be a non-empty two-dimensional mask")
-
-    # Generate every reused Euclidean cleanup kernel once before applying any path.
-    k3 = generate_kernel((3, 3), round_kernel=True)
-    k5 = generate_kernel((5, 5), round_kernel=True)
-    k7 = generate_kernel((7, 7), round_kernel=True)
-
-    # Apply direct cleanup to raw, then reuse prior results for the progressive paths.
-    d3 = open_close_component(raw, k3)
-    d5 = open_close_component(raw, k5)
-    d7 = open_close_component(raw, k7)
-    p35 = open_close_component(d3, k5)
-    p357 = open_close_component(p35, k7)
-    return {
-        "raw": raw.copy(),
-        "D3": d3,
-        "D5": d5,
-        "D7": d7,
-        "P35": p35,
-        "P357": p357,
-    }
-
-
-def seed_connected_cleanup_candidates(
-    component: np.ndarray,
-    seed_point: tuple[int, int],
-) -> dict[str, np.ndarray]:
-    """Return each cleanup candidate's 8-component containing the authoritative seed."""
-    raw = np.asarray(component, dtype=bool)
-    if raw.ndim != 2 or not np.any(raw):
-        raise ThresholdResolutionError("Raw cleanup component is empty")
-
-    seed_x, seed_y = seed_point
-    height, width = raw.shape
-    if not (0 <= seed_x < width and 0 <= seed_y < height):
-        raise ThresholdResolutionError("Cleanup seed lies outside the component raster")
-    if not raw[seed_y, seed_x]:
-        raise ThresholdResolutionError("Cleanup seed lies outside the raw component")
-
-    # Build the fixed raw/direct/progressive morphology candidate family once.
-    candidates = cleanup_morphology_candidates(raw)
-    valid: dict[str, np.ndarray] = {}
-    for name in CLEANUP_CANDIDATE_ORDER:
-        candidate = candidates[name]
-        if not candidate[seed_y, seed_x]:
-            continue
-        flood = np.where(candidate, 255, 0).astype(np.uint8)
-        cv2.floodFill(flood, None, (seed_x, seed_y), 128, flags=8)
-        valid[name] = flood == 128
-
-    return valid
-
-
-def evaluate_cleanup_candidates(
-    component: np.ndarray,
-    seed_point: tuple[int, int],
-    threshold: int,
-) -> tuple[CleanupCandidateEvaluation, ...]:
-    """Measure every valid cleanup candidate against the same raw component."""
-    # Restrict every morphology candidate to the authoritative seed-connected identity.
-    candidates = seed_connected_cleanup_candidates(component, seed_point)
-
-    # Measure the unmodified component once; every candidate is scored against this baseline.
-    raw_topology = _component_descriptor(candidates["raw"], threshold)
-    base_area = raw_topology.area
-    base_contour = raw_topology.contour_n
-    base_roughness = raw_topology.roughness
-    base_solidity = raw_topology.solidity
-    solidity_headroom = 1.0 - base_solidity
-
-    rows: list[CleanupCandidateEvaluation] = []
-    for name in CLEANUP_CANDIDATE_ORDER:
-        candidate = candidates.get(name)
-        if candidate is None:
-            continue
-
-        # Reuse the already measured raw descriptor; measure only actual cleanup variants.
-        topology = raw_topology if name == "raw" else _component_descriptor(candidate, threshold)
-
-        # Benefit terms count only actual cleanup improvements.
-        contour_cleanup = max(0.0, 1.0 - topology.contour_n / base_contour)
-        roughness_cleanup = (
-            max(0.0, 1.0 - topology.roughness / base_roughness)
-            if base_roughness > 0.0
-            else 0.0
-        )
-        solidity_gain = (
-            max(0.0, (topology.solidity - base_solidity) / solidity_headroom)
-            if solidity_headroom > 0.0
-            else 0.0
-        )
-        internal_dark_cleanup = max(
-            0.0,
-            raw_topology.internal_dark_fraction - topology.internal_dark_fraction,
-        )
-
-        # Cost terms count only actual loss relative to the raw component.
-        area_loss = max(0.0, 1.0 - topology.area / base_area)
-        solidity_loss = (
-            max(0.0, (base_solidity - topology.solidity) / base_solidity)
-            if base_solidity > 0.0
-            else 0.0
-        )
-        rows.append(
-            CleanupCandidateEvaluation(
-                name=name,
-                mask=candidate,
-                topology=topology,
-                metrics=CleanupMetrics(
-                    contour_cleanup=contour_cleanup,
-                    roughness_cleanup=roughness_cleanup,
-                    solidity_gain=solidity_gain,
-                    internal_dark_cleanup=internal_dark_cleanup,
-                    area_loss=area_loss,
-                    solidity_loss=solidity_loss,
-                ),
-            )
-        )
-    return tuple(rows)
+    return refinement.threshold
 
 
 # ---------------------------------------------------------------------------
 # Final-T full-resolution solar resolution and persistence
 # ---------------------------------------------------------------------------
-# These constants belong to downstream SolarData construction, not Auto-T Stage A.
+# These constants belong to downstream SolarData construction, not automatic threshold search.
 ROI_DILATION_FRACTION = 0.065
 GUARD_DILATION_FRACTION = 0.195
 
