@@ -61,6 +61,7 @@ def make_state_app():
         histogram_start_threshold=10,
         work_res_threshold=12,
         full_res_seed_point=(3, 0),
+        cleaned_component_mask=appmod.compress_full_mask(np.array([[False, False, False, True]])),
         resolved=True,
     )
     app.image_state = {

@@ -72,6 +72,7 @@ def test_seed_support_is_explicit_5x5_square_with_no_fallback():
     gray[10, 10] = 250
     assert cad.brightest_supported_component_point(gray, thin, kernel) is None
 
+
 def test_seed_rule_is_brightest_supported_then_innermost_tie_break():
     gray = np.zeros((51, 51), np.uint8)
     component = np.zeros_like(gray)
@@ -161,6 +162,7 @@ def test_commit_setting_change_always_stores_initialized_threshold_even_at_auto_
         histogram_start_threshold=17,
         work_res_threshold=17,
         full_res_seed_point=(2, 2),
+        cleaned_component_mask=cad.compress_full_mask(np.ones((5, 5), dtype=bool)),
         resolved=True,
     )
     app.image_state = {
