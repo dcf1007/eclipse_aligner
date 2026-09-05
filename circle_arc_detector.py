@@ -54,6 +54,7 @@ horizon special case in automatic threshold selection.
 
 import argparse
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import os
@@ -550,8 +551,8 @@ def find_separation_threshold(
     start_T: int,
     full_res_seed_point: tuple[int, int],
     full_res_guard_mask: np.ndarray,
-) -> int:
-    """Return the lowest T whose D7-cleaned component is separated by the fixed guard."""
+) -> tuple[int, np.ndarray]:
+    """Return the lowest separated T and its already-computed D7 component."""
     if full_res_gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
     if not 0 <= start_T <= 255:
@@ -597,6 +598,7 @@ def find_separation_threshold(
 
     if not np.any(component & full_res_guard_boundary):
         best_T = start_T
+        best_component = component
         for threshold in range(start_T - 1, -1, -1):
             binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
             binary = cv2.morphologyEx(
@@ -616,7 +618,8 @@ def find_separation_threshold(
             if component is None or np.any(component & full_res_guard_boundary):
                 break
             best_T = threshold
-        return best_T
+            best_component = component
+        return best_T, best_component
 
     for threshold in range(start_T + 1, 256):
         binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
@@ -637,7 +640,7 @@ def find_separation_threshold(
         binary[~full_res_guard_mask] = 0
         component = extract_component(binary, full_res_seed_point)
         if component is not None and not np.any(component & full_res_guard_boundary):
-            return threshold
+            return threshold, component
 
     raise ThresholdResolutionError(
         "Tracked full-resolution solar component never became separated after D7 cleanup"
@@ -1138,8 +1141,9 @@ def refine_threshold(
 def find_auto_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
+    separation_result_callback=None,
 ) -> int:
-    """Determine automatic T, retain its seed, and cache the winning cleaned mask."""
+    """Determine automatic T, optionally exposing the completed Stage-A result."""
     if full_res_gray.ndim != 2:
         raise ValueError("grayscale image must be two-dimensional")
     if full_res_gray.dtype != np.uint8:
@@ -1228,12 +1232,14 @@ def find_auto_threshold(
         # Find the exact coarse separation boundary using fixed D7 cleanup, the
         # authoritative seed point, and the immutable full-resolution guard.
         resolution_step = "coarse separation"
-        separation_T = find_separation_threshold(
+        separation_T, separation_component = find_separation_threshold(
             full_res_gray,
             work_res_T,
             full_res_seed_point,
             full_res_guard_mask,
         )
+        if separation_result_callback is not None:
+            separation_result_callback(separation_T, separation_component)
 
         # Fine refinement may only raise the proven separation T. It reuses the same
         # authoritative seed and fixed guard and returns its winning full-resolution mask.
@@ -1591,75 +1597,98 @@ class DetectorApp:
             return
 
         path = self.image_paths[index]
-
-        # Load source pixels without changing their channel count or integer depth.
-        unchanged_image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         self.current_index = index
         self.current_path = path
 
-        if unchanged_image is None:
-            self.master_image_payload = None
-            self.master_image_shape = None
-            self.gray_image = None
-            if hasattr(self, "threshold_canvas"):
-                self.render_canvas_content(self.threshold_canvas, transparent_bgra())
-            if hasattr(self, "color_canvas"):
-                self.render_canvas_content(self.color_canvas, transparent_bgra())
-            self.status.set(f"Could not load image: {path}")
-            self.update_navigation_state()
-            return
-
-        # Normalize once to the lossless uint16 BGRA master used by future transforms.
-        master_image = normalize_master_bgra16(unchanged_image)
-
-        # Derive the authoritative uint8 processing grayscale directly from that master.
-        self.gray_image = master_bgra16_to_gray8(master_image)
-
-        # Derive a temporary uint8 color raster only for the Tk canvas display path.
-        display_image = master_bgra16_to_display_bgra8(master_image)
-
-        if path in self.image_state:
-            state = self.image_state[path]
-            state.setdefault("auto_threshold_result", None)
-            state.setdefault("solar_data", None)
-        else:
-            state = {
-                "settings": ImageSettings(),
-                "auto_threshold_result": None,
-                "solar_data": None,
-            }
-            self.image_state[path] = state
-
-        settings = state["settings"]
-        for setting_name, variable in self.setting_variables.items():
-            if setting_name == "threshold":
-                continue
-            baseline = getattr(self.default_settings, setting_name)
-            override = getattr(settings, setting_name)
-            variable.set(baseline if override is None else override)
-
-        self._update_center_preview_label()
-        if hasattr(self, "color_canvas"):
-            self.render_canvas_content(self.color_canvas, display_image)
-
-        # The canvas retains its own display raster. Keep only a compressed exact master
-        # until full-color transform/export code starts consuming the master directly.
-        self.master_image_shape = master_image.shape
-        self.master_image_payload = compress_master_bgra16(master_image)
-
-        if settings.threshold is None:
-            # None has one meaning only: this image has never had T initialized.
-            try:
-                threshold = find_auto_threshold(self.gray_image, state)
-            except ThresholdResolutionError as exc:
-                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-            else:
-                self.commit_setting_change("threshold", threshold)
-        else:
-            self.threshold.set(settings.threshold)
-            self.refresh_preview(changed_setting="image load")
-
+        # Navigation/filename is the first visible change for the newly selected image.
         self.update_navigation_state()
+        self.root.update_idletasks()
+
+        try:
+            with self.processing_ui():
+                # Load source pixels without changing their channel count or integer depth.
+                unchanged_image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
+                if unchanged_image is None:
+                    self.master_image_payload = None
+                    self.master_image_shape = None
+                    self.gray_image = None
+                    if hasattr(self, "threshold_canvas"):
+                        self.render_canvas_content(self.threshold_canvas, transparent_bgra())
+                    if hasattr(self, "color_canvas"):
+                        self.render_canvas_content(self.color_canvas, transparent_bgra())
+                    self.status.set(f"Could not load image: {path}")
+                    return
+
+                # Normalize once to the lossless uint16 BGRA master used by future transforms.
+                master_image = normalize_master_bgra16(unchanged_image)
+
+                # Derive the authoritative uint8 processing grayscale directly from that master.
+                self.gray_image = master_bgra16_to_gray8(master_image)
+
+                # Derive a temporary uint8 color raster only for the Tk canvas display path.
+                display_image = master_bgra16_to_display_bgra8(master_image)
+
+                if path in self.image_state:
+                    state = self.image_state[path]
+                    state.setdefault("auto_threshold_result", None)
+                    state.setdefault("solar_data", None)
+                else:
+                    state = {
+                        "settings": ImageSettings(),
+                        "auto_threshold_result": None,
+                        "solar_data": None,
+                    }
+                    self.image_state[path] = state
+
+                settings = state["settings"]
+                for setting_name, variable in self.setting_variables.items():
+                    if setting_name == "threshold":
+                        continue
+                    baseline = getattr(self.default_settings, setting_name)
+                    override = getattr(settings, setting_name)
+                    variable.set(baseline if override is None else override)
+
+                self._update_center_preview_label()
+
+                # Keep the exact master before starting the visible processing stages.
+                self.master_image_shape = master_image.shape
+                self.master_image_payload = compress_master_bgra16(master_image)
+
+                # First visible processing stage: source color + authoritative grayscale.
+                if hasattr(self, "color_canvas"):
+                    self.render_canvas_content(self.color_canvas, display_image)
+                if hasattr(self, "threshold_canvas"):
+                    self.render_canvas_content(self.threshold_canvas, self.gray_image)
+
+                if settings.threshold is None:
+                    # None has one meaning only: this image has never had T initialized.
+                    try:
+                        threshold = find_auto_threshold(
+                            self.gray_image,
+                            state,
+                            self._display_auto_separation_result,
+                        )
+                    except ThresholdResolutionError as exc:
+                        self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+                    else:
+                        result = state["auto_threshold_result"]
+                        refined_component = decompress_full_mask(
+                            result.cleaned_component_mask,
+                            self.gray_image.shape,
+                        )
+                        if hasattr(self, "threshold_canvas"):
+                            self.render_canvas_content(self.threshold_canvas, refined_component)
+                        self.commit_setting_change(
+                            "threshold",
+                            threshold,
+                            display_raw_threshold=False,
+                        )
+                else:
+                    self.threshold.set(settings.threshold)
+                    self.refresh_preview(changed_setting="image load")
+        finally:
+            self.update_navigation_state()
 
 
     def previous_image(self):
@@ -1669,6 +1698,33 @@ class DetectorApp:
     def next_image(self):
         if 0 <= self.current_index < len(self.image_paths) - 1:
             self.load_image_at(self.current_index + 1)
+
+    @contextmanager
+    def processing_ui(self):
+        """Keep interactive controls disabled during synchronous processing."""
+        control_types = (tk.Button, tk.Scale, tk.Checkbutton, tk.Radiobutton)
+        prior_states = []
+        pending = [self.root]
+        while pending:
+            parent = pending.pop()
+            for child in parent.winfo_children():
+                pending.append(child)
+                if isinstance(child, control_types):
+                    prior_states.append((child, child.cget("state")))
+                    child.config(state=tk.DISABLED)
+
+        # Only flush Tk's pending geometry/repaint work; processing stays synchronous.
+        self.root.update_idletasks()
+        try:
+            yield
+        finally:
+            # Consume mouse/keyboard events queued during synchronous processing while
+            # every interactive control is still disabled. This prevents a click or
+            # drag made during processing from being replayed after controls are restored.
+            self.root.update()
+            for widget, state in prior_states:
+                if widget.winfo_exists():
+                    widget.config(state=state)
 
     def update_navigation_state(self):
         count = len(self.image_paths)
@@ -1987,6 +2043,10 @@ class DetectorApp:
     # ------------------------------------------------------------------
     # Application actions and threshold preview
     # ------------------------------------------------------------------
+    def _display_auto_separation_result(self, _threshold: int, component: np.ndarray):
+        if hasattr(self, "threshold_canvas"):
+            self.render_canvas_content(self.threshold_canvas, component)
+
     def save_centered_images(self):
         self.status.set(
             "Save centered images: export functionality is not implemented in the threshold-finder stage."
@@ -1998,31 +2058,47 @@ class DetectorApp:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
 
-        state = self.image_state[self.current_path]
-        result = state.get("auto_threshold_result")
-        if (
-            isinstance(result, AutoThresholdResult)
-            and result.resolved
-            and result.threshold is not None
-        ):
-            selected_threshold = result.threshold
-        else:
-            try:
-                selected_threshold = find_auto_threshold(self.gray_image, state)
-            except ThresholdResolutionError as exc:
-                self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-                return
-            result = state["auto_threshold_result"]
+        with self.processing_ui():
+            state = self.image_state[self.current_path]
+            result = state.get("auto_threshold_result")
+            if (
+                isinstance(result, AutoThresholdResult)
+                and result.resolved
+                and result.threshold is not None
+            ):
+                selected_threshold = result.threshold
+            else:
+                try:
+                    selected_threshold = find_auto_threshold(
+                        self.gray_image,
+                        state,
+                        self._display_auto_separation_result,
+                    )
+                except ThresholdResolutionError as exc:
+                    self.status.set(f"Automatic threshold could not be resolved ({exc}).")
+                    return
+                result = state["auto_threshold_result"]
 
-        self.commit_setting_change("threshold", selected_threshold)
+            if result.cleaned_component_mask is not None and hasattr(self, "threshold_canvas"):
+                refined_component = decompress_full_mask(
+                    result.cleaned_component_mask,
+                    self.gray_image.shape,
+                )
+                self.render_canvas_content(self.threshold_canvas, refined_component)
 
-        solar_data = state.get("solar_data")
-        if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
-            self.status.set(
-                "Automatic grayscale threshold selected: "
-                f"T={selected_threshold} (work-res T={result.work_res_threshold}, "
-                f"histogram start={result.histogram_start_threshold}); refined component displayed."
+            self.commit_setting_change(
+                "threshold",
+                selected_threshold,
+                display_raw_threshold=False,
             )
+
+            solar_data = state.get("solar_data")
+            if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
+                self.status.set(
+                    "Automatic grayscale threshold selected: "
+                    f"T={selected_threshold} (work-res T={result.work_res_threshold}, "
+                    f"histogram start={result.histogram_start_threshold}); refined component displayed."
+                )
 
 
     def auto_select_radius(self):
@@ -2033,7 +2109,7 @@ class DetectorApp:
 
 
 
-    def commit_setting_change(self, setting_name, value):
+    def commit_setting_change(self, setting_name, value, display_raw_threshold: bool = True):
         """Synchronize one completed setting change, persist it, then refresh once."""
         variable = self.setting_variables[setting_name]
         variable.set(value)
@@ -2057,7 +2133,10 @@ class DetectorApp:
             setattr(settings, setting_name, None if value == baseline else value)
 
         if self.gray_image is not None:
-            self.refresh_preview(changed_setting=setting_name)
+            self.refresh_preview(
+                changed_setting=setting_name,
+                display_raw_threshold=display_raw_threshold,
+            )
 
 
     def _selected_center_target_name(self):
@@ -2092,12 +2171,13 @@ class DetectorApp:
         target = self._selected_center_target_name()
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
-    def refresh_preview(self, changed_setting: str | None = None, full_resolution: bool = False):
-        """Display raw current-T B/W, resolve/persist SolarData, then display refinement.
-
-        ``full_resolution`` is intentionally a placeholder today: both modes use the
-        same authoritative full-resolution grayscale and the same resolver.
-        """
+    def refresh_preview(
+        self,
+        changed_setting: str | None = None,
+        full_resolution: bool = False,
+        display_raw_threshold: bool = True,
+    ):
+        """Display current-T B/W when requested, resolve SolarData, then display refinement."""
         if self.gray_image is None or self.current_path is None:
             action = "Apply Full Resolution" if full_resolution else "Refresh Preview"
             self.status.set(f"{action}: no readable image is loaded.")
@@ -2109,49 +2189,54 @@ class DetectorApp:
             self.status.set("Threshold is not initialized for the current image.")
             return
 
-        threshold = settings.threshold
-        existing = state.get("solar_data")
-        reused = isinstance(existing, SolarData) and existing.threshold == threshold
-        if isinstance(existing, SolarData) and existing.threshold != threshold:
-            state["solar_data"] = None
+        with self.processing_ui():
+            threshold = settings.threshold
+            existing = state.get("solar_data")
+            reused = isinstance(existing, SolarData) and existing.threshold == threshold
+            if isinstance(existing, SolarData) and existing.threshold != threshold:
+                state["solar_data"] = None
 
-        threshold_mask = self.gray_image > threshold
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, threshold_mask)
+            if display_raw_threshold:
+                threshold_mask = self.gray_image > threshold
+                if hasattr(self, "threshold_canvas"):
+                    self.render_canvas_content(self.threshold_canvas, threshold_mask)
 
-        try:
-            refined_component = resolve_threshold(
-                self.gray_image,
-                threshold,
-                state,
-            )
-        except (ThresholdResolutionError, ValueError) as exc:
-            self.status.set(
-                f"Pure threshold remains displayed at T={threshold}; SolarData could not be "
-                f"established ({exc})."
-            )
-            return
+            try:
+                refined_component = resolve_threshold(
+                    self.gray_image,
+                    threshold,
+                    state,
+                )
+            except (ThresholdResolutionError, ValueError) as exc:
+                retained_display = (
+                    "Pure threshold" if display_raw_threshold else "Stage-B refined component"
+                )
+                self.status.set(
+                    f"{retained_display} remains displayed at T={threshold}; SolarData could not be "
+                    f"established ({exc})."
+                )
+                return
 
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, refined_component)
+            if hasattr(self, "threshold_canvas"):
+                self.render_canvas_content(self.threshold_canvas, refined_component)
 
-        if full_resolution:
-            self.status.set(
-                "Full-resolution refined solar-component preview applied at "
-                f"T={threshold}. Ellipse detector backend not implemented yet."
-            )
-        elif changed_setting is not None:
-            self.status.set(
-                f"{changed_setting} committed; refined current preview displayed at T={threshold}."
-            )
-        elif reused:
-            self.status.set(
-                f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
-            )
-        else:
-            self.status.set(
-                f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
-            )
+            if full_resolution:
+                self.status.set(
+                    "Full-resolution refined solar-component preview applied at "
+                    f"T={threshold}. Ellipse detector backend not implemented yet."
+                )
+            elif changed_setting is not None:
+                self.status.set(
+                    f"{changed_setting} committed; refined current preview displayed at T={threshold}."
+                )
+            elif reused:
+                self.status.set(
+                    f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
+                )
+            else:
+                self.status.set(
+                    f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
+                )
 
 
     def apply_full_resolution(self, _event=None):
