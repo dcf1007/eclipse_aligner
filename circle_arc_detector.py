@@ -415,30 +415,11 @@ def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
 
 MAX_T_REFINEMENT_STEPS = 10
 
-# Photometric edge profiles are sampled along estimated outward contour normals.
-# The 25-pixel radius supplies enough interior/exterior context to see the full
-# brightness transition and, by the accepted current design, also defines the
-# offset at which edge-alignment quality falls to zero.
+# Photometric edge profiles retain a fixed +/-25-pixel observation radius so each
+# profile normally contains the full limb transition plus interior/exterior context.
+# Unlike the previous implementation, this acquisition radius does not define the
+# edge score scale.
 EDGE_PROFILE_RADIUS_PX = 25
-
-# After the strongest outward intensity fall, the wanted edge is the point where
-# the negative slope has recovered to 25% of that peak and remains recovered for
-# four consecutive profile positions. This locates the outer end of the transition
-# rather than its strongest-gradient midpoint.
-EDGE_SLOPE_RECOVERY_FRACTION = 0.25
-EDGE_SLOPE_RECOVERY_PERSISTENCE_PX = 4
-
-# Adjacent CHAIN_APPROX_NONE contour points yield highly redundant normal profiles.
-# Sample at least eight contour indices apart, and increase that spacing only for
-# exceptionally long contours so approximately no more than 2000 profiles are
-# evaluated. These limits control runtime while retaining broad contour coverage.
-EDGE_PROFILE_MIN_SAMPLE_STRIDE = 8
-EDGE_PROFILE_MAX_SAMPLE_COUNT = 2000
-
-# Estimate each local tangent from contour points +/-12 indices around the sample.
-# The wider chord suppresses raster stair-step noise before the tangent is rotated
-# into an outward normal; it remains short enough to preserve local curvature.
-EDGE_NORMAL_TANGENT_HALF_SPAN = 12
 
 GUARD_BOUNDARY_KERNEL = generate_kernel((3, 3), round_kernel=False)
 SEPARATION_KERNEL = generate_kernel((7, 7), round_kernel=True)
@@ -456,11 +437,9 @@ class ThresholdMeasurement:
     threshold: int
     filled_area: int
     roughness: float
-    solidity: float
-    internal_dark_fraction: float
-    edge_alignment: float
-    edge_credible_fraction: float
-    edge_transition_monotonicity: float
+    hole_quality: float
+    edge_distance: float
+    edge_reliability: float
 
 
 
@@ -782,301 +761,316 @@ def measure_roughness(contour: np.ndarray, filled_area: int) -> float:
     return perimeter / (2.0 * math.sqrt(math.pi * filled_area))
 
 
-def measure_solidity(contour: np.ndarray, filled_area: int) -> float:
-    """Return filled external area divided by raster-filled convex-hull area."""
-    if filled_area <= 0:
-        raise ValueError("filled area must be positive")
-    hull = cv2.convexHull(contour)
-    x, y, width, height = cv2.boundingRect(hull)
-    local_hull = hull.astype(np.int32, copy=True)
-    local_hull[:, 0, 0] -= x
-    local_hull[:, 0, 1] -= y
-    raster = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillConvexPoly(raster, local_hull, 1)
-    filled_hull_area = int(np.count_nonzero(raster))
-    if filled_hull_area <= 0:
-        raise ThresholdResolutionError("filled convex hull is empty")
-    return filled_area / filled_hull_area
-
-
-def measure_internal_dark_fraction(component_area: int, filled_area: int) -> float:
-    """Return the fraction of the filled external silhouette absent from the component."""
+def measure_hole_quality(
+    contour: np.ndarray,
+    component_area: int,
+    filled_area: int,
+) -> float:
+    """Return external-boundary share after converting internal dark area to perimeter."""
     if filled_area <= 0:
         raise ValueError("filled area must be positive")
     if component_area < 0 or component_area > filled_area:
         raise ValueError("component area must be between zero and filled area")
-    return (filled_area - component_area) / filled_area
+    external_perimeter = float(cv2.arcLength(contour, True))
+    if not math.isfinite(external_perimeter) or external_perimeter <= 0.0:
+        raise ThresholdResolutionError("external contour perimeter is empty")
+    hole_area = filled_area - component_area
+    minimum_hole_perimeter = 2.0 * math.sqrt(math.pi * hole_area)
+    return external_perimeter / (external_perimeter + minimum_hole_perimeter)
 
 
-def _nearest_mask(mask: np.ndarray, xy: np.ndarray) -> np.ndarray:
-    x = np.rint(xy[:, 0]).astype(np.int32)
-    y = np.rint(xy[:, 1]).astype(np.int32)
-    height, width = mask.shape
-    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
-    output = np.zeros(len(x), dtype=bool)
-    valid_indices = np.flatnonzero(valid)
-    output[valid_indices] = mask[y[valid_indices], x[valid_indices]]
-    return output
-
-
-def _contour_normals(
-    component: np.ndarray,
-    contour: np.ndarray,
-    sample_stride: int,
-    tangent_half_span: int = EDGE_NORMAL_TANGENT_HALF_SPAN,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return sampled contour points and consistently outward unit normals."""
-    points = contour[:, 0, :].astype(np.float32)
-    count = len(points)
-    if count < 2 * tangent_half_span + 3:
-        tangent_half_span = max(1, count // 8)
-
-    indices = np.arange(0, count, max(1, sample_stride), dtype=np.int32)
-    sampled = points[indices]
-    previous = points[(indices - tangent_half_span) % count]
-    following = points[(indices + tangent_half_span) % count]
-    tangent = following - previous
-    lengths = np.linalg.norm(tangent, axis=1)
-    usable = lengths > 1e-6
-    sampled = sampled[usable]
-    tangent = tangent[usable] / lengths[usable, None]
-    normal = np.column_stack((-tangent[:, 1], tangent[:, 0])).astype(np.float32)
-
-    # A tangent determines two opposite normals. Probe 1..5 pixels on both sides
-    # of the component boundary and call the side with more component support inward.
-    # This short multi-pixel vote is more stable than deciding from one raster sample.
-    positive_inside = np.zeros(len(sampled), np.int16)
-    negative_inside = np.zeros(len(sampled), np.int16)
-    for distance in (1.0, 2.0, 3.0, 4.0, 5.0):
-        positive_inside += _nearest_mask(component, sampled + normal * distance).astype(np.int16)
-        negative_inside += _nearest_mask(component, sampled - normal * distance).astype(np.int16)
-
-    positive_is_inward = positive_inside > negative_inside
-    tied = positive_inside == negative_inside
-    if np.any(tied):
-        # Resolve otherwise ambiguous votes with a direct two-pixel inside/outside
-        # check. Samples still ambiguous here cannot supply a trustworthy normal.
-        positive2 = _nearest_mask(component, sampled[tied] + normal[tied] * 2.0)
-        negative2 = _nearest_mask(component, sampled[tied] - normal[tied] * 2.0)
-        tie_choice = positive2 & ~negative2
-        tie_resolved = positive2 ^ negative2
-        tied_indices = np.flatnonzero(tied)
-        positive_is_inward[tied_indices[tie_resolved]] = tie_choice[tie_resolved]
-        keep = np.ones(len(sampled), dtype=bool)
-        keep[tied_indices[~tie_resolved]] = False
-        sampled = sampled[keep]
-        normal = normal[keep]
-        positive_is_inward = positive_is_inward[keep]
-
-    outward = normal.copy()
-    outward[positive_is_inward] *= -1.0
-    return sampled, outward
-
-
-
-def _linear_fit(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
-    if len(x) < 2:
-        return math.nan, math.nan
-    x_mean = float(x.mean())
-    y_mean = float(y.mean())
-    denominator = float(np.sum((x - x_mean) ** 2))
-    if denominator <= 1e-12:
-        return 0.0, y_mean
-    slope = float(np.sum((x - x_mean) * (y - y_mean)) / denominator)
-    return slope, y_mean - slope * x_mean
-
-
-def _sample_edge_profiles(
+def _sample_grayscale_profiles(
     full_res_gray: np.ndarray,
-    component: np.ndarray,
     contour: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Sample lightly smoothed full-resolution grayscale profiles across the contour."""
-    sample_stride = max(
-        EDGE_PROFILE_MIN_SAMPLE_STRIDE,
-        math.ceil(max(1, len(contour)) / EDGE_PROFILE_MAX_SAMPLE_COUNT),
+    """Return one averaged outward grayscale profile per raster-scale polygon side."""
+    radius = EDGE_PROFILE_RADIUS_PX
+    profile_width = 2 * radius + 1
+    empty = (
+        np.empty((0, profile_width), dtype=np.float64),
+        np.empty(0, dtype=np.float64),
     )
-    points, outward = _contour_normals(component, contour, sample_stride)
-    if len(points) == 0:
-        raise ThresholdResolutionError("no oriented contour samples for photometric edge")
 
-    distances = np.arange(
-        -EDGE_PROFILE_RADIUS_PX,
-        EDGE_PROFILE_RADIUS_PX + 1,
-        dtype=np.float32,
-    )
-    xy = points[:, None, :] + outward[:, None, :] * distances[None, :, None]
-    full_res_height, full_res_width = full_res_gray.shape
-    x = xy[:, :, 0]
-    y = xy[:, :, 1]
-    complete = (
-        (x.min(axis=1) >= 0)
-        & (x.max(axis=1) <= full_res_width - 1)
-        & (y.min(axis=1) >= 0)
-        & (y.max(axis=1) <= full_res_height - 1)
-    )
-    xy = xy[complete]
-    if len(xy) == 0:
-        raise ThresholdResolutionError("all photometric edge profiles leave the image")
+    # Integer contour coordinates represent pixel-cell locations. Simplify only
+    # deviations no larger than the half-pixel cell diagonal, so raster stair-steps
+    # do not create thousands of nearly duplicate local directions.
+    raster_tolerance = math.hypot(0.5, 0.5)
+    polygon = cv2.approxPolyDP(contour, raster_tolerance, True)
+    points = polygon[:, 0, :].astype(np.float64)
+    if len(points) < 3:
+        return empty
 
+    oriented_area = float(cv2.contourArea(polygon, oriented=True))
+    if oriented_area == 0.0:
+        return empty
+    orientation = 1.0 if oriented_area > 0.0 else -1.0
+
+    starts = points
+    vectors = np.roll(points, -1, axis=0) - points
+    lengths = np.hypot(vectors[:, 0], vectors[:, 1])
+    usable = np.isfinite(lengths) & (lengths > np.finfo(np.float64).eps)
+    starts = starts[usable]
+    vectors = vectors[usable]
+    lengths = lengths[usable]
+    if len(lengths) == 0:
+        return empty
+    outwards = orientation * np.column_stack((vectors[:, 1], -vectors[:, 0]))
+    outwards /= lengths[:, None]
+    counts = np.maximum(1, np.ceil(lengths).astype(np.int32))
+
+    offsets = np.arange(-radius, radius + 1, dtype=np.float32)
+    height, width = full_res_gray.shape
     full_res_gray_float = full_res_gray.astype(np.float32, copy=False)
-    map_x = xy[:, :, 0].astype(np.float32)
-    map_y = xy[:, :, 1].astype(np.float32)
-    profiles = cv2.remap(
-        full_res_gray_float,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
+    bases: list[np.ndarray] = []
+    kept_outwards: list[np.ndarray] = []
+    sample_counts: list[int] = []
+    segment_lengths: list[float] = []
+
+    for start, vector, segment_length, outward, sample_count in zip(
+        starts, vectors, lengths, outwards, counts
+    ):
+        fraction = (np.arange(sample_count, dtype=np.float64) + 0.5) / sample_count
+        base = start[None, :] + fraction[:, None] * vector[None, :]
+
+        x_min = base[:, 0].min() - radius * abs(outward[0])
+        x_max = base[:, 0].max() + radius * abs(outward[0])
+        y_min = base[:, 1].min() - radius * abs(outward[1])
+        y_max = base[:, 1].max() + radius * abs(outward[1])
+        if x_min < 0 or x_max > width - 1 or y_min < 0 or y_max > height - 1:
+            continue
+
+        bases.append(base.astype(np.float32))
+        kept_outwards.append(outward.astype(np.float32))
+        sample_counts.append(int(sample_count))
+        segment_lengths.append(float(segment_length))
+
+    if not bases:
+        return empty
+
+    sample_counts_array = np.asarray(sample_counts, dtype=np.int32)
+    base_points = np.vstack(bases)
+    outward_normals = np.repeat(
+        np.asarray(kept_outwards, dtype=np.float32),
+        sample_counts_array,
+        axis=0,
     )
+    segment_ids = np.repeat(
+        np.arange(len(sample_counts), dtype=np.int32),
+        sample_counts_array,
+    )
+    profile_sums = np.zeros((len(sample_counts), profile_width), dtype=np.float64)
 
-    # Light 1-D smoothing prevents interpolation noise or one-pixel fluctuations
-    # from determining the strongest derivative. The accepted 7-pixel, sigma=1.25
-    # filter is intentionally kept local because it may be revisited with the edge
-    # confidence implementation rather than treated as a public tuning parameter.
-    profiles = cv2.GaussianBlur(profiles, (7, 1), sigmaX=1.25, sigmaY=0)
-    return profiles, distances
+    # cv::remap stores map dimensions in signed 16-bit coordinates internally.
+    # Chunk only for that library limit; it does not alter the sampled geometry.
+    max_remap_rows = np.iinfo(np.int16).max - 1
+    for first in range(0, len(base_points), max_remap_rows):
+        last = min(len(base_points), first + max_remap_rows)
+        xy = (
+            base_points[first:last, None, :]
+            + outward_normals[first:last, None, :] * offsets[None, :, None]
+        )
+        sampled = cv2.remap(
+            full_res_gray_float,
+            xy[:, :, 0],
+            xy[:, :, 1],
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        ).astype(np.float64, copy=False)
+        np.add.at(profile_sums, segment_ids[first:last], sampled)
 
-
+    return (
+        profile_sums / sample_counts_array[:, None],
+        np.asarray(segment_lengths, dtype=np.float64),
+    )
 
 
 def measure_edge_alignment(
     full_res_gray: np.ndarray,
-    component: np.ndarray,
     contour: np.ndarray,
-) -> tuple[float, float, float]:
-    """Measure edge alignment plus credibility and transition-monotonicity confidence."""
-    profiles, distances = _sample_edge_profiles(full_res_gray, component, contour)
-    profile_count = len(profiles)
-    drop = (profiles[:, :-2] - profiles[:, 2:]) * 0.5
-    derivative_positions = distances[1:-1]
-    peak_indices = np.argmax(drop, axis=1)
-    rows = np.arange(profile_count)
-    peak_drop = drop[rows, peak_indices]
-    peak_position = distances[peak_indices + 1]
+) -> tuple[float, float]:
+    """Return photometric edge distance and image-local profile reliability."""
+    profiles, segment_lengths = _sample_grayscale_profiles(full_res_gray, contour)
+    if len(profiles) == 0:
+        return math.nan, 0.0
 
-    # Use the median of the six samples at each profile end as robust interior and
-    # exterior plateau estimates. Reject profiles that have neither a minimal total
-    # inside-to-outside drop nor a detectable local falling slope; these deliberately
-    # permissive accepted floors keep flat/noise-only profiles out of edge confidence.
-    inner = np.median(profiles[:, :6], axis=1)
-    outer = np.median(profiles[:, -6:], axis=1)
-    total_drop = inner - outer
-    credible = (total_drop >= 1.0) & (peak_drop >= 0.12)
-    credible_count = int(np.count_nonzero(credible))
-    credible_fraction = credible_count / profile_count if profile_count else 0.0
-    if credible_count == 0:
-        return 0.0, float(credible_fraction), 0.0
-
-    endpoints = np.full(profile_count, np.nan, dtype=np.float32)
-    monotonicity = np.full(profile_count, np.nan, dtype=np.float32)
-
-    for index in np.flatnonzero(credible):
-        peak_derivative_index = int(peak_indices[index])
-        recovery_limit = (
-            EDGE_SLOPE_RECOVERY_FRACTION * float(peak_drop[index])
-        )
-        for derivative_index in range(
-            peak_derivative_index + 1,
-            len(derivative_positions) - EDGE_SLOPE_RECOVERY_PERSISTENCE_PX + 1,
-        ):
-            segment = drop[
-                index,
-                derivative_index : derivative_index + EDGE_SLOPE_RECOVERY_PERSISTENCE_PX,
-            ]
-            if (
-                len(segment) == EDGE_SLOPE_RECOVERY_PERSISTENCE_PX
-                and np.all(segment <= recovery_limit)
-            ):
-                endpoints[index] = derivative_positions[derivative_index]
-                break
-
-        # Estimate the transition interval from local transition and plateau lines.
-        # The accepted 7-sample fits, small slope tolerances, +/-5-pixel intersection
-        # allowance, +/-6-pixel fallback, and -0.03 monotonicity tolerance are retained
-        # because they reproduce the approved Auto-T choices. They are implementation
-        # parameters, not immutable theory, and may change or disappear after review.
-        #
-        # TODO: Revisit and benchmark this edge-confidence calculation after the
-        # threshold-finder branch is updated and regression-stable. The current
-        # transition/plateau fitting and monotonicity logic works as expected but may
-        # be more complex than necessary. Compare against a simpler confidence measure
-        # before making any behavioral change.
-        peak_profile_index = peak_derivative_index + 1
-        transition_low = max(0, peak_profile_index - 3)
-        transition_high = min(len(distances), peak_profile_index + 4)
-        transition_slope, transition_intercept = _linear_fit(
-            distances[transition_low:transition_high],
-            profiles[index, transition_low:transition_high],
-        )
-        outer_slope, outer_intercept = _linear_fit(
-            distances[-7:], profiles[index, -7:]
-        )
-        inner_slope, inner_intercept = _linear_fit(
-            distances[:7], profiles[index, :7]
-        )
-
-        tangent_outer = math.nan
-        tangent_inner = math.nan
-        if (
-            math.isfinite(transition_slope)
-            and transition_slope < -1e-3
-            and math.isfinite(outer_slope)
-            and abs(transition_slope - outer_slope) > 1e-4
-        ):
-            value = (outer_intercept - transition_intercept) / (
-                transition_slope - outer_slope
-            )
-            if distances[0] - 5 <= value <= distances[-1] + 5:
-                tangent_outer = value
-        if (
-            math.isfinite(transition_slope)
-            and transition_slope < -1e-3
-            and math.isfinite(inner_slope)
-            and abs(transition_slope - inner_slope) > 1e-4
-        ):
-            value = (inner_intercept - transition_intercept) / (
-                transition_slope - inner_slope
-            )
-            if distances[0] - 5 <= value <= distances[-1] + 5:
-                tangent_inner = value
-
-        x0 = tangent_inner if math.isfinite(tangent_inner) else peak_position[index] - 6
-        x1 = tangent_outer if math.isfinite(tangent_outer) else peak_position[index] + 6
-        if x1 > x0:
-            transition = (derivative_positions >= x0) & (derivative_positions <= x1)
-            if np.any(transition):
-                monotonicity[index] = float(
-                    np.mean(drop[index, transition] >= -0.03)
-                )
-
-    # Credibility asks whether profiles contain a meaningful falling transition.
-    # Alignment itself uses only credible profiles where the 25%/4-pixel recovery
-    # endpoint was actually found. Keep these concepts separate for now; their
-    # relationship belongs in the later confidence-simplification benchmark above.
-    valid_endpoints = endpoints[np.isfinite(endpoints) & credible]
-    valid_monotonicity = monotonicity[np.isfinite(monotonicity) & credible]
-    median_abs_offset = (
-        float(np.median(np.abs(valid_endpoints)))
-        if len(valid_endpoints)
-        else float(EDGE_PROFILE_RADIUS_PX)
+    positions = np.arange(
+        -EDGE_PROFILE_RADIUS_PX,
+        EDGE_PROFILE_RADIUS_PX + 1,
+        dtype=np.float64,
     )
-    transition_monotonicity = (
-        float(np.median(valid_monotonicity))
-        if len(valid_monotonicity)
+    falling_derivative = -np.gradient(profiles, positions, axis=1)
+    edge_positions = np.full(len(profiles), np.nan, dtype=np.float64)
+    model_centers = np.full(len(profiles), np.nan, dtype=np.float64)
+    model_sigmas = np.full(len(profiles), np.nan, dtype=np.float64)
+    profile_reliability = np.zeros(len(profiles), dtype=np.float64)
+    machine_epsilon = np.finfo(np.float64).eps
+
+    for index, profile in enumerate(profiles):
+        derivative = falling_derivative[index]
+        peak_index = int(np.argmax(derivative))
+        peak_value = float(derivative[peak_index])
+        if not math.isfinite(peak_value) or peak_value <= 0.0:
+            continue
+
+        transition_start = peak_index
+        transition_stop = peak_index
+        while transition_start > 0 and derivative[transition_start - 1] > 0.0:
+            transition_start -= 1
+        while (
+            transition_stop + 1 < len(derivative)
+            and derivative[transition_stop + 1] > 0.0
+        ):
+            transition_stop += 1
+
+        # The observed edge is where the approximately linear falling transition
+        # meets the observed exterior trend. Both intervals come directly from the
+        # dominant positive derivative lobe; no fixed fit width or slope fraction is used.
+        if (
+            transition_stop - transition_start + 1 >= 2
+            and transition_stop + 1 < len(positions) - 1
+        ):
+            transition_x = positions[transition_start : transition_stop + 1]
+            transition_y = profile[transition_start : transition_stop + 1]
+            count = len(transition_x)
+            sum_x = float(np.sum(transition_x))
+            sum_y = float(np.sum(transition_y))
+            sum_xx = float(np.dot(transition_x, transition_x))
+            sum_xy = float(np.dot(transition_x, transition_y))
+            denominator = count * sum_xx - sum_x * sum_x
+            denominator_limit = machine_epsilon * max(
+                1.0,
+                abs(count * sum_xx),
+                abs(sum_x * sum_x),
+            )
+            if abs(denominator) > denominator_limit:
+                transition_slope = (count * sum_xy - sum_x * sum_y) / denominator
+                transition_intercept = (sum_y - transition_slope * sum_x) / count
+
+                outer_x = positions[transition_stop + 1 :]
+                outer_y = profile[transition_stop + 1 :]
+                count = len(outer_x)
+                sum_x = float(np.sum(outer_x))
+                sum_y = float(np.sum(outer_y))
+                sum_xx = float(np.dot(outer_x, outer_x))
+                sum_xy = float(np.dot(outer_x, outer_y))
+                denominator = count * sum_xx - sum_x * sum_x
+                denominator_limit = machine_epsilon * max(
+                    1.0,
+                    abs(count * sum_xx),
+                    abs(sum_x * sum_x),
+                )
+                if abs(denominator) > denominator_limit:
+                    outer_slope = (count * sum_xy - sum_x * sum_y) / denominator
+                    outer_intercept = (sum_y - outer_slope * sum_x) / count
+                    slope_difference = transition_slope - outer_slope
+                    slope_limit = machine_epsilon * max(
+                        1.0,
+                        abs(transition_slope),
+                        abs(outer_slope),
+                    )
+                    if transition_slope < 0.0 and abs(slope_difference) > slope_limit:
+                        edge_positions[index] = (
+                            outer_intercept - transition_intercept
+                        ) / slope_difference
+
+        # An ideal blurred step has a Gaussian derivative and therefore an
+        # error-function intensity profile. Derive its center/width from the same
+        # dominant derivative lobe. R^2 is computed for all usable profiles together
+        # below so the identical model does not pay Python overhead once per sample.
+        transition_derivative = np.maximum(
+            derivative[transition_start : transition_stop + 1],
+            0.0,
+        )
+        derivative_mass = float(np.sum(transition_derivative))
+        if not math.isfinite(derivative_mass) or derivative_mass <= machine_epsilon:
+            continue
+        transition_x = positions[transition_start : transition_stop + 1]
+        center = float(np.dot(transition_derivative, transition_x) / derivative_mass)
+        variance = float(
+            np.dot(transition_derivative, (transition_x - center) ** 2)
+            / derivative_mass
+        )
+        sigma = math.sqrt(max(0.0, variance))
+        if not math.isfinite(sigma) or sigma <= machine_epsilon:
+            continue
+        model_centers[index] = center
+        model_sigmas[index] = sigma
+
+    model_valid = np.isfinite(model_centers) & np.isfinite(model_sigmas)
+    if np.any(model_valid):
+        valid_profiles = profiles[model_valid]
+        valid_centers = model_centers[model_valid]
+        valid_sigmas = model_sigmas[model_valid]
+        sqrt_two = math.sqrt(2.0)
+        basis = np.fromiter(
+            (
+                0.5 * (1.0 + math.erf((center - position) / (sigma * sqrt_two)))
+                for center, sigma in zip(valid_centers, valid_sigmas)
+                for position in positions
+            ),
+            dtype=np.float64,
+            count=len(valid_profiles) * len(positions),
+        ).reshape(len(valid_profiles), len(positions))
+
+        profile_means = np.mean(valid_profiles, axis=1)
+        basis_means = np.mean(basis, axis=1)
+        centered_profiles = valid_profiles - profile_means[:, None]
+        centered_basis = basis - basis_means[:, None]
+        basis_energy = np.sum(centered_basis * centered_basis, axis=1)
+        profile_energy = np.sum(centered_profiles * centered_profiles, axis=1)
+        covariance = np.sum(centered_basis * centered_profiles, axis=1)
+        amplitudes = np.divide(
+            covariance,
+            basis_energy,
+            out=np.zeros_like(covariance),
+            where=basis_energy > machine_epsilon,
+        )
+        reliable = (
+            (basis_energy > machine_epsilon)
+            & (profile_energy > machine_epsilon)
+            & np.isfinite(amplitudes)
+            & (amplitudes > 0.0)
+        )
+        if np.any(reliable):
+            backgrounds = profile_means - amplitudes * basis_means
+            fitted = backgrounds[:, None] + amplitudes[:, None] * basis
+            residual_energy = np.sum((valid_profiles - fitted) ** 2, axis=1)
+            r_squared = np.zeros(len(valid_profiles), dtype=np.float64)
+            r_squared[reliable] = np.clip(
+                1.0 - residual_energy[reliable] / profile_energy[reliable],
+                0.0,
+                1.0,
+            )
+            profile_reliability[model_valid] = r_squared
+
+    weights = segment_lengths * profile_reliability
+    valid = np.isfinite(edge_positions) & np.isfinite(weights) & (weights > 0.0)
+    if np.any(valid):
+        values = np.abs(edge_positions[valid])
+        valid_weights = weights[valid]
+        order = np.argsort(values)
+        values = values[order]
+        valid_weights = valid_weights[order]
+        cutoff = 0.5 * float(np.sum(valid_weights))
+        edge_distance = float(
+            values[
+                np.searchsorted(
+                    np.cumsum(valid_weights),
+                    cutoff,
+                    side="left",
+                )
+            ]
+        )
+    else:
+        edge_distance = math.nan
+
+    total_length = float(np.sum(segment_lengths))
+    edge_reliability = (
+        float(np.dot(segment_lengths, profile_reliability) / total_length)
+        if total_length > 0.0
         else 0.0
     )
-    alignment = 1.0 - min(
-        median_abs_offset / EDGE_PROFILE_RADIUS_PX,
-        1.0,
-    )
-    return (
-        float(alignment),
-        float(credible_fraction),
-        float(transition_monotonicity),
-    )
-
-
+    return edge_distance, edge_reliability
 
 
 def refine_threshold(
@@ -1143,25 +1137,24 @@ def refine_threshold(
                 contour = find_external_contour(cleaned_component)
                 filled_area = measure_filled_area(contour)
                 roughness = measure_roughness(contour, filled_area)
-                solidity = measure_solidity(contour, filled_area)
                 component_area = int(np.count_nonzero(cleaned_component))
-                internal_dark_fraction = measure_internal_dark_fraction(
+                hole_quality = measure_hole_quality(
+                    contour,
                     component_area,
                     filled_area,
                 )
-                edge_alignment, credible_fraction, transition_monotonicity = (
-                    measure_edge_alignment(full_res_gray, cleaned_component, contour)
+                edge_distance, edge_reliability = measure_edge_alignment(
+                    full_res_gray,
+                    contour,
                 )
                 measurements.append(
                     ThresholdMeasurement(
                         threshold=threshold,
                         filled_area=filled_area,
                         roughness=roughness,
-                        solidity=solidity,
-                        internal_dark_fraction=internal_dark_fraction,
-                        edge_alignment=edge_alignment,
-                        edge_credible_fraction=credible_fraction,
-                        edge_transition_monotonicity=transition_monotonicity,
+                        hole_quality=hole_quality,
+                        edge_distance=edge_distance,
+                        edge_reliability=edge_reliability,
                     )
                 )
                 compressed_masks[threshold] = compress_array(cleaned_component)
@@ -1203,33 +1196,27 @@ def refine_threshold(
         if not math.isfinite(max_roughness) or max_roughness <= 0.0 or max_area <= 0:
             raise ThresholdResolutionError("invalid within-image score scale")
 
-        reliability_samples = [
-            measurement.edge_credible_fraction
-            * measurement.edge_transition_monotonicity
-            for measurement in measurements
-        ]
-        edge_reliability = float(np.median(reliability_samples))
-        edge_reliability = (
-            float(np.clip(edge_reliability, 0.0, 1.0))
-            if math.isfinite(edge_reliability)
-            else 0.0
+        edge_reliability = float(
+            np.median([measurement.edge_reliability for measurement in measurements])
         )
-        edge_weight = edge_reliability**2
+        if not math.isfinite(edge_reliability):
+            edge_reliability = 0.0
 
         best_threshold: int | None = None
         best_score = -math.inf
         for measurement in measurements:
             q_roughness = 1.0 - measurement.roughness / max_roughness
-            q_holes = 1.0 - measurement.internal_dark_fraction
             q_area = measurement.filled_area / max_area
-            q_solidity = measurement.solidity
-            q_edge = measurement.edge_alignment
+            q_edge = (
+                1.0 / (1.0 + measurement.edge_distance)
+                if math.isfinite(measurement.edge_distance)
+                else 0.0
+            )
             score = (
                 q_roughness
-                + q_holes
+                + measurement.hole_quality
                 + 0.5 * q_area
-                + 0.5 * q_solidity
-                + edge_weight * q_edge
+                + edge_reliability * q_edge
             )
             # Measurements are in ascending T order. Strict '>' therefore keeps the
             # lower T only when two floating-point scores are exactly equal.
