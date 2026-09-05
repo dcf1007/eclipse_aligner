@@ -1,10 +1,10 @@
 """Eclipse alignment GUI with grayscale automatic threshold selection.
 
 This module combines the application's user-interface foundation with the tested
-image-only automatic threshold finder. The GUI owns image navigation, per-image
-processing settings, control interaction, preview lifecycle, and cached automatic
-threshold results. Color-to-grayscale conversion is an input-stage responsibility
-and is performed before the threshold algorithm is called.
+image-only automatic threshold stages. The GUI owns image navigation, per-image
+processing settings, control interaction, explicit processing-stage orchestration,
+and cached automatic-threshold results. Color-to-grayscale conversion is an
+input-stage responsibility and is performed before the threshold algorithm is called.
 
 All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
 absolute image path. ``settings.threshold`` is special: ``None`` means the threshold
@@ -16,21 +16,23 @@ Slider labels update continuously, but a setting is committed only after mouse
 release or the final keyboard key release. Checkboxes and radio buttons commit
 immediately. Every actual setting change passes through
 ``commit_setting_change(setting_name, value)``, which synchronizes the Tk variable,
-persists the per-image setting, invalidates incompatible derived state, and invokes
-``refresh_preview()`` once.
+persists the per-image setting, invalidates incompatible derived state, and clears
+stale threshold-canvas content. Processing is started only by explicit processing
+actions such as Auto T or Refresh Preview.
 
-``find_auto_threshold()`` owns automatic-threshold acquisition. It performs the
-coarse full-resolution separation search, then deterministic fine refinement, stores
-the selected T, the single authoritative full-resolution seed, and the compressed
-full-resolution winning cleaned component in ``AutoThresholdResult``, and returns T.
-It does not build SolarData.
+Automatic threshold selection has two explicit algorithmic stages. Stage A,
+``find_separation_threshold()``, progressively fills the current image's single
+``AutoThresholdResult`` through work-resolution and full-resolution separation.
+The GUI renders the completed Stage-A component, then Stage B,
+``refine_threshold()``, fills the refined threshold and component in that same
+object and returns the final T. Auto T stops after rendering this refined component;
+it does not build SolarData.
 
 SolarData integration of the cached Auto-T component is intentionally deferred.
 ``resolve_threshold()`` therefore remains the existing downstream selected-T path in
 this revision: it independently establishes the selected-T component/seed, applies
 its existing 7x7 Euclidean OPEN/CLOSE, constructs/stores SolarData, and returns that
-mask for final display. This downstream path is not modified as part of freezing the
-automatic-threshold coarse search and refinement.
+mask for final display.
 
 The automatic-threshold algorithm uses authoritative 8-bit grayscale with fixed
 semantics ``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel
@@ -58,6 +60,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import os
+import struct
 import tkinter as tk
 import zlib
 from tkinter import filedialog
@@ -72,7 +75,6 @@ IMAGE_FILE_TYPES = (
 )
 
 SLIDER_KEY_RELEASE_SETTLE_MS = 45
-CANVAS_REDRAW_DELAY_MS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,43 @@ def generate_kernel(
     return ellipse.astype(np.uint8)
 
 
+def morphological_cleanup(
+    source: np.ndarray,
+    kernel: np.ndarray,
+    threshold: int | None = None,
+) -> np.ndarray:
+    """Apply one OPEN->CLOSE cleanup to grayscale-at-T or an existing binary mask."""
+    source = np.asarray(source)
+    kernel = np.asarray(kernel, dtype=np.uint8)
+    if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
+        raise ValueError("kernel must be a non-empty two-dimensional mask")
+
+    if threshold is not None:
+        if source.ndim != 2 or source.dtype != np.uint8:
+            raise ValueError(
+                "thresholded morphology requires authoritative 2D uint8 grayscale"
+            )
+        if not isinstance(threshold, (int, np.integer)) or not 0 <= int(threshold) <= 255:
+            raise ValueError("threshold must be an integer from 0 to 255")
+        cleaned = cv2.compare(source, int(threshold), cv2.CMP_GT)
+    else:
+        if source.ndim != 2 or source.dtype not in (bool, np.uint8):
+            raise ValueError("binary morphology requires a 2D bool or uint8 mask")
+        cleaned = np.where(source != 0, 255, 0).astype(np.uint8)
+
+    cleaned = cv2.morphologyEx(
+        cleaned,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1,
+    )
+    return cv2.morphologyEx(
+        cleaned,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=1,
+    )
+
 
 def resize_img(
     img: np.ndarray,
@@ -148,65 +187,85 @@ def resize_img(
     return resized.astype(original_dtype, copy=False)
 
 
-def normalize_master_bgra16(image: np.ndarray) -> np.ndarray:
-    """Normalize an unchanged OpenCV load to lossless contiguous uint16 BGRA."""
-    source = np.asarray(image)
-    if source.dtype not in (np.uint8, np.uint16):
-        raise ValueError(f"master image dtype must be uint8 or uint16, got {source.dtype}")
+def compress_array(array: np.ndarray) -> bytes:
+    """Compress one supported 1-, 8-, or 16-bit internal image array."""
+    array = np.asarray(array)
+    if array.ndim not in (2, 3):
+        raise ValueError("array must be two- or three-dimensional")
 
-    if source.ndim == 2:
-        bgra = cv2.cvtColor(source, cv2.COLOR_GRAY2BGRA)
-    elif source.ndim == 3 and source.shape[2] == 3:
-        bgra = cv2.cvtColor(source, cv2.COLOR_BGR2BGRA)
-    elif source.ndim == 3 and source.shape[2] == 4:
-        bgra = source
+    height, width = array.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("array dimensions must be positive")
+
+    channels = 1 if array.ndim == 2 else array.shape[2]
+    if channels not in (1, 3, 4):
+        raise ValueError("array channel count must be 1, 3, or 4")
+
+    if array.dtype == bool:
+        if array.ndim != 2:
+            raise ValueError("1-bit arrays must be two-dimensional")
+        bit_depth = 1
+        encoded_pixels = np.packbits(array.reshape(-1)).tobytes()
+    elif array.dtype == np.uint8:
+        bit_depth = 8
+        encoded_pixels = np.ascontiguousarray(array).tobytes()
+    elif array.dtype == np.uint16:
+        bit_depth = 16
+        # Persist uint16 samples in an explicit byte order rather than native endian.
+        encoded_pixels = np.ascontiguousarray(
+            array.astype(np.dtype("<u2"), copy=False)
+        ).tobytes()
     else:
-        raise ValueError(f"unsupported master image shape: {source.shape}")
+        raise ValueError("array dtype must be bool, uint8, or uint16")
 
-    # Expanding uint8 by exactly 257 preserves every source code value in uint16.
-    if bgra.dtype == np.uint8:
-        bgra = bgra.astype(np.uint16) * 257
-    return np.ascontiguousarray(bgra, dtype=np.uint16)
+    header = struct.pack("<IIB", height, width, bit_depth)
+    return zlib.compress(header + encoded_pixels, level=1)
 
 
-def master_bgra16_to_gray8(master_bgra16: np.ndarray) -> np.ndarray:
-    """Derive authoritative uint8 gray directly from the lossless uint16 BGRA master."""
-    master = np.asarray(master_bgra16)
-    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
-        raise ValueError("master image must be uint16 BGRA")
-
-    gray16 = cv2.cvtColor(master, cv2.COLOR_BGRA2GRAY)
-    # Fixed full-range mapping keeps T=0..255 comparable across all images.
-    return ((gray16.astype(np.uint32) + 128) // 257).astype(np.uint8)
-
-
-def master_bgra16_to_display_bgra8(master_bgra16: np.ndarray) -> np.ndarray:
-    """Derive a fixed-range uint8 BGRA display raster without modifying the master."""
-    master = np.asarray(master_bgra16)
-    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
-        raise ValueError("master image must be uint16 BGRA")
-    return ((master.astype(np.uint32) + 128) // 257).astype(np.uint8)
-
-
-def compress_master_bgra16(master_bgra16: np.ndarray) -> bytes:
-    """Compress one contiguous uint16 BGRA master with fast lossless zlib level 1."""
-    master = np.asarray(master_bgra16)
-    if master.dtype != np.uint16 or master.ndim != 3 or master.shape[2] != 4:
-        raise ValueError("master image must be uint16 BGRA")
-    return zlib.compress(np.ascontiguousarray(master).tobytes(), level=1)
-
-
-def decompress_master_bgra16(payload: bytes, shape: tuple[int, int, int]) -> np.ndarray:
-    """Restore a compressed uint16 BGRA master as a read-only ndarray view."""
-    if len(shape) != 3 or shape[2] != 4 or shape[0] <= 0 or shape[1] <= 0:
-        raise ValueError("master shape must be positive (height, width, 4)")
+def decompress_array(payload: bytes) -> np.ndarray:
+    """Restore one self-describing array produced by ``compress_array``."""
     raw = zlib.decompress(payload)
-    expected_bytes = shape[0] * shape[1] * shape[2] * np.dtype(np.uint16).itemsize
-    if len(raw) != expected_bytes:
+    header_size = struct.calcsize("<IIB")
+    if len(raw) < header_size:
+        raise ValueError("compressed array payload is truncated")
+
+    height, width, bit_depth = struct.unpack("<IIB", raw[:header_size])
+    if height <= 0 or width <= 0:
+        raise ValueError("compressed array dimensions must be positive")
+
+    encoded_pixels = raw[header_size:]
+    pixel_count = height * width
+
+    if bit_depth == 1:
+        expected_bytes = (pixel_count + 7) // 8
+        if len(encoded_pixels) != expected_bytes:
+            raise ValueError(
+                f"compressed 1-bit array has {len(encoded_pixels)} bytes; "
+                f"expected {expected_bytes}"
+            )
+        packed = np.frombuffer(encoded_pixels, dtype=np.uint8)
+        return np.unpackbits(packed, count=pixel_count).reshape((height, width)) != 0
+
+    if bit_depth == 8:
+        bytes_per_channel = pixel_count
+        dtype = np.uint8
+    elif bit_depth == 16:
+        bytes_per_channel = pixel_count * 2
+        dtype = np.dtype("<u2")
+    else:
+        raise ValueError(f"unsupported compressed array bit depth: {bit_depth}")
+
+    if len(encoded_pixels) % bytes_per_channel != 0:
+        raise ValueError("compressed array pixel payload has invalid length")
+    channels = len(encoded_pixels) // bytes_per_channel
+    if channels not in (1, 3, 4):
         raise ValueError(
-            f"compressed master has {len(raw)} bytes; expected {expected_bytes}"
+            f"compressed array has unsupported inferred channel count: {channels}"
         )
-    return np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+
+    shape = (height, width) if channels == 1 else (height, width, channels)
+    return np.frombuffer(encoded_pixels, dtype=dtype).reshape(shape)
+
 
 def nearest_positive_odd(value: float) -> int:
     """Return the nearest positive odd integer; exact ties choose the lower odd."""
@@ -248,35 +307,26 @@ class ThresholdResolutionError(RuntimeError):
     """Expected inability to establish/track a separated solar component."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class AutoThresholdResult:
-    threshold: int | None
-    histogram_start_threshold: int
-    work_res_threshold: int | None
-    full_res_seed_point: tuple[int, int] | None
-    cleaned_component_mask: bytes | None
-    # ``resolved`` is currently redundant with whether Auto-T produced a complete
-    # final result. Keep it explicit for readability for now; it may disappear later.
-    resolved: bool = False
-    reason: str = ""
+    """Progressively accumulated authoritative results for one Auto-T run."""
 
-    def __post_init__(self) -> None:
-        """Reject contradictory resolved/unresolved result states."""
-        if self.resolved:
-            if self.threshold is None:
-                raise ValueError("resolved Auto-T result requires a threshold")
-            if self.work_res_threshold is None:
-                raise ValueError("resolved Auto-T result requires a work-resolution threshold")
-            if self.full_res_seed_point is None:
-                raise ValueError("resolved Auto-T result requires a full-resolution seed point")
-            if self.cleaned_component_mask is None:
-                raise ValueError("resolved Auto-T result requires a cleaned component mask")
-        else:
-            if self.threshold is not None:
-                raise ValueError("unresolved Auto-T result cannot contain a final threshold")
-            if self.cleaned_component_mask is not None:
-                raise ValueError("unresolved Auto-T result cannot contain a cleaned component mask")
+    histogram_start_threshold: int | None = None
 
+    work_res_seed_point: tuple[int, int] | None = None
+    work_res_separation_threshold: int | None = None
+    work_res_separation_component_mask: bytes | None = None
+
+    full_res_seed_point: tuple[int, int] | None = None
+
+    full_res_separation_threshold: int | None = None
+    full_res_separation_component_mask: bytes | None = None
+    full_res_separation_guard_mask: bytes | None = None
+
+    full_res_refined_threshold: int | None = None
+    full_res_refined_component_mask: bytes | None = None
+
+    failure_reason: str | None = None
 
 
 
@@ -440,12 +490,12 @@ def extract_component(
 
 
 
-def find_work_res_solar_component(
+def find_work_res_separation_threshold(
     work_res_gray: np.ndarray,
     start_T: int,
     work_res_seed_kernel: np.ndarray,
-) -> tuple[int, np.ndarray]:
-    """Establish one supported work-resolution seed, then track that identity downward."""
+) -> tuple[tuple[int, int], int, np.ndarray]:
+    """Return the work seed, lowest separated T, and tracked component."""
     work_res_seed_point: tuple[int, int] | None = None
     work_res_T: int | None = None
     work_res_component: np.ndarray | None = None
@@ -484,7 +534,7 @@ def find_work_res_solar_component(
             f"No {kernel_width}x{kernel_height}-supported enclosed bright component "
             "exists through T=0"
         )
-    return work_res_T, work_res_component
+    return work_res_seed_point, work_res_T, work_res_component
 
 
 
@@ -506,29 +556,6 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     return distance <= margin
 
 
-def clean_solar_component(
-    binary_mask: np.ndarray,
-    seed_point: tuple[int, int],
-    guard_mask: np.ndarray,
-) -> np.ndarray | None:
-    """Progressively clean, guard, then extract the component containing ``seed_point``."""
-    if binary_mask.ndim != 2:
-        raise ValueError("binary mask must be two-dimensional")
-    if guard_mask.ndim != 2 or guard_mask.shape != binary_mask.shape or not np.any(guard_mask):
-        raise ValueError("guard must be a non-empty mask matching binary mask")
-    if not np.any(binary_mask):
-        return None
-
-    cleaned = np.where(binary_mask != 0, 255, 0).astype(np.uint8)
-    for kernel in SOLAR_CLEANUP_KERNELS:
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    cleaned[~guard_mask] = 0
-    return extract_component(cleaned, seed_point)
-
-
-
 def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
     """Return the one-pixel inner boundary of a non-empty boolean guard mask."""
     if guard_mask.ndim != 2 or not np.any(guard_mask):
@@ -546,7 +573,7 @@ def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
 
 
 
-def find_separation_threshold(
+def find_full_res_separation_threshold(
     full_res_gray: np.ndarray,
     start_T: int,
     full_res_seed_point: tuple[int, int],
@@ -572,19 +599,7 @@ def find_separation_threshold(
     full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
 
     # Evaluate the starting T after the fixed D7 cleanup used by coarse separation.
-    binary = cv2.compare(full_res_gray, start_T, cv2.CMP_GT)
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        SEPARATION_KERNEL,
-        iterations=1,
-    )
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_CLOSE,
-        SEPARATION_KERNEL,
-        iterations=1,
-    )
+    binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, start_T)
     if binary[seed_y, seed_x] == 0:
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
@@ -600,18 +615,10 @@ def find_separation_threshold(
         best_T = start_T
         best_component = component
         for threshold in range(start_T - 1, -1, -1):
-            binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-            binary = cv2.morphologyEx(
-                binary,
-                cv2.MORPH_OPEN,
+            binary = morphological_cleanup(
+                full_res_gray,
                 SEPARATION_KERNEL,
-                iterations=1,
-            )
-            binary = cv2.morphologyEx(
-                binary,
-                cv2.MORPH_CLOSE,
-                SEPARATION_KERNEL,
-                iterations=1,
+                threshold,
             )
             binary[~full_res_guard_mask] = 0
             component = extract_component(binary, full_res_seed_point)
@@ -622,19 +629,7 @@ def find_separation_threshold(
         return best_T, best_component
 
     for threshold in range(start_T + 1, 256):
-        binary = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            SEPARATION_KERNEL,
-            iterations=1,
-        )
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_CLOSE,
-            SEPARATION_KERNEL,
-            iterations=1,
-        )
+        binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, threshold)
         if binary[seed_y, seed_x] == 0:
             break
         binary[~full_res_guard_mask] = 0
@@ -646,6 +641,108 @@ def find_separation_threshold(
         "Tracked full-resolution solar component never became separated after D7 cleanup"
     )
 
+
+
+def find_separation_threshold(
+    full_res_gray: np.ndarray,
+    auto_threshold_result: AutoThresholdResult,
+) -> None:
+    """Run Auto-T Stage A and fill separation results in the supplied state object."""
+    if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
+        raise ValueError("automatic thresholding requires authoritative 2D uint8 grayscale")
+    if not isinstance(auto_threshold_result, AutoThresholdResult):
+        raise ValueError("Stage A requires an AutoThresholdResult")
+
+    full_res_height, full_res_width = full_res_gray.shape
+    full_res_max_dim = max(full_res_height, full_res_width)
+    if full_res_max_dim > WORK_RES_MAX_DIM:
+        work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
+        work_res_size = (
+            round(full_res_width * work_res_scale),
+            round(full_res_height * work_res_scale),
+        )
+    else:
+        work_res_size = (full_res_width, full_res_height)
+
+    work_res_gray = resize_img(full_res_gray, work_res_size)
+    auto_threshold_result.histogram_start_threshold = (
+        find_histogram_start_threshold(work_res_gray)
+    )
+    work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
+
+    resolution_step = "work-resolution separation"
+    try:
+        (
+            auto_threshold_result.work_res_seed_point,
+            auto_threshold_result.work_res_separation_threshold,
+            work_res_component,
+        ) = find_work_res_separation_threshold(
+            work_res_gray,
+            auto_threshold_result.histogram_start_threshold,
+            work_res_seed_kernel,
+        )
+        auto_threshold_result.work_res_separation_component_mask = compress_array(
+            work_res_component
+        )
+
+        # Transfer only the mature work component geometry onto the exact source raster.
+        full_res_search_mask = resize_img(
+            work_res_component,
+            (full_res_width, full_res_height),
+            mask=True,
+        )
+
+        # Scale the fixed 5x5 square work support to the realized full-resolution scale.
+        work_res_support_size = max(work_res_seed_kernel.shape)
+        mapped_kernel_size = (
+            work_res_support_size
+            * max(full_res_gray.shape)
+            / max(work_res_gray.shape)
+        )
+        full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
+        full_res_seed_kernel = generate_kernel(
+            (full_res_kernel_size, full_res_kernel_size),
+            round_kernel=False,
+        )
+
+        resolution_step = "full-resolution seed selection"
+        auto_threshold_result.full_res_seed_point = brightest_supported_component_point(
+            full_res_gray,
+            full_res_search_mask,
+            full_res_seed_kernel,
+        )
+        if auto_threshold_result.full_res_seed_point is None:
+            raise ThresholdResolutionError(
+                f"Transferred solar component has no {full_res_kernel_size}x"
+                f"{full_res_kernel_size}-supported full-resolution seed"
+            )
+
+        resolution_step = "full-resolution guard construction"
+        image_scale = math.sqrt(full_res_width * full_res_height)
+        full_res_guard_mask = dilate_component_mask(
+            full_res_search_mask,
+            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
+        )
+        auto_threshold_result.full_res_separation_guard_mask = compress_array(
+            full_res_guard_mask
+        )
+
+        resolution_step = "full-resolution separation"
+        (
+            auto_threshold_result.full_res_separation_threshold,
+            full_res_separation_component,
+        ) = find_full_res_separation_threshold(
+            full_res_gray,
+            auto_threshold_result.work_res_separation_threshold,
+            auto_threshold_result.full_res_seed_point,
+            full_res_guard_mask,
+        )
+        auto_threshold_result.full_res_separation_component_mask = compress_array(
+            full_res_separation_component
+        )
+    except ThresholdResolutionError as exc:
+        auto_threshold_result.failure_reason = f"{resolution_step}: {exc}"
+        raise
 
 
 def find_external_contour(component: np.ndarray) -> np.ndarray:
@@ -664,17 +761,13 @@ def find_external_contour(component: np.ndarray) -> np.ndarray:
 
 
 
-def _lattice_boundary_points(contour: np.ndarray) -> int:
+def measure_filled_area(contour: np.ndarray) -> int:
+    """Return raster-equivalent area enclosed by the external lattice contour."""
     points = contour[:, 0, :].astype(np.int64)
     following = np.roll(points, -1, axis=0)
     distance = np.abs(following - points)
-    return int(np.gcd(distance[:, 0], distance[:, 1]).sum())
-
-
-def measure_filled_area(contour: np.ndarray) -> int:
-    """Return raster-equivalent area enclosed by the external lattice contour."""
+    boundary_points = int(np.gcd(distance[:, 0], distance[:, 1]).sum())
     polygon_area = float(cv2.contourArea(contour))
-    boundary_points = _lattice_boundary_points(contour)
     filled_area = int(round(polygon_area + 0.5 * boundary_points + 1.0))
     if filled_area <= 0:
         raise ThresholdResolutionError("filled external contour area is empty")
@@ -829,19 +922,13 @@ def _sample_edge_profiles(
     full_res_gray_float = full_res_gray.astype(np.float32, copy=False)
     map_x = xy[:, :, 0].astype(np.float32)
     map_y = xy[:, :, 1].astype(np.float32)
-    profile_chunks = []
-    for start in range(0, len(map_x), 15000):
-        stop = min(len(map_x), start + 15000)
-        profile_chunks.append(
-            cv2.remap(
-                full_res_gray_float,
-                map_x[start:stop],
-                map_y[start:stop],
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
-        )
-    profiles = np.vstack(profile_chunks)
+    profiles = cv2.remap(
+        full_res_gray_float,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
 
     # Light 1-D smoothing prevents interpolation noise or one-pixel fluctuations
     # from determining the strongest derivative. The accepted 7-pixel, sigma=1.25
@@ -994,19 +1081,34 @@ def measure_edge_alignment(
 
 def refine_threshold(
     full_res_gray: np.ndarray,
-    base_threshold: int,
-    full_res_seed_point: tuple[int, int],
-    full_res_guard_mask: np.ndarray,
-) -> tuple[int, bytes]:
-    """Fine-tune one separated threshold and return T plus its compressed cleaned mask."""
+    auto_threshold_result: AutoThresholdResult,
+) -> int:
+    """Run Auto-T Stage B, fill the supplied result, and return its winning T."""
     if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
         raise ValueError("threshold refinement requires authoritative uint8 grayscale")
+    if not isinstance(auto_threshold_result, AutoThresholdResult):
+        raise ValueError("Stage B requires an AutoThresholdResult")
+    if auto_threshold_result.failure_reason is not None:
+        raise ValueError("cannot refine an Auto-T result that already failed")
     if (
-        full_res_guard_mask.ndim != 2
+        auto_threshold_result.full_res_separation_threshold is None
+        or auto_threshold_result.full_res_seed_point is None
+        or auto_threshold_result.full_res_separation_guard_mask is None
+    ):
+        raise ValueError("threshold refinement requires a completed Stage-A separation")
+
+    base_threshold = auto_threshold_result.full_res_separation_threshold
+    full_res_seed_point = auto_threshold_result.full_res_seed_point
+    full_res_guard_mask = decompress_array(
+        auto_threshold_result.full_res_separation_guard_mask
+    )
+    if (
+        full_res_guard_mask.dtype != bool
+        or full_res_guard_mask.ndim != 2
         or full_res_guard_mask.shape != full_res_gray.shape
         or not np.any(full_res_guard_mask)
     ):
-        raise ValueError("guard must be a non-empty mask matching grayscale")
+        raise ValueError("stored Stage-A guard must be a non-empty mask matching grayscale")
     if not 0 <= base_threshold <= 255:
         raise ValueError("base threshold must be 0..255")
 
@@ -1017,265 +1119,135 @@ def refine_threshold(
     if not full_res_guard_mask[seed_y, seed_x]:
         raise ValueError("full-resolution seed must lie inside the fixed guard")
 
-    full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
-    measurements: list[ThresholdMeasurement] = []
-    compressed_masks: dict[int, bytes] = {}
-    raw_reference_area: int | None = None
-    raw_reference_roughness: float | None = None
-
-    max_threshold = min(255, base_threshold + MAX_T_REFINEMENT_STEPS)
-    for threshold in range(base_threshold, max_threshold + 1):
-        threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-
-        cleaned_component = clean_solar_component(
-            threshold_mask,
-            full_res_seed_point,
-            full_res_guard_mask,
-        )
-        if (
-            cleaned_component is not None
-            and not np.any(cleaned_component & full_res_guard_boundary)
-        ):
-            contour = find_external_contour(cleaned_component)
-            filled_area = measure_filled_area(contour)
-            roughness = measure_roughness(contour, filled_area)
-            solidity = measure_solidity(contour, filled_area)
-            component_area = int(np.count_nonzero(cleaned_component))
-            internal_dark_fraction = measure_internal_dark_fraction(
-                component_area,
-                filled_area,
-            )
-            edge_alignment, credible_fraction, transition_monotonicity = (
-                measure_edge_alignment(full_res_gray, cleaned_component, contour)
-            )
-            measurements.append(
-                ThresholdMeasurement(
-                    threshold=threshold,
-                    filled_area=filled_area,
-                    roughness=roughness,
-                    solidity=solidity,
-                    internal_dark_fraction=internal_dark_fraction,
-                    edge_alignment=edge_alignment,
-                    edge_credible_fraction=credible_fraction,
-                    edge_transition_monotonicity=transition_monotonicity,
-                )
-            )
-            compressed_masks[threshold] = compress_full_mask(cleaned_component)
-
-        # Raw geometry only anchors the largest/roughest end of the score scale.
-        # Measure the first separated raw component once, then stop evaluating raw.
-        if raw_reference_area is None:
-            raw_mask = threshold_mask.copy()
-            raw_mask[~full_res_guard_mask] = 0
-            raw_component = extract_component(raw_mask, full_res_seed_point)
-            if (
-                raw_component is not None
-                and not np.any(raw_component & full_res_guard_boundary)
-            ):
-                raw_contour = find_external_contour(raw_component)
-                raw_reference_area = measure_filled_area(raw_contour)
-                raw_reference_roughness = measure_roughness(
-                    raw_contour,
-                    raw_reference_area,
-                )
-
-    if not measurements:
-        raise ThresholdResolutionError(
-            "no separated cleaned solar component exists in the refinement window"
-        )
-    if raw_reference_area is None or raw_reference_roughness is None:
-        raise ThresholdResolutionError(
-            "no separated raw reference exists in the refinement window"
-        )
-
-    max_roughness = max(
-        raw_reference_roughness,
-        *(measurement.roughness for measurement in measurements),
-    )
-    max_area = max(
-        raw_reference_area,
-        *(measurement.filled_area for measurement in measurements),
-    )
-    if not math.isfinite(max_roughness) or max_roughness <= 0.0 or max_area <= 0:
-        raise ThresholdResolutionError("invalid within-image score scale")
-
-    reliability_samples = [
-        measurement.edge_credible_fraction
-        * measurement.edge_transition_monotonicity
-        for measurement in measurements
-    ]
-    edge_reliability = float(np.median(reliability_samples))
-    edge_reliability = (
-        float(np.clip(edge_reliability, 0.0, 1.0))
-        if math.isfinite(edge_reliability)
-        else 0.0
-    )
-    edge_weight = edge_reliability**2
-
-    best_threshold: int | None = None
-    best_score = -math.inf
-    for measurement in measurements:
-        q_roughness = 1.0 - measurement.roughness / max_roughness
-        q_holes = 1.0 - measurement.internal_dark_fraction
-        q_area = measurement.filled_area / max_area
-        q_solidity = measurement.solidity
-        q_edge = measurement.edge_alignment
-        score = (
-            q_roughness
-            + q_holes
-            + 0.5 * q_area
-            + 0.5 * q_solidity
-            + edge_weight * q_edge
-        )
-        # Measurements are in ascending T order. Strict '>' therefore keeps the
-        # lower T only when two floating-point scores are exactly equal.
-        if score > best_score:
-            best_score = score
-            best_threshold = measurement.threshold
-
-    if best_threshold is None:
-        raise ThresholdResolutionError("threshold refinement produced no score winner")
-    return best_threshold, compressed_masks[best_threshold]
-
-
-def find_auto_threshold(
-    full_res_gray: np.ndarray,
-    image_state: dict[str, object],
-    separation_result_callback=None,
-) -> int:
-    """Determine automatic T, optionally exposing the completed Stage-A result."""
-    if full_res_gray.ndim != 2:
-        raise ValueError("grayscale image must be two-dimensional")
-    if full_res_gray.dtype != np.uint8:
-        raise ValueError("automatic thresholding requires authoritative uint8 grayscale")
-
-    # Auto-T limits the longest work-resolution dimension to 1200 pixels while
-    # passing the complete target size explicitly to resize_img().
-    full_res_height, full_res_width = full_res_gray.shape
-    full_res_max_dim = max(full_res_height, full_res_width)
-    if full_res_max_dim > WORK_RES_MAX_DIM:
-        work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
-        work_res_size = (
-            round(full_res_width * work_res_scale),
-            round(full_res_height * work_res_scale),
-        )
-    else:
-        work_res_size = (full_res_width, full_res_height)
-
-    # Build the work-resolution grayscale raster used only for component identity tracking.
-    work_res_gray = resize_img(full_res_gray, work_res_size)
-
-    # Start the downward work-resolution search at the histogram valley before the bright mode.
-    histogram_start_T = find_histogram_start_threshold(work_res_gray)
-
-    # Generate the fixed square work-resolution seed-support kernel here so its
-    # footprint remains explicit and can be scaled equivalently at full resolution.
-    work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
-
-    work_res_T: int | None = None
-    full_res_seed_point: tuple[int, int] | None = None
-    resolution_step = "work-resolution component search"
-
     try:
-        # Establish one supported seed, then track only that connected identity downward.
-        work_res_T, work_res_component = find_work_res_solar_component(
-            work_res_gray,
-            histogram_start_T,
-            work_res_seed_kernel,
-        )
+        full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
+        measurements: list[ThresholdMeasurement] = []
+        compressed_masks: dict[int, bytes] = {}
+        raw_reference_area: int | None = None
+        raw_reference_roughness: float | None = None
 
-        # Transfer only the mature work component geometry onto the exact source raster.
-        full_res_search_mask = resize_img(
-            work_res_component,
-            (full_res_width, full_res_height),
-            mask=True,
-        )
+        max_threshold = min(255, base_threshold + MAX_T_REFINEMENT_STEPS)
+        for threshold in range(base_threshold, max_threshold + 1):
+            threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
 
-        # Preserve the actual work seed-support footprint at the realized source scale.
-        work_res_support_size = max(work_res_seed_kernel.shape)
-        mapped_kernel_size = (
-            work_res_support_size
-            * max(full_res_gray.shape)
-            / max(work_res_gray.shape)
-        )
-        full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
-        # Generate the equivalent full-resolution square support kernel once before
-        # selecting the fixed authoritative full-resolution seed point.
-        full_res_seed_kernel = generate_kernel(
-            (full_res_kernel_size, full_res_kernel_size),
-            round_kernel=False,
-        )
+            cleaned = threshold_mask
+            for kernel in SOLAR_CLEANUP_KERNELS:
+                cleaned = morphological_cleanup(cleaned, kernel)
+            cleaned[~full_res_guard_mask] = 0
+            cleaned_component = extract_component(cleaned, full_res_seed_point)
 
-        # Select the brightest deeply supported full-resolution seed anywhere in the
-        # transferred mature component. This point remains authoritative through refinement.
-        resolution_step = "full-resolution seed selection"
-        full_res_seed_point = brightest_supported_component_point(
-            full_res_gray,
-            full_res_search_mask,
-            full_res_seed_kernel,
-        )
-        if full_res_seed_point is None:
+            if (
+                cleaned_component is not None
+                and not np.any(cleaned_component & full_res_guard_boundary)
+            ):
+                contour = find_external_contour(cleaned_component)
+                filled_area = measure_filled_area(contour)
+                roughness = measure_roughness(contour, filled_area)
+                solidity = measure_solidity(contour, filled_area)
+                component_area = int(np.count_nonzero(cleaned_component))
+                internal_dark_fraction = measure_internal_dark_fraction(
+                    component_area,
+                    filled_area,
+                )
+                edge_alignment, credible_fraction, transition_monotonicity = (
+                    measure_edge_alignment(full_res_gray, cleaned_component, contour)
+                )
+                measurements.append(
+                    ThresholdMeasurement(
+                        threshold=threshold,
+                        filled_area=filled_area,
+                        roughness=roughness,
+                        solidity=solidity,
+                        internal_dark_fraction=internal_dark_fraction,
+                        edge_alignment=edge_alignment,
+                        edge_credible_fraction=credible_fraction,
+                        edge_transition_monotonicity=transition_monotonicity,
+                    )
+                )
+                compressed_masks[threshold] = compress_array(cleaned_component)
+
+            # Raw geometry only anchors the largest/roughest end of the score scale.
+            # Measure the first separated raw component once, then stop evaluating raw.
+            if raw_reference_area is None:
+                raw_mask = threshold_mask.copy()
+                raw_mask[~full_res_guard_mask] = 0
+                raw_component = extract_component(raw_mask, full_res_seed_point)
+                if (
+                    raw_component is not None
+                    and not np.any(raw_component & full_res_guard_boundary)
+                ):
+                    raw_contour = find_external_contour(raw_component)
+                    raw_reference_area = measure_filled_area(raw_contour)
+                    raw_reference_roughness = measure_roughness(
+                        raw_contour,
+                        raw_reference_area,
+                    )
+
+        if not measurements:
             raise ThresholdResolutionError(
-                f"Transferred solar component has no {full_res_kernel_size}x"
-                f"{full_res_kernel_size}-supported full-resolution seed"
+                "no separated cleaned solar component exists in the refinement window"
+            )
+        if raw_reference_area is None or raw_reference_roughness is None:
+            raise ThresholdResolutionError(
+                "no separated raw reference exists in the refinement window"
             )
 
-        # Expand the transferred component by the fixed 10% L2 margin to create the
-        # immutable full-resolution guard shared by coarse separation and refinement.
-        resolution_step = "full-resolution guard construction"
-        image_scale = math.sqrt(full_res_width * full_res_height)
-        full_res_guard_mask = dilate_component_mask(
-            full_res_search_mask,
-            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
+        max_roughness = max(
+            raw_reference_roughness,
+            *(measurement.roughness for measurement in measurements),
         )
-
-        # Find the exact coarse separation boundary using fixed D7 cleanup, the
-        # authoritative seed point, and the immutable full-resolution guard.
-        resolution_step = "coarse separation"
-        separation_T, separation_component = find_separation_threshold(
-            full_res_gray,
-            work_res_T,
-            full_res_seed_point,
-            full_res_guard_mask,
+        max_area = max(
+            raw_reference_area,
+            *(measurement.filled_area for measurement in measurements),
         )
-        if separation_result_callback is not None:
-            separation_result_callback(separation_T, separation_component)
+        if not math.isfinite(max_roughness) or max_roughness <= 0.0 or max_area <= 0:
+            raise ThresholdResolutionError("invalid within-image score scale")
 
-        # Fine refinement may only raise the proven separation T. It reuses the same
-        # authoritative seed and fixed guard and returns its winning full-resolution mask.
-        resolution_step = "fine refinement"
-        final_T, cleaned_component_mask = refine_threshold(
-            full_res_gray,
-            separation_T,
-            full_res_seed_point,
-            full_res_guard_mask,
+        reliability_samples = [
+            measurement.edge_credible_fraction
+            * measurement.edge_transition_monotonicity
+            for measurement in measurements
+        ]
+        edge_reliability = float(np.median(reliability_samples))
+        edge_reliability = (
+            float(np.clip(edge_reliability, 0.0, 1.0))
+            if math.isfinite(edge_reliability)
+            else 0.0
         )
+        edge_weight = edge_reliability**2
 
+        best_threshold: int | None = None
+        best_score = -math.inf
+        for measurement in measurements:
+            q_roughness = 1.0 - measurement.roughness / max_roughness
+            q_holes = 1.0 - measurement.internal_dark_fraction
+            q_area = measurement.filled_area / max_area
+            q_solidity = measurement.solidity
+            q_edge = measurement.edge_alignment
+            score = (
+                q_roughness
+                + q_holes
+                + 0.5 * q_area
+                + 0.5 * q_solidity
+                + edge_weight * q_edge
+            )
+            # Measurements are in ascending T order. Strict '>' therefore keeps the
+            # lower T only when two floating-point scores are exactly equal.
+            if score > best_score:
+                best_score = score
+                best_threshold = measurement.threshold
+
+        if best_threshold is None:
+            raise ThresholdResolutionError("threshold refinement produced no score winner")
+
+        auto_threshold_result.full_res_refined_threshold = best_threshold
+        auto_threshold_result.full_res_refined_component_mask = compressed_masks[
+            best_threshold
+        ]
+        return best_threshold
     except ThresholdResolutionError as exc:
-        # Expected inability to resolve at any Auto-T stage is persisted explicitly.
-        # Keep any intermediate work T / source seed already established for diagnostics,
-        # but a failed Auto-T never exposes a final threshold or cleaned component mask.
-        result = AutoThresholdResult(
-            threshold=None,
-            histogram_start_threshold=histogram_start_T,
-            work_res_threshold=work_res_T,
-            full_res_seed_point=full_res_seed_point,
-            cleaned_component_mask=None,
-            reason=f"{resolution_step}: {exc}",
-        )
-        image_state["auto_threshold_result"] = result
+        auto_threshold_result.failure_reason = f"fine refinement: {exc}"
         raise
-
-    result = AutoThresholdResult(
-        threshold=final_T,
-        histogram_start_threshold=histogram_start_T,
-        work_res_threshold=work_res_T,
-        full_res_seed_point=full_res_seed_point,
-        cleaned_component_mask=cleaned_component_mask,
-        resolved=True,
-    )
-    image_state["auto_threshold_result"] = result
-    return final_T
 
 
 # ---------------------------------------------------------------------------
@@ -1297,20 +1269,7 @@ def refine_solar_component_mask(component: np.ndarray) -> np.ndarray:
     if not np.any(component):
         raise ValueError("component mask is empty")
 
-    component_u8 = np.where(component, 255, 0).astype(np.uint8)
-    opened = cv2.morphologyEx(
-        component_u8,
-        cv2.MORPH_OPEN,
-        SOLAR_COMPONENT_KERNEL,
-        iterations=1,
-    )
-    refined = cv2.morphologyEx(
-        opened,
-        cv2.MORPH_CLOSE,
-        SOLAR_COMPONENT_KERNEL,
-        iterations=1,
-    )
-    return refined != 0
+    return morphological_cleanup(component, SOLAR_COMPONENT_KERNEL) != 0
 
 
 @dataclass(frozen=True)
@@ -1323,33 +1282,6 @@ class SolarData:
     roi_6_5_mask: bytes
     guard_19_5_mask: bytes
     component_contour: np.ndarray
-
-
-def compress_full_mask(mask: np.ndarray) -> bytes:
-    """Pack a full-resolution boolean mask to one bit/pixel, then zlib level 1."""
-    mask_bool = np.asarray(mask, dtype=bool)
-    packed = np.packbits(mask_bool.reshape(-1))
-    return zlib.compress(packed.tobytes(), level=1)
-
-
-def decompress_full_mask(payload: bytes, shape: tuple[int, int]) -> np.ndarray:
-    """Restore a compressed full-resolution mask using the current image shape."""
-    if len(shape) != 2:
-        raise ValueError("mask shape must be (height, width)")
-    height, width = shape
-    if height <= 0 or width <= 0:
-        raise ValueError("mask shape dimensions must be positive")
-
-    pixel_count = height * width
-    raw = zlib.decompress(payload)
-    expected_bytes = (pixel_count + 7) // 8
-    if len(raw) != expected_bytes:
-        raise ValueError(
-            f"compressed mask has {len(raw)} packed bytes; expected {expected_bytes}"
-        )
-    packed = np.frombuffer(raw, dtype=np.uint8)
-    bits = np.unpackbits(packed, count=pixel_count)
-    return bits.reshape((height, width)) != 0
 
 
 def _ordered_external_component_contour(component: np.ndarray) -> np.ndarray:
@@ -1384,7 +1316,11 @@ def resolve_threshold(
     existing = image_state.get("solar_data")
     if isinstance(existing, SolarData) and existing.threshold == threshold:
         # Restore and validate the cached authoritative component before reuse.
-        refined_component = decompress_full_mask(existing.component_mask, full_res_gray.shape)
+        refined_component = decompress_array(existing.component_mask)
+        if refined_component.dtype != bool or refined_component.shape != full_res_gray.shape:
+            raise ThresholdResolutionError(
+                "Stored SolarData component mask does not match the current image"
+            )
         seed_x, seed_y = existing.seed_point
         height, width = full_res_gray.shape
         if not (0 <= seed_x < width and 0 <= seed_y < height):
@@ -1463,9 +1399,9 @@ def resolve_threshold(
     solar_data = SolarData(
         threshold=threshold,
         seed_point=(seed_x, seed_y),
-        component_mask=compress_full_mask(refined_component),
-        roi_6_5_mask=compress_full_mask(roi_6_5_mask),
-        guard_19_5_mask=compress_full_mask(guard_19_5_mask),
+        component_mask=compress_array(refined_component),
+        roi_6_5_mask=compress_array(roi_6_5_mask),
+        guard_19_5_mask=compress_array(guard_19_5_mask),
         component_contour=contour,
     )
 
@@ -1490,7 +1426,6 @@ class DetectorApp:
         self.current_index = -1
         self.current_path: str | None = None
         self.master_image_payload: bytes | None = None
-        self.master_image_shape: tuple[int, int, int] | None = None
         self.gray_image = None
 
         # Per-image state keeps settings, the cached automatic threshold result,
@@ -1499,7 +1434,6 @@ class DetectorApp:
         # expresses the image-to-state hierarchy.
         self.image_state: dict[str, dict[str, object]] = {}
 
-        self.canvas_redraw_job = None
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
         # Tk platforms. Keep one deferred refresh job so only the final key-up
@@ -1587,7 +1521,6 @@ class DetectorApp:
         self.current_index = -1
         self.current_path = None
         self.master_image_payload = None
-        self.master_image_shape = None
         self.gray_image = None
         self.load_image_at(0)
 
@@ -1611,7 +1544,6 @@ class DetectorApp:
 
                 if unchanged_image is None:
                     self.master_image_payload = None
-                    self.master_image_shape = None
                     self.gray_image = None
                     if hasattr(self, "threshold_canvas"):
                         self.render_canvas_content(self.threshold_canvas, transparent_bgra())
@@ -1620,14 +1552,38 @@ class DetectorApp:
                     self.status.set(f"Could not load image: {path}")
                     return
 
-                # Normalize once to the lossless uint16 BGRA master used by future transforms.
-                master_image = normalize_master_bgra16(unchanged_image)
+                # Normalize the unchanged load directly to the agreed lossless uint16
+                # BGRA master. uint8 inputs are expanded by exactly 257 so every source
+                # code value is preserved in the uint16 representation.
+                source = np.asarray(unchanged_image)
+                if source.dtype not in (np.uint8, np.uint16):
+                    raise ValueError(
+                        f"master image dtype must be uint8 or uint16, got {source.dtype}"
+                    )
+                if source.ndim == 2:
+                    master_image = cv2.cvtColor(source, cv2.COLOR_GRAY2BGRA)
+                elif source.ndim == 3 and source.shape[2] == 3:
+                    master_image = cv2.cvtColor(source, cv2.COLOR_BGR2BGRA)
+                elif source.ndim == 3 and source.shape[2] == 4:
+                    master_image = source
+                else:
+                    raise ValueError(f"unsupported master image shape: {source.shape}")
+                if master_image.dtype == np.uint8:
+                    master_image = master_image.astype(np.uint16) * 257
+                master_image = np.ascontiguousarray(master_image, dtype=np.uint16)
 
-                # Derive the authoritative uint8 processing grayscale directly from that master.
-                self.gray_image = master_bgra16_to_gray8(master_image)
+                # Authoritative threshold processing is always uint8 grayscale derived
+                # directly from the lossless master with the fixed full-range mapping.
+                gray16 = cv2.cvtColor(master_image, cv2.COLOR_BGRA2GRAY)
+                self.gray_image = (
+                    (gray16.astype(np.uint32) + 128) // 257
+                ).astype(np.uint8)
 
-                # Derive a temporary uint8 color raster only for the Tk canvas display path.
-                display_image = master_bgra16_to_display_bgra8(master_image)
+                # The canvas receives an explicit uint8 display raster. The master itself
+                # remains untouched and retained losslessly for later transforms/export.
+                display_image = (
+                    (master_image.astype(np.uint32) + 128) // 257
+                ).astype(np.uint8)
 
                 if path in self.image_state:
                     state = self.image_state[path]
@@ -1651,9 +1607,8 @@ class DetectorApp:
 
                 self._update_center_preview_label()
 
-                # Keep the exact master before starting the visible processing stages.
-                self.master_image_shape = master_image.shape
-                self.master_image_payload = compress_master_bgra16(master_image)
+                # Retain the exact master in the shared self-describing array format.
+                self.master_image_payload = compress_array(master_image)
 
                 # First visible processing stage: source color + authoritative grayscale.
                 if hasattr(self, "color_canvas"):
@@ -1661,32 +1616,13 @@ class DetectorApp:
                 if hasattr(self, "threshold_canvas"):
                     self.render_canvas_content(self.threshold_canvas, self.gray_image)
 
-                if settings.threshold is None:
-                    # None has one meaning only: this image has never had T initialized.
-                    try:
-                        threshold = find_auto_threshold(
-                            self.gray_image,
-                            state,
-                            self._display_auto_separation_result,
-                        )
-                    except ThresholdResolutionError as exc:
-                        self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-                    else:
-                        result = state["auto_threshold_result"]
-                        refined_component = decompress_full_mask(
-                            result.cleaned_component_mask,
-                            self.gray_image.shape,
-                        )
-                        if hasattr(self, "threshold_canvas"):
-                            self.render_canvas_content(self.threshold_canvas, refined_component)
-                        self.commit_setting_change(
-                            "threshold",
-                            threshold,
-                            display_raw_threshold=False,
-                        )
-                else:
-                    self.threshold.set(settings.threshold)
-                    self.refresh_preview(changed_setting="image load")
+            # Image preparation and Auto T own separate, sequential processing-ui
+            # contexts. There is no nested processing_ui() state or bypass flag.
+            if settings.threshold is None:
+                self.auto_select_threshold()
+            else:
+                self.threshold.set(settings.threshold)
+                self.refresh_preview(changed_setting="image load")
         finally:
             self.update_navigation_state()
 
@@ -1733,7 +1669,6 @@ class DetectorApp:
             has_current
             and self.gray_image is not None
             and self.master_image_payload is not None
-            and self.master_image_shape is not None
         )
 
         self.previous_button.config(
@@ -2037,68 +1972,102 @@ class DetectorApp:
         )
         self.threshold_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         self.color_canvas.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-        self.threshold_canvas.bind("<Configure>", self._schedule_canvas_redraw)
-        self.color_canvas.bind("<Configure>", self._schedule_canvas_redraw)
+        self.threshold_canvas.bind("<Configure>", self._handle_canvas_resize)
+        self.color_canvas.bind("<Configure>", self._handle_canvas_resize)
 
     # ------------------------------------------------------------------
     # Application actions and threshold preview
     # ------------------------------------------------------------------
-    def _display_auto_separation_result(self, _threshold: int, component: np.ndarray):
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, component)
-
     def save_centered_images(self):
         self.status.set(
             "Save centered images: export functionality is not implemented in the threshold-finder stage."
         )
 
     def auto_select_threshold(self):
-        """Restore/recompute image-only Auto T, then commit it like any other T change."""
+        """Run or reuse image-only Auto T and stop after the Stage-B refined display."""
         if self.gray_image is None or self.current_path is None:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
 
+        state = self.image_state[self.current_path]
+        if (
+            isinstance(state.get("auto_threshold_result"), AutoThresholdResult)
+            and state["auto_threshold_result"].failure_reason is not None
+        ):
+            self.status.set(
+                "Automatic threshold previously failed "
+                f"({state['auto_threshold_result'].failure_reason})."
+            )
+            return
+
         with self.processing_ui():
-            state = self.image_state[self.current_path]
-            result = state.get("auto_threshold_result")
-            if (
-                isinstance(result, AutoThresholdResult)
-                and result.resolved
-                and result.threshold is not None
+            if not isinstance(state.get("auto_threshold_result"), AutoThresholdResult):
+                state["auto_threshold_result"] = AutoThresholdResult()
+            elif (
+                state["auto_threshold_result"].full_res_refined_threshold is None
+                or state["auto_threshold_result"].full_res_refined_component_mask is None
             ):
-                selected_threshold = result.threshold
-            else:
+                # Incomplete, non-failed runs are not authoritative for a new attempt.
+                state["auto_threshold_result"] = AutoThresholdResult()
+
+            if state["auto_threshold_result"].full_res_refined_threshold is None:
                 try:
-                    selected_threshold = find_auto_threshold(
+                    find_separation_threshold(
                         self.gray_image,
-                        state,
-                        self._display_auto_separation_result,
+                        state["auto_threshold_result"],
+                    )
+                    if (
+                        state["auto_threshold_result"].full_res_separation_component_mask
+                        is not None
+                        and hasattr(self, "threshold_canvas")
+                    ):
+                        self.render_canvas_content(
+                            self.threshold_canvas,
+                            decompress_array(
+                                state[
+                                    "auto_threshold_result"
+                                ].full_res_separation_component_mask
+                            ),
+                        )
+
+                    selected_threshold = refine_threshold(
+                        self.gray_image,
+                        state["auto_threshold_result"],
                     )
                 except ThresholdResolutionError as exc:
                     self.status.set(f"Automatic threshold could not be resolved ({exc}).")
                     return
-                result = state["auto_threshold_result"]
-
-            if result.cleaned_component_mask is not None and hasattr(self, "threshold_canvas"):
-                refined_component = decompress_full_mask(
-                    result.cleaned_component_mask,
-                    self.gray_image.shape,
+            else:
+                selected_threshold = (
+                    state["auto_threshold_result"].full_res_refined_threshold
                 )
-                self.render_canvas_content(self.threshold_canvas, refined_component)
 
-            self.commit_setting_change(
-                "threshold",
-                selected_threshold,
-                display_raw_threshold=False,
+            # The setting commit invalidates stale downstream/display state. Publish the
+            # newly valid Stage-B display only after that state transition completes.
+            self.commit_setting_change("threshold", selected_threshold)
+
+            if (
+                state["auto_threshold_result"].full_res_refined_component_mask is not None
+                and hasattr(self, "threshold_canvas")
+            ):
+                self.render_canvas_content(
+                    self.threshold_canvas,
+                    decompress_array(
+                        state[
+                            "auto_threshold_result"
+                        ].full_res_refined_component_mask
+                    ),
+                )
+
+            self.status.set(
+                "Automatic grayscale threshold selected: "
+                f"T={selected_threshold} "
+                f"(work-res separation T="
+                f"{state['auto_threshold_result'].work_res_separation_threshold}, "
+                f"histogram start="
+                f"{state['auto_threshold_result'].histogram_start_threshold}); "
+                "Stage-B refined component displayed."
             )
-
-            solar_data = state.get("solar_data")
-            if isinstance(solar_data, SolarData) and solar_data.threshold == selected_threshold:
-                self.status.set(
-                    "Automatic grayscale threshold selected: "
-                    f"T={selected_threshold} (work-res T={result.work_res_threshold}, "
-                    f"histogram start={result.histogram_start_threshold}); refined component displayed."
-                )
 
 
     def auto_select_radius(self):
@@ -2109,8 +2078,8 @@ class DetectorApp:
 
 
 
-    def commit_setting_change(self, setting_name, value, display_raw_threshold: bool = True):
-        """Synchronize one completed setting change, persist it, then refresh once."""
+    def commit_setting_change(self, setting_name, value):
+        """Synchronize and persist one completed setting change, invalidating stale display."""
         variable = self.setting_variables[setting_name]
         variable.set(value)
         value = variable.get()
@@ -2132,11 +2101,8 @@ class DetectorApp:
             baseline = getattr(self.default_settings, setting_name)
             setattr(settings, setting_name, None if value == baseline else value)
 
-        if self.gray_image is not None:
-            self.refresh_preview(
-                changed_setting=setting_name,
-                display_raw_threshold=display_raw_threshold,
-            )
+        if hasattr(self, "threshold_canvas"):
+            self.render_canvas_content(self.threshold_canvas, None)
 
 
     def _selected_center_target_name(self):
@@ -2175,9 +2141,8 @@ class DetectorApp:
         self,
         changed_setting: str | None = None,
         full_resolution: bool = False,
-        display_raw_threshold: bool = True,
     ):
-        """Display current-T B/W when requested, resolve SolarData, then display refinement."""
+        """Run the current explicit preview-processing cascade from raw threshold onward."""
         if self.gray_image is None or self.current_path is None:
             action = "Apply Full Resolution" if full_resolution else "Refresh Preview"
             self.status.set(f"{action}: no readable image is loaded.")
@@ -2196,10 +2161,9 @@ class DetectorApp:
             if isinstance(existing, SolarData) and existing.threshold != threshold:
                 state["solar_data"] = None
 
-            if display_raw_threshold:
-                threshold_mask = self.gray_image > threshold
-                if hasattr(self, "threshold_canvas"):
-                    self.render_canvas_content(self.threshold_canvas, threshold_mask)
+            threshold_mask = self.gray_image > threshold
+            if hasattr(self, "threshold_canvas"):
+                self.render_canvas_content(self.threshold_canvas, threshold_mask)
 
             try:
                 refined_component = resolve_threshold(
@@ -2208,11 +2172,8 @@ class DetectorApp:
                     state,
                 )
             except (ThresholdResolutionError, ValueError) as exc:
-                retained_display = (
-                    "Pure threshold" if display_raw_threshold else "Stage-B refined component"
-                )
                 self.status.set(
-                    f"{retained_display} remains displayed at T={threshold}; SolarData could not be "
+                    f"Pure threshold remains displayed at T={threshold}; SolarData could not be "
                     f"established ({exc})."
                 )
                 return
@@ -2244,23 +2205,12 @@ class DetectorApp:
         self.refresh_preview(full_resolution=True)
 
 
-    def _schedule_canvas_redraw(self, _event=None):
-        if self.canvas_redraw_job is not None:
-            self.root.after_cancel(self.canvas_redraw_job)
-        self.canvas_redraw_job = self.root.after(
-            CANVAS_REDRAW_DELAY_MS, self._redraw_cached_canvases
-        )
-
-    def _redraw_cached_canvases(self):
-        """Refit each canvas's retained unscaled raster after a canvas resize."""
-        self.canvas_redraw_job = None
-        for canvas_name in ("threshold_canvas", "color_canvas"):
-            if not hasattr(self, canvas_name):
-                continue
-            canvas = getattr(self, canvas_name)
-            unscaled_raster = getattr(canvas, "_unscaled_render_raster", None)
-            if unscaled_raster is not None:
-                self.render_canvas_content(canvas, unscaled_raster)
+    def _handle_canvas_resize(self, event):
+        """Refit only the resized canvas from its retained unscaled display raster."""
+        canvas = event.widget
+        unscaled_raster = getattr(canvas, "_unscaled_render_raster", None)
+        if unscaled_raster is not None:
+            self.render_canvas_content(canvas, unscaled_raster)
 
 
     def render_canvas_content(self, canvas, content):
@@ -2270,32 +2220,27 @@ class DetectorApp:
             unscaled_render_raster = transparent_bgra()
         else:
             unscaled_render_raster = np.asarray(content)
-            if unscaled_render_raster.dtype == bool:
-                unscaled_render_raster = np.where(
-                    unscaled_render_raster, 255, 0
-                ).astype(np.uint8)
-            elif unscaled_render_raster.dtype != np.uint8:
-                unscaled_render_raster = np.clip(
-                    unscaled_render_raster, 0, 255
-                ).astype(np.uint8)
-
-            if unscaled_render_raster.ndim == 2:
+            if unscaled_render_raster.dtype == bool and unscaled_render_raster.ndim == 2:
                 unscaled_render_raster = cv2.cvtColor(
-                    unscaled_render_raster, cv2.COLOR_GRAY2BGRA
+                    np.where(unscaled_render_raster, 255, 0).astype(np.uint8),
+                    cv2.COLOR_GRAY2BGRA,
                 )
             elif (
-                unscaled_render_raster.ndim == 3
-                and unscaled_render_raster.shape[2] == 3
+                unscaled_render_raster.dtype == np.uint8
+                and unscaled_render_raster.ndim == 2
             ):
                 unscaled_render_raster = cv2.cvtColor(
-                    unscaled_render_raster, cv2.COLOR_BGR2BGRA
+                    unscaled_render_raster,
+                    cv2.COLOR_GRAY2BGRA,
                 )
-            elif (
-                unscaled_render_raster.ndim != 3
-                or unscaled_render_raster.shape[2] != 4
+            elif not (
+                unscaled_render_raster.dtype == np.uint8
+                and unscaled_render_raster.ndim == 3
+                and unscaled_render_raster.shape[2] == 4
             ):
                 raise ValueError(
-                    "canvas content must be a 2D mask or 3/4-channel image"
+                    "canvas content must be a 2D bool mask, 2D uint8 grayscale, "
+                    "or uint8 BGRA image"
                 )
 
         # Canvas-owned display cache retains exactly the normalized unscaled raster.
@@ -2332,7 +2277,7 @@ class DetectorApp:
         # Tk does not retain the Python PhotoImage object. Keep it alive while displayed.
         canvas._tk_photo_image = tk_photo
 
-        # Make the raw threshold stage paintable before sequential final-T processing continues.
+        # Flush pending repaint work before synchronous processing continues.
         self.root.update_idletasks()
 
 
