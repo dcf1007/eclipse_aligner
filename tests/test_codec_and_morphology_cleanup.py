@@ -92,6 +92,36 @@ def test_image_decoder_rejects_multichannel_one_bit_payload():
         cad.decompress_image(zlib.compress(raw))
 
 
+def test_contour_codec_roundtrips_int32_xy_points_in_explicit_little_endian_storage():
+    contour = np.array(
+        [[0, 0], [17, 3], [1024, 2048], [17, 4095]],
+        dtype=np.int32,
+    )
+    payload = cad.compress_contour(contour)
+    raw = zlib.decompress(payload)
+    assert raw == contour.astype(np.dtype("<i4"), copy=False).tobytes()
+    restored = cad.decompress_contour(payload)
+    assert restored.dtype == np.int32
+    assert restored.shape == contour.shape
+    assert np.array_equal(restored, contour)
+
+
+def test_contour_codec_enforces_fixed_n_by_2_int32_contract():
+    with pytest.raises(ValueError, match=r"\(N, 2\)"):
+        cad.compress_contour(np.zeros((3, 1, 2), np.int32))
+    with pytest.raises(ValueError, match="at least one point"):
+        cad.compress_contour(np.empty((0, 2), np.int32))
+    with pytest.raises(ValueError, match="dtype must be int32"):
+        cad.compress_contour(np.zeros((3, 2), np.uint16))
+
+
+def test_contour_decoder_rejects_empty_and_incomplete_points():
+    with pytest.raises(ValueError, match="empty"):
+        cad.decompress_contour(zlib.compress(b""))
+    with pytest.raises(ValueError, match="complete int32 XY points"):
+        cad.decompress_contour(zlib.compress(b"1234567"))
+
+
 def test_morphological_cleanup_threshold_mode_matches_explicit_open_close():
     gray = np.zeros((31, 31), np.uint8)
     gray[6:25, 6:25] = 180

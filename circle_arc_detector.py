@@ -289,6 +289,37 @@ def decompress_image(payload: bytes) -> np.ndarray:
     return restored.astype(np.uint16, copy=False) if bit_depth == 16 else restored
 
 
+def compress_contour(contour: np.ndarray) -> bytes:
+    """Compress one ordered ``(N, 2)`` int32 XY contour."""
+    contour = np.asarray(contour)
+    if contour.ndim != 2 or contour.shape[1] != 2:
+        raise ValueError("contour must be an (N, 2) XY array")
+    if len(contour) == 0:
+        raise ValueError("contour must contain at least one point")
+    if contour.dtype != np.int32:
+        raise ValueError("contour dtype must be int32")
+
+    encoded_points = np.ascontiguousarray(
+        contour.astype(np.dtype("<i4"), copy=False)
+    ).tobytes()
+    return zlib.compress(encoded_points, level=1)
+
+
+def decompress_contour(payload: bytes) -> np.ndarray:
+    """Restore one ordered ``(N, 2)`` int32 XY contour."""
+    raw = zlib.decompress(payload)
+    bytes_per_point = 2 * np.dtype("<i4").itemsize
+    if len(raw) == 0:
+        raise ValueError("compressed contour is empty")
+    if len(raw) % bytes_per_point != 0:
+        raise ValueError(
+            "compressed contour payload does not contain complete int32 XY points"
+        )
+
+    contour = np.frombuffer(raw, dtype=np.dtype("<i4")).reshape(-1, 2)
+    return contour.astype(np.int32, copy=False)
+
+
 def nearest_positive_odd(value: float) -> int:
     """Return the nearest positive odd integer; exact ties choose the lower odd."""
     if value <= 0:

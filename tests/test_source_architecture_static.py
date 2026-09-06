@@ -41,6 +41,8 @@ def test_expected_stage_names_and_shared_helpers_exist():
         "def morphological_cleanup(",
         "def compress_image(",
         "def decompress_image(",
+        "def compress_contour(",
+        "def decompress_contour(",
         "def find_work_res_separation_threshold(",
         "def find_full_res_separation_threshold(",
         "def find_separation_threshold(",
