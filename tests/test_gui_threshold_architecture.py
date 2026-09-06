@@ -32,7 +32,7 @@ def test_commit_threshold_invalidates_mismatched_solardata_only():
     app=_app()
     solar=SimpleNamespace(threshold=10)
     # Need actual SolarData type for isinstance check.
-    solar=cad.SolarData(10,(0,0),b'',b'',b'',np.array([[0,0]],np.int32))
+    solar=cad.SolarData(10,(0,0),b'',b'',b'',cad.compress_contour(np.array([[0,0]],np.int32)))
     app.image_state['x']['solar_data']=solar
     app.render_canvas_content=lambda *_:None
     app.commit_setting_change('threshold',11)

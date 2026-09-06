@@ -155,6 +155,9 @@ def test_solardata_masks_use_shared_self_describing_codec_and_reuse_exact_state(
     assert np.array_equal(cad.decompress_image(solar.component_mask), first)
     assert cad.decompress_image(solar.roi_6_5_mask).shape == gray.shape
     assert cad.decompress_image(solar.guard_19_5_mask).shape == gray.shape
+    contour = cad.decompress_contour(solar.component_contour)
+    assert contour.dtype == np.int32
+    assert contour.ndim == 2 and contour.shape[1] == 2
     monkeypatch.setattr(cad, 'largest_enclosed_bright_component', lambda *_: (_ for _ in ()).throw(AssertionError('recomputed')))
     second = cad.resolve_threshold(gray, 100, state)
     assert state['solar_data'] is solar

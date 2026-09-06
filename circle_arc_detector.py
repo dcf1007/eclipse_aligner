@@ -1332,7 +1332,7 @@ class SolarData:
     component_mask: bytes
     roi_6_5_mask: bytes
     guard_19_5_mask: bytes
-    component_contour: np.ndarray
+    component_contour: bytes
 
 
 def resolve_threshold(
@@ -1365,6 +1365,11 @@ def resolve_threshold(
         if full_res_gray[seed_y, seed_x] <= threshold:
             raise ThresholdResolutionError(
                 f"Stored SolarData seed is not light at T={threshold}"
+            )
+        contour = decompress_contour(existing.component_contour)
+        if contour.dtype != np.int32 or contour.ndim != 2 or contour.shape[1] != 2:
+            raise ThresholdResolutionError(
+                "Stored SolarData contour must be an (N, 2) int32 XY array"
             )
         return refined_component
 
@@ -1435,7 +1440,7 @@ def resolve_threshold(
         component_mask=compress_image(refined_component),
         roi_6_5_mask=compress_image(roi_6_5_mask),
         guard_19_5_mask=compress_image(guard_19_5_mask),
-        component_contour=contour,
+        component_contour=compress_contour(contour),
     )
 
     # Publish only after every final-T resolution step has succeeded.
