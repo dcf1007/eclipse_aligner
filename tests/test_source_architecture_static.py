@@ -25,6 +25,8 @@ def test_removed_cumbersome_helpers_and_old_codecs():
         "compress_full_mask",
         "decompress_full_mask",
         "compress_master_bgra16",
+        "compress_array",
+        "decompress_array",
         "decompress_master_bgra16",
         "master_bgra16_to_gray8",
         "master_bgra16_to_display_bgra8",
@@ -37,8 +39,8 @@ def test_removed_cumbersome_helpers_and_old_codecs():
 def test_expected_stage_names_and_shared_helpers_exist():
     for name in (
         "def morphological_cleanup(",
-        "def compress_array(",
-        "def decompress_array(",
+        "def compress_image(",
+        "def decompress_image(",
         "def find_work_res_separation_threshold(",
         "def find_full_res_separation_threshold(",
         "def find_separation_threshold(",

@@ -11,7 +11,7 @@ def test_load_path_inlines_master_normalization_and_uses_shared_codec():
     block=TEXT.split('def load_image_at(self, index: int):',1)[1].split('\n    def previous_image',1)[0]
     assert 'cv2.IMREAD_UNCHANGED' in block
     assert 'np.uint16' in block
-    assert 'compress_array(master_image)' in block
+    assert 'compress_image(master_image)' in block
     assert 'master_image_shape' not in block
 
 
@@ -29,4 +29,4 @@ def test_load_path_calls_auto_select_after_load_processing_context():
 def test_uint16_master_codec_roundtrip():
     master=np.zeros((5,7,4),np.uint16)
     master[...,0]=1234; master[...,3]=65535
-    assert np.array_equal(cad.decompress_array(cad.compress_array(master)),master)
+    assert np.array_equal(cad.decompress_image(cad.compress_image(master)),master)

@@ -98,7 +98,7 @@ def main() -> None:
         result = cad.AutoThresholdResult()
         cad.find_separation_threshold(gray, result)
         selected_t = cad.refine_threshold(gray, result)
-        mask = cad.decompress_array(result.full_res_refined_component_mask)
+        mask = cad.decompress_image(result.full_res_refined_component_mask)
         mask_sha256 = hashlib.sha256(mask.astype(np.uint8).tobytes()).hexdigest()
         row = {
             "image": image_id,

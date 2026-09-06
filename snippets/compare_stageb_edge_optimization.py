@@ -15,7 +15,7 @@ from benchmark_stageb_simplified_score import CASES, load_authoritative_gray8, l
 
 
 def cleaned_component_at(cad, gray: np.ndarray, threshold: int, result):
-    guard = cad.decompress_array(result.full_res_separation_guard_mask)
+    guard = cad.decompress_image(result.full_res_separation_guard_mask)
     cleaned = cv2.compare(gray, threshold, cv2.CMP_GT)
     for kernel in cad.SOLAR_CLEANUP_KERNELS:
         cleaned = cad.morphological_cleanup(cleaned, kernel)

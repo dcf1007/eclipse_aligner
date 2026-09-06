@@ -20,7 +20,7 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
         full_res_separation_threshold=100,
     )
     guard = np.ones_like(gray, bool)
-    result.full_res_separation_guard_mask = cad.compress_array(guard)
+    result.full_res_separation_guard_mask = cad.compress_image(guard)
     seen = []
     real = cad.morphological_cleanup
 
@@ -45,7 +45,7 @@ def test_refinement_inlines_progressive_p357_cleanup(monkeypatch):
     result = cad.AutoThresholdResult(
         full_res_seed_point=(40, 40),
         full_res_separation_threshold=100,
-        full_res_separation_guard_mask=cad.compress_array(np.ones_like(gray, bool)),
+        full_res_separation_guard_mask=cad.compress_image(np.ones_like(gray, bool)),
     )
     calls = []
     real = cad.morphological_cleanup

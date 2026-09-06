@@ -187,7 +187,7 @@ def resize_img(
     return resized.astype(original_dtype, copy=False)
 
 
-def compress_array(array: np.ndarray) -> bytes:
+def compress_image(array: np.ndarray) -> bytes:
     """Compress one supported 1-, 8-, or 16-bit internal image array."""
     array = np.asarray(array)
     if array.ndim not in (2, 3):
@@ -222,8 +222,8 @@ def compress_array(array: np.ndarray) -> bytes:
     return zlib.compress(header + encoded_pixels, level=1)
 
 
-def decompress_array(payload: bytes) -> np.ndarray:
-    """Restore one self-describing array produced by ``compress_array``."""
+def decompress_image(payload: bytes) -> np.ndarray:
+    """Restore one self-describing array produced by ``compress_image``."""
     raw = zlib.decompress(payload)
     header_size = struct.calcsize("<IIB")
     if len(raw) < header_size:
@@ -661,7 +661,7 @@ def find_separation_threshold(
             auto_threshold_result.histogram_start_threshold,
             work_res_seed_kernel,
         )
-        auto_threshold_result.work_res_separation_component_mask = compress_array(
+        auto_threshold_result.work_res_separation_component_mask = compress_image(
             work_res_component
         )
 
@@ -703,7 +703,7 @@ def find_separation_threshold(
             full_res_search_mask,
             AUTO_T_GUARD_DILATION_FRACTION * image_scale,
         )
-        auto_threshold_result.full_res_separation_guard_mask = compress_array(
+        auto_threshold_result.full_res_separation_guard_mask = compress_image(
             full_res_guard_mask
         )
 
@@ -717,7 +717,7 @@ def find_separation_threshold(
             auto_threshold_result.full_res_seed_point,
             full_res_guard_mask,
         )
-        auto_threshold_result.full_res_separation_component_mask = compress_array(
+        auto_threshold_result.full_res_separation_component_mask = compress_image(
             full_res_separation_component
         )
     except ThresholdResolutionError as exc:
@@ -1094,7 +1094,7 @@ def refine_threshold(
 
     base_threshold = auto_threshold_result.full_res_separation_threshold
     full_res_seed_point = auto_threshold_result.full_res_seed_point
-    full_res_guard_mask = decompress_array(
+    full_res_guard_mask = decompress_image(
         auto_threshold_result.full_res_separation_guard_mask
     )
     if (
@@ -1159,7 +1159,7 @@ def refine_threshold(
                         edge_reliability=edge_reliability,
                     )
                 )
-                compressed_masks[threshold] = compress_array(cleaned_component)
+                compressed_masks[threshold] = compress_image(cleaned_component)
                 candidate_contours[threshold] = contour
 
             # Raw geometry only anchors the largest/roughest end of the score scale.
@@ -1319,7 +1319,7 @@ def resolve_threshold(
     existing = image_state.get("solar_data")
     if isinstance(existing, SolarData) and existing.threshold == threshold:
         # Restore and validate the cached authoritative component before reuse.
-        refined_component = decompress_array(existing.component_mask)
+        refined_component = decompress_image(existing.component_mask)
         if refined_component.dtype != bool or refined_component.shape != full_res_gray.shape:
             raise ThresholdResolutionError(
                 "Stored SolarData component mask does not match the current image"
@@ -1402,9 +1402,9 @@ def resolve_threshold(
     solar_data = SolarData(
         threshold=threshold,
         seed_point=(seed_x, seed_y),
-        component_mask=compress_array(refined_component),
-        roi_6_5_mask=compress_array(roi_6_5_mask),
-        guard_19_5_mask=compress_array(guard_19_5_mask),
+        component_mask=compress_image(refined_component),
+        roi_6_5_mask=compress_image(roi_6_5_mask),
+        guard_19_5_mask=compress_image(guard_19_5_mask),
         component_contour=contour,
     )
 
@@ -1611,7 +1611,7 @@ class DetectorApp:
                 self._update_center_preview_label()
 
                 # Retain the exact master in the shared self-describing array format.
-                self.master_image_payload = compress_array(master_image)
+                self.master_image_payload = compress_image(master_image)
 
                 # First visible processing stage: source color + authoritative grayscale.
                 if hasattr(self, "color_canvas"):
@@ -2026,7 +2026,7 @@ class DetectorApp:
                     ):
                         self.render_canvas_content(
                             self.threshold_canvas,
-                            decompress_array(
+                            decompress_image(
                                 state[
                                     "auto_threshold_result"
                                 ].full_res_separation_component_mask
@@ -2055,7 +2055,7 @@ class DetectorApp:
             ):
                 self.render_canvas_content(
                     self.threshold_canvas,
-                    decompress_array(
+                    decompress_image(
                         state[
                             "auto_threshold_result"
                         ].full_res_refined_component_mask

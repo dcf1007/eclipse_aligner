@@ -54,7 +54,7 @@ def test_stage_b_mutates_same_result_and_returns_final_t():
     assert result.full_res_refined_component_contour.ndim == 2
     assert result.full_res_refined_component_contour.shape[1] == 2
 
-    winning_component = cad.decompress_array(result.full_res_refined_component_mask)
+    winning_component = cad.decompress_image(result.full_res_refined_component_mask)
     expected_contour = cad.find_external_contour(winning_component).reshape(-1, 2)
     assert np.array_equal(
         result.full_res_refined_component_contour,
