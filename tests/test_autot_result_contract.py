@@ -18,6 +18,7 @@ def test_autot_result_is_mutable_progressive_and_defaults_empty():
     assert result.failure_reason is None
     assert result.histogram_start_threshold is None
     assert result.full_res_refined_threshold is None
+    assert result.full_res_refined_component_contour is None
     result.histogram_start_threshold = 12
     assert result.histogram_start_threshold == 12
 
@@ -36,6 +37,7 @@ def test_stage_a_populates_progressive_result():
     assert result.full_res_separation_component_mask is not None
     assert result.full_res_separation_guard_mask is not None
     assert result.full_res_refined_threshold is None
+    assert result.full_res_refined_component_contour is None
 
 
 def test_stage_b_mutates_same_result_and_returns_final_t():
@@ -47,6 +49,17 @@ def test_stage_b_mutates_same_result_and_returns_final_t():
     assert id(result)==identity
     assert final_t==result.full_res_refined_threshold
     assert result.full_res_refined_component_mask is not None
+    assert result.full_res_refined_component_contour is not None
+    assert result.full_res_refined_component_contour.dtype == np.uint16
+    assert result.full_res_refined_component_contour.ndim == 2
+    assert result.full_res_refined_component_contour.shape[1] == 2
+
+    winning_component = cad.decompress_array(result.full_res_refined_component_mask)
+    expected_contour = cad.find_external_contour(winning_component).reshape(-1, 2)
+    assert np.array_equal(
+        result.full_res_refined_component_contour,
+        expected_contour.astype(np.uint16),
+    )
 
 
 def test_stage_a_failure_persists_failure_reason(monkeypatch):
