@@ -50,16 +50,14 @@ def test_stage_b_mutates_same_result_and_returns_final_t():
     assert final_t==result.full_res_refined_threshold
     assert result.full_res_refined_component_mask is not None
     assert result.full_res_refined_component_contour is not None
-    assert result.full_res_refined_component_contour.dtype == np.uint16
-    assert result.full_res_refined_component_contour.ndim == 2
-    assert result.full_res_refined_component_contour.shape[1] == 2
+    stored_contour = cad.decompress_contour(result.full_res_refined_component_contour)
+    assert stored_contour.dtype == np.int32
+    assert stored_contour.ndim == 2
+    assert stored_contour.shape[1] == 2
 
     winning_component = cad.decompress_image(result.full_res_refined_component_mask)
-    expected_contour = cad.find_external_contour(winning_component).reshape(-1, 2)
-    assert np.array_equal(
-        result.full_res_refined_component_contour,
-        expected_contour.astype(np.uint16),
-    )
+    expected_contour = cad.find_external_contour(winning_component)
+    assert np.array_equal(stored_contour, expected_contour)
 
 
 def test_stage_a_failure_persists_failure_reason(monkeypatch):

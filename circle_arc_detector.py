@@ -378,7 +378,7 @@ class AutoThresholdResult:
 
     full_res_refined_threshold: int | None = None
     full_res_refined_component_mask: bytes | None = None
-    full_res_refined_component_contour: np.ndarray | None = None
+    full_res_refined_component_contour: bytes | None = None
 
     failure_reason: str | None = None
 
@@ -1286,23 +1286,15 @@ def refine_threshold(
         if best_threshold is None:
             raise ThresholdResolutionError("threshold refinement produced no score winner")
 
-        winning_contour = candidate_contours[best_threshold].reshape(-1, 2)
-        if winning_contour.size == 0:
-            raise ThresholdResolutionError("winning solar component contour is empty")
-        if (
-            int(winning_contour.min()) < 0
-            or int(winning_contour.max()) > np.iinfo(np.uint16).max
-        ):
-            raise ThresholdResolutionError(
-                "winning solar contour coordinates exceed uint16 range"
-            )
-        stored_winning_contour = winning_contour.astype(np.uint16, copy=False)
+        winning_contour = candidate_contours[best_threshold]
 
         auto_threshold_result.full_res_refined_threshold = best_threshold
         auto_threshold_result.full_res_refined_component_mask = compressed_masks[
             best_threshold
         ]
-        auto_threshold_result.full_res_refined_component_contour = stored_winning_contour
+        auto_threshold_result.full_res_refined_component_contour = compress_contour(
+            winning_contour
+        )
         return best_threshold
     except ThresholdResolutionError as exc:
         auto_threshold_result.failure_reason = f"fine refinement: {exc}"
