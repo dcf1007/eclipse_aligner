@@ -187,84 +187,106 @@ def resize_img(
     return resized.astype(original_dtype, copy=False)
 
 
-def compress_image(array: np.ndarray) -> bytes:
-    """Compress one supported 1-, 8-, or 16-bit internal image array."""
-    array = np.asarray(array)
-    if array.ndim not in (2, 3):
-        raise ValueError("array must be two- or three-dimensional")
+def compress_image(image: np.ndarray) -> bytes:
+    """Compress one supported 1-, 8-, or 16-bit internal image or mask."""
+    image = np.asarray(image)
+    if image.ndim == 2:
+        height, width = image.shape
+        channels = 0
+    elif image.ndim == 3:
+        height, width, channels = image.shape
+    else:
+        raise ValueError("image must be two- or three-dimensional")
 
-    height, width = array.shape[:2]
     if height <= 0 or width <= 0:
-        raise ValueError("array dimensions must be positive")
+        raise ValueError("image dimensions must be positive")
+    if channels not in (0, 1, 2, 3, 4):
+        raise ValueError("image channel count must be 0, 1, 2, 3, or 4")
 
-    channels = 1 if array.ndim == 2 else array.shape[2]
-    if channels not in (1, 3, 4):
-        raise ValueError("array channel count must be 1, 3, or 4")
+    samples_per_pixel = 1 if channels == 0 else channels
 
-    if array.dtype == bool:
-        if array.ndim != 2:
-            raise ValueError("1-bit arrays must be two-dimensional")
+    if image.dtype == bool:
+        if channels not in (0, 1):
+            raise ValueError(
+                "1-bit images must have no explicit channel axis or exactly one channel"
+            )
         bit_depth = 1
-        encoded_pixels = np.packbits(array.reshape(-1)).tobytes()
-    elif array.dtype == np.uint8:
+        encoded_pixels = np.packbits(image.reshape(-1)).tobytes()
+    elif image.dtype == np.uint8:
         bit_depth = 8
-        encoded_pixels = np.ascontiguousarray(array).tobytes()
-    elif array.dtype == np.uint16:
+        encoded_pixels = np.ascontiguousarray(image).tobytes()
+    elif image.dtype == np.uint16:
         bit_depth = 16
         # Persist uint16 samples in an explicit byte order rather than native endian.
         encoded_pixels = np.ascontiguousarray(
-            array.astype(np.dtype("<u2"), copy=False)
+            image.astype(np.dtype("<u2"), copy=False)
         ).tobytes()
     else:
-        raise ValueError("array dtype must be bool, uint8, or uint16")
+        raise ValueError("image dtype must be bool, uint8, or uint16")
 
-    header = struct.pack("<IIB", height, width, bit_depth)
+    expected_samples = height * width * samples_per_pixel
+    if image.size != expected_samples:
+        raise ValueError("image shape does not match its declared channel structure")
+
+    header = struct.pack("<IIBB", height, width, channels, bit_depth)
     return zlib.compress(header + encoded_pixels, level=1)
 
 
 def decompress_image(payload: bytes) -> np.ndarray:
-    """Restore one self-describing array produced by ``compress_image``."""
+    """Restore one image or mask produced by :func:`compress_image`."""
     raw = zlib.decompress(payload)
-    header_size = struct.calcsize("<IIB")
+    header_size = struct.calcsize("<IIBB")
     if len(raw) < header_size:
-        raise ValueError("compressed array payload is truncated")
+        raise ValueError("compressed image payload is truncated")
 
-    height, width, bit_depth = struct.unpack("<IIB", raw[:header_size])
+    height, width, channels, bit_depth = struct.unpack(
+        "<IIBB", raw[:header_size]
+    )
     if height <= 0 or width <= 0:
-        raise ValueError("compressed array dimensions must be positive")
+        raise ValueError("compressed image dimensions must be positive")
+    if channels not in (0, 1, 2, 3, 4):
+        raise ValueError(
+            f"compressed image has unsupported channel count: {channels}"
+        )
 
     encoded_pixels = raw[header_size:]
-    pixel_count = height * width
+    samples_per_pixel = 1 if channels == 0 else channels
+    sample_count = height * width * samples_per_pixel
+    shape = (height, width) if channels == 0 else (height, width, channels)
 
     if bit_depth == 1:
-        expected_bytes = (pixel_count + 7) // 8
+        if channels not in (0, 1):
+            raise ValueError(
+                "compressed 1-bit image must have no explicit channel axis "
+                "or exactly one channel"
+            )
+        expected_bytes = (sample_count + 7) // 8
         if len(encoded_pixels) != expected_bytes:
             raise ValueError(
-                f"compressed 1-bit array has {len(encoded_pixels)} bytes; "
+                f"compressed 1-bit image has {len(encoded_pixels)} bytes; "
                 f"expected {expected_bytes}"
             )
         packed = np.frombuffer(encoded_pixels, dtype=np.uint8)
-        return np.unpackbits(packed, count=pixel_count).reshape((height, width)) != 0
+        return np.unpackbits(packed, count=sample_count).reshape(shape) != 0
 
     if bit_depth == 8:
-        bytes_per_channel = pixel_count
+        bytes_per_sample = 1
         dtype = np.uint8
     elif bit_depth == 16:
-        bytes_per_channel = pixel_count * 2
+        bytes_per_sample = 2
         dtype = np.dtype("<u2")
     else:
-        raise ValueError(f"unsupported compressed array bit depth: {bit_depth}")
+        raise ValueError(f"unsupported compressed image bit depth: {bit_depth}")
 
-    if len(encoded_pixels) % bytes_per_channel != 0:
-        raise ValueError("compressed array pixel payload has invalid length")
-    channels = len(encoded_pixels) // bytes_per_channel
-    if channels not in (1, 3, 4):
+    expected_bytes = sample_count * bytes_per_sample
+    if len(encoded_pixels) != expected_bytes:
         raise ValueError(
-            f"compressed array has unsupported inferred channel count: {channels}"
+            f"compressed image pixel payload has {len(encoded_pixels)} bytes; "
+            f"expected {expected_bytes}"
         )
 
-    shape = (height, width) if channels == 1 else (height, width, channels)
-    return np.frombuffer(encoded_pixels, dtype=dtype).reshape(shape)
+    restored = np.frombuffer(encoded_pixels, dtype=dtype).reshape(shape)
+    return restored.astype(np.uint16, copy=False) if bit_depth == 16 else restored
 
 
 def nearest_positive_odd(value: float) -> int:

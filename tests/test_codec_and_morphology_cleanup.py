@@ -8,49 +8,87 @@ import pytest
 import circle_arc_detector as cad
 
 
-def test_codec_roundtrips_bool_mask_and_embeds_shape():
+def test_image_codec_roundtrips_bool_shapes_and_records_channel_axis_exactly():
     mask = np.zeros((13, 17), bool)
     mask[2:10, 3:15] = True
-    payload = cad.compress_image(mask)
-    restored = cad.decompress_image(payload)
-    assert restored.dtype == bool
-    assert restored.shape == mask.shape
-    assert np.array_equal(restored, mask)
-    raw = zlib.decompress(payload)
-    assert struct.unpack('<IIB', raw[:9]) == (13, 17, 1)
+    for image, channels in ((mask, 0), (mask[..., None], 1)):
+        payload = cad.compress_image(image)
+        restored = cad.decompress_image(payload)
+        assert restored.dtype == bool
+        assert restored.shape == image.shape
+        assert np.array_equal(restored, image)
+        raw = zlib.decompress(payload)
+        assert struct.unpack("<IIBB", raw[:10]) == (13, 17, channels, 1)
 
 
-def test_codec_roundtrips_uint8_gray_and_bgra():
+def test_image_codec_roundtrips_uint8_gray_gray_alpha_and_bgra():
     gray = np.arange(35, dtype=np.uint8).reshape(5, 7)
+    gray_alpha = np.dstack([gray, np.full_like(gray, 173)])
     bgra = np.dstack([gray, gray, gray, np.full_like(gray, 255)])
-    for array in (gray, bgra):
-        restored = cad.decompress_image(cad.compress_image(array))
+
+    for image, channels in (
+        (gray, 0),
+        (gray[..., None], 1),
+        (gray_alpha, 2),
+        (bgra, 4),
+    ):
+        payload = cad.compress_image(image)
+        raw = zlib.decompress(payload)
+        assert struct.unpack("<IIBB", raw[:10]) == (5, 7, channels, 8)
+        restored = cad.decompress_image(payload)
         assert restored.dtype == np.uint8
-        assert restored.shape == array.shape
-        assert np.array_equal(restored, array)
+        assert restored.shape == image.shape
+        assert np.array_equal(restored, image)
 
 
-def test_codec_roundtrips_uint16_in_explicit_little_endian_storage():
-    master = np.arange(4 * 6 * 4, dtype=np.uint16).reshape(4, 6, 4) * 521
-    payload = cad.compress_image(master)
+def test_image_codec_roundtrips_uint16_gray_alpha_in_explicit_little_endian_storage():
+    gray = (np.arange(24, dtype=np.uint16).reshape(4, 6) * 521)
+    gray_alpha = np.dstack([gray, np.full_like(gray, 65535)])
+    payload = cad.compress_image(gray_alpha)
     raw = zlib.decompress(payload)
-    assert struct.unpack('<IIB', raw[:9]) == (4, 6, 16)
+    assert struct.unpack("<IIBB", raw[:10]) == (4, 6, 2, 16)
     restored = cad.decompress_image(payload)
-    assert restored.dtype.itemsize == 2
-    assert restored.shape == master.shape
-    assert np.array_equal(restored, master)
+    assert restored.dtype == np.uint16
+    assert restored.shape == gray_alpha.shape
+    assert np.array_equal(restored, gray_alpha)
 
 
-def test_codec_rejects_unsupported_dtype_and_channels():
-    with pytest.raises(ValueError):
+def test_image_codec_preserves_uint16_two_dimensional_and_explicit_one_channel_shapes():
+    gray = (np.arange(20, dtype=np.uint16).reshape(4, 5) * 977)
+    for image, channels in ((gray, 0), (gray[..., None], 1)):
+        payload = cad.compress_image(image)
+        raw = zlib.decompress(payload)
+        assert struct.unpack("<IIBB", raw[:10]) == (4, 5, channels, 16)
+        restored = cad.decompress_image(payload)
+        assert restored.dtype == np.uint16
+        assert restored.shape == image.shape
+        assert np.array_equal(restored, image)
+
+
+def test_image_codec_rejects_unsupported_dtype_and_channels():
+    with pytest.raises(ValueError, match="dtype"):
         cad.compress_image(np.zeros((3, 4), np.float32))
-    with pytest.raises(ValueError):
-        cad.compress_image(np.zeros((3, 4, 2), np.uint8))
+    with pytest.raises(ValueError, match="channel count"):
+        cad.compress_image(np.zeros((3, 4, 5), np.uint8))
 
 
-def test_codec_rejects_invalid_bit_depth():
-    raw = struct.pack('<IIB', 2, 2, 7) + b'1234'
-    with pytest.raises(ValueError, match='bit depth'):
+def test_image_decoder_rejects_invalid_channel_count_bit_depth_and_payload_length():
+    bad_channels = struct.pack("<IIBB", 2, 2, 5, 8) + b"1234"
+    with pytest.raises(ValueError, match="channel count"):
+        cad.decompress_image(zlib.compress(bad_channels))
+
+    bad_depth = struct.pack("<IIBB", 2, 2, 0, 7) + b"1234"
+    with pytest.raises(ValueError, match="bit depth"):
+        cad.decompress_image(zlib.compress(bad_depth))
+
+    bad_length = struct.pack("<IIBB", 2, 2, 2, 8) + b"1234567"
+    with pytest.raises(ValueError, match="expected 8"):
+        cad.decompress_image(zlib.compress(bad_length))
+
+
+def test_image_decoder_rejects_multichannel_one_bit_payload():
+    raw = struct.pack("<IIBB", 2, 2, 2, 1) + b"\x00"
+    with pytest.raises(ValueError, match="exactly one channel"):
         cad.decompress_image(zlib.compress(raw))
 
 
