@@ -47,6 +47,7 @@ def test_expected_stage_names_and_shared_helpers_exist():
         "def find_full_res_separation_threshold(",
         "def find_separation_threshold(",
         "def refine_threshold(",
+        "def find_external_contour(",
     ):
         assert name in TEXT
 

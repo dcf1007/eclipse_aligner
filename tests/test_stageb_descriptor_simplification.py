@@ -12,7 +12,7 @@ def _rectangle_contour(x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
     mask = np.zeros((220, 220), dtype=np.uint8)
     cv2.rectangle(mask, (x0, y0), (x1, y1), 255, -1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    return contours[0]
+    return contours[0].reshape(-1, 2).astype(np.int32)
 
 
 def _erf_edge_image(center: float, sigma: float) -> np.ndarray:
@@ -58,7 +58,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
     mask = np.zeros_like(gray, dtype=np.uint8)
     cv2.circle(mask, (110, 110), 55, 255, -1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    contour = contours[0]
+    contour = contours[0].reshape(-1, 2).astype(np.int32)
     profiles, lengths = cad._sample_grayscale_profiles(gray, contour)
     assert profiles.shape[1] == 2 * cad.EDGE_PROFILE_RADIUS_PX + 1
     assert len(profiles) == len(lengths)

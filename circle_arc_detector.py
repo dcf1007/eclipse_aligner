@@ -779,7 +779,7 @@ def find_separation_threshold(
 
 
 def find_external_contour(component: np.ndarray) -> np.ndarray:
-    """Return the largest-area external CHAIN_APPROX_NONE contour of a non-empty component."""
+    """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
     if component.ndim != 2 or not np.any(component):
         raise ThresholdResolutionError("solar component is empty or not two-dimensional")
     component_u8 = np.where(component != 0, 255, 0).astype(np.uint8)
@@ -790,13 +790,16 @@ def find_external_contour(component: np.ndarray) -> np.ndarray:
     )
     if not contours:
         raise ThresholdResolutionError("solar component has no external contour")
-    return max(contours, key=cv2.contourArea)
+    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    if contour.size == 0:
+        raise ThresholdResolutionError("solar component external contour is empty")
+    return np.ascontiguousarray(contour, dtype=np.int32)
 
 
 
 def measure_filled_area(contour: np.ndarray) -> int:
     """Return raster-equivalent area enclosed by the external lattice contour."""
-    points = contour[:, 0, :].astype(np.int64)
+    points = contour.astype(np.int64)
     following = np.roll(points, -1, axis=0)
     distance = np.abs(following - points)
     boundary_points = int(np.gcd(distance[:, 0], distance[:, 1]).sum())
@@ -849,8 +852,8 @@ def _sample_grayscale_profiles(
     # deviations no larger than the half-pixel cell diagonal, so raster stair-steps
     # do not create thousands of nearly duplicate local directions.
     raster_tolerance = math.hypot(0.5, 0.5)
-    polygon = cv2.approxPolyDP(contour, raster_tolerance, True)
-    points = polygon[:, 0, :].astype(np.float64)
+    polygon = cv2.approxPolyDP(contour, raster_tolerance, True).reshape(-1, 2)
+    points = polygon.astype(np.float64)
     if len(points) < 3:
         return empty
 

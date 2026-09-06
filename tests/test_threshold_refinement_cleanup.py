@@ -11,6 +11,23 @@ def test_measure_filled_area_includes_lattice_boundary_without_helper():
     assert cad.measure_filled_area(contour) == 25
 
 
+
+def test_find_external_contour_returns_application_xy_int32_without_geometry_change():
+    mask = np.zeros((31, 37), bool)
+    mask[5:24, 7:29] = True
+    mask[9:13, 29:33] = True
+
+    contour = cad.find_external_contour(mask)
+    assert contour.dtype == np.int32
+    assert contour.ndim == 2 and contour.shape[1] == 2
+
+    source = np.where(mask, 255, 0).astype(np.uint8)
+    opencv_contours, _ = cv2.findContours(
+        source, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    expected = max(opencv_contours, key=cv2.contourArea).reshape(-1, 2)
+    assert np.array_equal(contour, expected)
+
 def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
     gray = np.zeros((61, 61), np.uint8)
     cv2.circle(gray, (30, 30), 18, 180, -1)
