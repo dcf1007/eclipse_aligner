@@ -28,6 +28,7 @@ def test_removed_cumbersome_helpers_and_old_codecs():
         "compress_array",
         "decompress_array",
         "decompress_master_bgra16",
+        "_ordered_external_component_contour",
         "master_bgra16_to_gray8",
         "master_bgra16_to_display_bgra8",
         "normalize_master_bgra16",

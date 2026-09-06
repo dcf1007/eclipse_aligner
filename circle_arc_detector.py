@@ -1343,24 +1343,6 @@ class SolarData:
     component_contour: np.ndarray
 
 
-def _ordered_external_component_contour(component: np.ndarray) -> np.ndarray:
-    """Return the ordered external CHAIN_APPROX_NONE contour as uint16 XY pairs."""
-    component_u8 = np.where(component, 255, 0).astype(np.uint8)
-    contours, _ = cv2.findContours(
-        component_u8,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-    if not contours:
-        raise ThresholdResolutionError("Solar component has no external contour")
-    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    if contour.size == 0:
-        raise ThresholdResolutionError("Solar component external contour is empty")
-    if int(contour.max()) > np.iinfo(np.uint16).max:
-        raise ThresholdResolutionError("Solar contour coordinates exceed uint16 range")
-    return contour.astype(np.uint16, copy=False)
-
-
 def resolve_threshold(
     full_res_gray: np.ndarray,
     threshold: int,
@@ -1453,7 +1435,7 @@ def resolve_threshold(
     )
 
     # Preserve the ordered external contour from this exact authoritative refined mask.
-    contour = _ordered_external_component_contour(refined_component)
+    contour = find_external_contour(refined_component)
 
     solar_data = SolarData(
         threshold=threshold,
