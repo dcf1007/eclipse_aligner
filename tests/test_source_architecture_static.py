@@ -78,3 +78,14 @@ def test_stageb_descriptor_set_is_roughness_holes_area_and_edge_only():
     assert "0.5 * q_area" in score_block
     assert "edge_reliability * q_edge" in score_block
     assert "q_solidity" not in score_block
+
+
+def test_gui_auto_select_delegates_autot_lifecycle_to_stage_functions():
+    block = TEXT.split("    def auto_select_threshold(self):", 1)[1].split(
+        "\n    def auto_select_radius", 1
+    )[0]
+    assert "except ThresholdResolutionError" not in block
+    assert "separation_threshold_complete" not in block
+    assert "threshold_refinement_complete" not in block
+    assert "find_separation_threshold(" in block
+    assert "refine_threshold(" in block

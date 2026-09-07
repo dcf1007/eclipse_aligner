@@ -32,12 +32,11 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
     gray = np.zeros((61, 61), np.uint8)
     cv2.circle(gray, (30, 30), 18, 180, -1)
     gray[30, 30] = 240
-    result = cad.AutoThresholdResult(
-        full_res_seed_point=(30, 30),
-        full_res_separation_threshold=100,
-    )
-    guard = np.ones_like(gray, bool)
-    result.full_res_separation_guard_mask = cad.compress_image(guard)
+    result = cad.AutoThresholdResult()
+    cad.find_separation_threshold(gray, result)
+    assert result.separation_threshold_complete
+    base_threshold = result.full_res_separation_threshold
+
     seen = []
     real = cad.morphological_cleanup
 
@@ -52,18 +51,19 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
     # Stage B thresholds once then applies P357 to the existing mask, so no
     # threshold-mode morphology is used during refinement.
     assert seen == []
-    assert 100 <= result.full_res_refined_threshold <= 110
+    assert base_threshold <= result.full_res_refined_threshold <= min(
+        255, base_threshold + cad.MAX_T_REFINEMENT_STEPS
+    )
 
 
 def test_refinement_inlines_progressive_p357_cleanup(monkeypatch):
     gray = np.zeros((81, 81), np.uint8)
     cv2.circle(gray, (40, 40), 20, 180, -1)
     gray[40, 40] = 240
-    result = cad.AutoThresholdResult(
-        full_res_seed_point=(40, 40),
-        full_res_separation_threshold=100,
-        full_res_separation_guard_mask=cad.compress_image(np.ones_like(gray, bool)),
-    )
+    result = cad.AutoThresholdResult()
+    cad.find_separation_threshold(gray, result)
+    assert result.separation_threshold_complete
+
     calls = []
     real = cad.morphological_cleanup
 

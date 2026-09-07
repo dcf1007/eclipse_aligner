@@ -382,6 +382,34 @@ class AutoThresholdResult:
 
     failure_reason: str | None = None
 
+    @property
+    def separation_threshold_complete(self) -> bool:
+        """Return whether every result owned by ``find_separation_threshold`` exists."""
+        return all(
+            value is not None
+            for value in (
+                self.histogram_start_threshold,
+                self.work_res_seed_point,
+                self.work_res_separation_threshold,
+                self.work_res_separation_component_mask,
+                self.full_res_seed_point,
+                self.full_res_separation_threshold,
+                self.full_res_separation_component_mask,
+                self.full_res_separation_guard_mask,
+            )
+        )
+
+    @property
+    def threshold_refinement_complete(self) -> bool:
+        """Return whether every result owned by ``refine_threshold`` exists."""
+        return all(
+            value is not None
+            for value in (
+                self.full_res_refined_threshold,
+                self.full_res_refined_component_mask,
+                self.full_res_refined_component_contour,
+            )
+        )
 
 
 def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
@@ -401,7 +429,7 @@ def find_histogram_start_threshold(work_res_gray: np.ndarray) -> int:
     for index in range(rightmost_peak - 1, 0, -1):
         if signal[index] <= signal[index - 1] and signal[index] < signal[index + 1]:
             return index
-    return 0
+    return rightmost_peak
 
 
 def brightest_supported_component_point(
@@ -577,7 +605,7 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     if component.ndim != 2:
         raise ValueError("component mask must be two-dimensional")
     if not np.any(component):
-        raise ThresholdResolutionError("Cannot dilate empty solar component")
+        raise ValueError("cannot dilate empty solar component")
     if margin < 0:
         raise ValueError("dilation margin must be non-negative")
 
@@ -620,14 +648,14 @@ def find_full_res_separation_threshold(
     if full_res_guard_mask.ndim != 2 or full_res_guard_mask.shape != full_res_gray.shape:
         raise ValueError("full-resolution guard and grayscale image must have identical shapes")
     if not np.any(full_res_guard_mask):
-        raise ThresholdResolutionError("Full-resolution Auto-T guard is empty")
+        raise ValueError("full-resolution Auto-T guard is empty")
 
     seed_x, seed_y = full_res_seed_point
     full_res_height, full_res_width = full_res_gray.shape
     if not (0 <= seed_x < full_res_width and 0 <= seed_y < full_res_height):
-        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the image")
+        raise ValueError("full-resolution tracking seed lies outside the image")
     if not full_res_guard_mask[seed_y, seed_x]:
-        raise ThresholdResolutionError("Full-resolution tracking seed lies outside the Auto-T guard")
+        raise ValueError("full-resolution tracking seed lies outside the Auto-T guard")
 
     full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
 
@@ -685,6 +713,25 @@ def find_separation_threshold(
         raise ValueError("automatic thresholding requires authoritative 2D uint8 grayscale")
     if not isinstance(auto_threshold_result, AutoThresholdResult):
         raise ValueError("Stage A requires an AutoThresholdResult")
+    if auto_threshold_result.failure_reason is not None:
+        return
+    if auto_threshold_result.separation_threshold_complete:
+        return
+
+    # An incomplete non-failed separation is a recoverable interrupted attempt.
+    # Restart Auto-T from Stage A without allowing stale downstream values to mix
+    # with the new progressive result.
+    auto_threshold_result.histogram_start_threshold = None
+    auto_threshold_result.work_res_seed_point = None
+    auto_threshold_result.work_res_separation_threshold = None
+    auto_threshold_result.work_res_separation_component_mask = None
+    auto_threshold_result.full_res_seed_point = None
+    auto_threshold_result.full_res_separation_threshold = None
+    auto_threshold_result.full_res_separation_component_mask = None
+    auto_threshold_result.full_res_separation_guard_mask = None
+    auto_threshold_result.full_res_refined_threshold = None
+    auto_threshold_result.full_res_refined_component_mask = None
+    auto_threshold_result.full_res_refined_component_contour = None
 
     full_res_height, full_res_width = full_res_gray.shape
     full_res_max_dim = max(full_res_height, full_res_width)
@@ -775,13 +822,13 @@ def find_separation_threshold(
         )
     except ThresholdResolutionError as exc:
         auto_threshold_result.failure_reason = f"{resolution_step}: {exc}"
-        raise
+        return
 
 
 def find_external_contour(component: np.ndarray) -> np.ndarray:
     """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
     if component.ndim != 2 or not np.any(component):
-        raise ThresholdResolutionError("solar component is empty or not two-dimensional")
+        raise ValueError("solar component is empty or not two-dimensional")
     component_u8 = np.where(component != 0, 255, 0).astype(np.uint8)
     contours, _ = cv2.findContours(
         component_u8,
@@ -789,10 +836,10 @@ def find_external_contour(component: np.ndarray) -> np.ndarray:
         cv2.CHAIN_APPROX_NONE,
     )
     if not contours:
-        raise ThresholdResolutionError("solar component has no external contour")
+        raise ValueError("solar component has no external contour")
     contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
     if contour.size == 0:
-        raise ThresholdResolutionError("solar component external contour is empty")
+        raise ValueError("solar component external contour is empty")
     return np.ascontiguousarray(contour, dtype=np.int32)
 
 
@@ -806,7 +853,7 @@ def measure_filled_area(contour: np.ndarray) -> int:
     polygon_area = float(cv2.contourArea(contour))
     filled_area = int(round(polygon_area + 0.5 * boundary_points + 1.0))
     if filled_area <= 0:
-        raise ThresholdResolutionError("filled external contour area is empty")
+        raise ValueError("filled external contour area is empty")
     return filled_area
 
 
@@ -830,7 +877,7 @@ def measure_hole_quality(
         raise ValueError("component area must be between zero and filled area")
     external_perimeter = float(cv2.arcLength(contour, True))
     if not math.isfinite(external_perimeter) or external_perimeter <= 0.0:
-        raise ThresholdResolutionError("external contour perimeter is empty")
+        raise ValueError("external contour perimeter is empty")
     hole_area = filled_area - component_area
     minimum_hole_perimeter = 2.0 * math.sqrt(math.pi * hole_area)
     return external_perimeter / (external_perimeter + minimum_hole_perimeter)
@@ -1133,20 +1180,36 @@ def measure_edge_alignment(
 def refine_threshold(
     full_res_gray: np.ndarray,
     auto_threshold_result: AutoThresholdResult,
-) -> int:
-    """Run Auto-T Stage B, fill the supplied result, and return its winning T."""
+) -> int | None:
+    """Run or reuse Auto-T Stage B and return its winning T when available."""
     if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
         raise ValueError("threshold refinement requires authoritative uint8 grayscale")
     if not isinstance(auto_threshold_result, AutoThresholdResult):
         raise ValueError("Stage B requires an AutoThresholdResult")
-    if auto_threshold_result.failure_reason is not None:
-        raise ValueError("cannot refine an Auto-T result that already failed")
+
     if (
-        auto_threshold_result.full_res_separation_threshold is None
-        or auto_threshold_result.full_res_seed_point is None
-        or auto_threshold_result.full_res_separation_guard_mask is None
+        auto_threshold_result.failure_reason is None
+        and not auto_threshold_result.separation_threshold_complete
     ):
-        raise ValueError("threshold refinement requires a completed Stage-A separation")
+        find_separation_threshold(full_res_gray, auto_threshold_result)
+
+    if (
+        auto_threshold_result.failure_reason is None
+        and not auto_threshold_result.separation_threshold_complete
+    ):
+        raise ValueError(
+            "separation threshold remained incomplete without a recorded failure"
+        )
+
+    if auto_threshold_result.failure_reason is not None:
+        return None
+
+    if auto_threshold_result.threshold_refinement_complete:
+        return auto_threshold_result.full_res_refined_threshold
+
+    auto_threshold_result.full_res_refined_threshold = None
+    auto_threshold_result.full_res_refined_component_mask = None
+    auto_threshold_result.full_res_refined_component_contour = None
 
     base_threshold = auto_threshold_result.full_res_separation_threshold
     full_res_seed_point = auto_threshold_result.full_res_seed_point
@@ -1298,7 +1361,7 @@ def refine_threshold(
         return best_threshold
     except ThresholdResolutionError as exc:
         auto_threshold_result.failure_reason = f"fine refinement: {exc}"
-        raise
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2028,57 +2091,38 @@ class DetectorApp:
             return
 
         state = self.image_state[self.current_path]
-        if (
-            isinstance(state.get("auto_threshold_result"), AutoThresholdResult)
-            and state["auto_threshold_result"].failure_reason is not None
-        ):
-            self.status.set(
-                "Automatic threshold previously failed "
-                f"({state['auto_threshold_result'].failure_reason})."
-            )
-            return
 
         with self.processing_ui():
             if not isinstance(state.get("auto_threshold_result"), AutoThresholdResult):
                 state["auto_threshold_result"] = AutoThresholdResult()
-            elif (
-                state["auto_threshold_result"].full_res_refined_threshold is None
-                or state["auto_threshold_result"].full_res_refined_component_mask is None
+
+            find_separation_threshold(
+                self.gray_image,
+                state["auto_threshold_result"],
+            )
+            if (
+                state["auto_threshold_result"].full_res_separation_component_mask
+                is not None
+                and hasattr(self, "threshold_canvas")
             ):
-                # Incomplete, non-failed runs are not authoritative for a new attempt.
-                state["auto_threshold_result"] = AutoThresholdResult()
-
-            if state["auto_threshold_result"].full_res_refined_threshold is None:
-                try:
-                    find_separation_threshold(
-                        self.gray_image,
-                        state["auto_threshold_result"],
-                    )
-                    if (
+                self.render_canvas_content(
+                    self.threshold_canvas,
+                    decompress_image(
                         state["auto_threshold_result"].full_res_separation_component_mask
-                        is not None
-                        and hasattr(self, "threshold_canvas")
-                    ):
-                        self.render_canvas_content(
-                            self.threshold_canvas,
-                            decompress_image(
-                                state[
-                                    "auto_threshold_result"
-                                ].full_res_separation_component_mask
-                            ),
-                        )
-
-                    selected_threshold = refine_threshold(
-                        self.gray_image,
-                        state["auto_threshold_result"],
-                    )
-                except ThresholdResolutionError as exc:
-                    self.status.set(f"Automatic threshold could not be resolved ({exc}).")
-                    return
-            else:
-                selected_threshold = (
-                    state["auto_threshold_result"].full_res_refined_threshold
+                    ),
                 )
+
+            selected_threshold = refine_threshold(
+                self.gray_image,
+                state["auto_threshold_result"],
+            )
+            if selected_threshold is None:
+                reason = state["auto_threshold_result"].failure_reason
+                self.status.set(
+                    "Automatic threshold could not be resolved"
+                    + (f" ({reason})." if reason is not None else ".")
+                )
+                return
 
             # The setting commit invalidates stale downstream/display state. Publish the
             # newly valid Stage-B display only after that state transition completes.

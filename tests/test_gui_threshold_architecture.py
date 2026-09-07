@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 import numpy as np
 
@@ -46,3 +47,29 @@ def test_canvas_resize_renders_only_event_widget_retained_raster():
     app._handle_canvas_resize(SimpleNamespace(widget=canvas))
     assert len(calls)==1 and calls[0][0] is canvas
     assert np.array_equal(calls[0][1],canvas._unscaled_render_raster)
+
+
+def test_auto_select_calls_both_stages_and_reads_failure_state_without_gui_retry_logic(monkeypatch):
+    app = _app()
+    app.gray_image = np.zeros((9, 9), np.uint8)
+    app.status = Var("")
+    app.processing_ui = nullcontext
+    del app.threshold_canvas
+    calls = []
+
+    def stage_a(gray, result):
+        calls.append(("separation", result))
+        result.failure_reason = "work-resolution separation: no component"
+
+    def stage_b(gray, result):
+        calls.append(("refinement", result))
+        return None
+
+    monkeypatch.setattr(cad, "find_separation_threshold", stage_a)
+    monkeypatch.setattr(cad, "refine_threshold", stage_b)
+
+    app.auto_select_threshold()
+
+    result = app.image_state["x"]["auto_threshold_result"]
+    assert calls == [("separation", result), ("refinement", result)]
+    assert "work-resolution separation: no component" in app.status.get()
