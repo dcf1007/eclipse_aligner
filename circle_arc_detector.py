@@ -93,23 +93,23 @@ def opaque_bgra(bgr: np.ndarray) -> np.ndarray:
 
 
 def generate_kernel(
-    size: tuple[int, int],
+    shape: tuple[int, int],
     round_kernel: bool = False,
 ) -> np.ndarray:
     """Return a positive-odd rectangle or centered discrete L2 ellipse."""
-    width, height = size
-    if width <= 0 or height <= 0 or width % 2 == 0 or height % 2 == 0:
-        raise ValueError("kernel width and height must be positive odd integers")
+    height, width = shape
+    if height <= 0 or width <= 0 or height % 2 == 0 or width % 2 == 0:
+        raise ValueError("kernel height and width must be positive odd integers")
 
     if not round_kernel:
         return np.ones((height, width), dtype=np.uint8)
 
     # A one-pixel axis is the exact degenerate ellipse: a straight filled line.
-    if width == 1 or height == 1:
+    if height == 1 or width == 1:
         return np.ones((height, width), dtype=np.uint8)
 
-    x_radius = width // 2
     y_radius = height // 2
+    x_radius = width // 2
     yy, xx = np.ogrid[-y_radius : y_radius + 1, -x_radius : x_radius + 1]
     ellipse = (xx / x_radius) ** 2 + (yy / y_radius) ** 2 <= 1.0
     return ellipse.astype(np.uint8)
@@ -155,24 +155,24 @@ def morphological_cleanup(
 
 def resize_img(
     img: np.ndarray,
-    size: tuple[int, int],
+    shape: tuple[int, int],
     mask: bool = False,
 ) -> np.ndarray:
-    """Resize to an explicit ``(width, height)``; masks always use exact nearest."""
+    """Resize to an explicit NumPy ``(height, width)`` shape."""
     original_dtype = img.dtype
     original_height, original_width = img.shape[:2]
-    width, height = size
+    height, width = shape
 
-    if width <= 0 or height <= 0:
+    if height <= 0 or width <= 0:
         raise ValueError("resize dimensions must be positive")
-    if (width, height) == (original_width, original_height):
+    if (height, width) == (original_height, original_width):
         return img.copy()
 
     if mask:
         # OpenCV cannot resize bool directly; preserve mask membership with exact nearest.
         resize_source = img.astype(np.uint8) if img.dtype == bool else img
         interpolation = cv2.INTER_NEAREST_EXACT
-    elif width < original_width or height < original_height:
+    elif height < original_height or width < original_width:
         resize_source = img
         interpolation = cv2.INTER_AREA
     else:
@@ -181,7 +181,7 @@ def resize_img(
 
     resized = cv2.resize(
         resize_source,
-        (width, height),
+        (width, height),  # OpenCV alone uses (width, height).
         interpolation=interpolation,
     )
     return resized.astype(original_dtype, copy=False)
@@ -354,6 +354,23 @@ class ImageSettings:
 WORK_RES_MAX_DIM = 1200
 PEAK_KERNEL = np.array([0.25, 0.50, 0.25], dtype=np.float64)
 AUTO_T_GUARD_DILATION_FRACTION = 0.10
+
+
+def calculate_work_res_shape(full_res_shape: tuple[int, int]) -> tuple[int, int]:
+    """Return the aspect-preserving work raster shape in NumPy ``(height, width)`` order."""
+    full_res_height, full_res_width = full_res_shape
+    if full_res_height <= 0 or full_res_width <= 0:
+        raise ValueError("full-resolution shape dimensions must be positive")
+
+    full_res_max_dim = max(full_res_shape)
+    if full_res_max_dim <= WORK_RES_MAX_DIM:
+        return full_res_shape
+
+    work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
+    return (
+        round(full_res_height * work_res_scale),
+        round(full_res_width * work_res_scale),
+    )
 
 
 class ThresholdResolutionError(RuntimeError):
@@ -734,17 +751,8 @@ def find_separation_threshold(
     auto_threshold_result.full_res_refined_component_contour = None
 
     full_res_height, full_res_width = full_res_gray.shape
-    full_res_max_dim = max(full_res_height, full_res_width)
-    if full_res_max_dim > WORK_RES_MAX_DIM:
-        work_res_scale = WORK_RES_MAX_DIM / full_res_max_dim
-        work_res_size = (
-            round(full_res_width * work_res_scale),
-            round(full_res_height * work_res_scale),
-        )
-    else:
-        work_res_size = (full_res_width, full_res_height)
-
-    work_res_gray = resize_img(full_res_gray, work_res_size)
+    work_res_shape = calculate_work_res_shape(full_res_gray.shape)
+    work_res_gray = resize_img(full_res_gray, work_res_shape)
     auto_threshold_result.histogram_start_threshold = (
         find_histogram_start_threshold(work_res_gray)
     )
@@ -768,7 +776,7 @@ def find_separation_threshold(
         # Transfer only the mature work component geometry onto the exact source raster.
         full_res_search_mask = resize_img(
             work_res_component,
-            (full_res_width, full_res_height),
+            full_res_gray.shape,
             mask=True,
         )
 
@@ -2334,13 +2342,13 @@ class DetectorApp:
         canvas_height = max(2, canvas.winfo_height() - 2)
         raster_height, raster_width = unscaled_render_raster.shape[:2]
         scale = min(canvas_width / raster_width, canvas_height / raster_height)
-        fitted_size = (
-            round(raster_width * scale),
+        fitted_shape = (
             round(raster_height * scale),
+            round(raster_width * scale),
         )
 
         # Resize the retained raster to the exact fitted canvas dimensions.
-        scaled_raster = resize_img(unscaled_render_raster, fitted_size)
+        scaled_raster = resize_img(unscaled_render_raster, fitted_shape)
         ok, encoded_png = cv2.imencode(".png", scaled_raster)
         if not ok:
             raise ValueError("could not encode canvas content")
