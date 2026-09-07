@@ -721,6 +721,49 @@ def find_full_res_separation_threshold(
 
 
 
+def derive_full_res_seed_and_guard(
+    full_res_gray: np.ndarray,
+    work_res_component: np.ndarray,
+    work_res_seed_kernel: np.ndarray,
+) -> tuple[tuple[int, int], np.ndarray]:
+    """Transfer mature work geometry and return its supported full-res seed and fixed guard."""
+    full_res_search_mask = resize_img(
+        work_res_component,
+        full_res_gray.shape,
+        mask=True,
+    )
+
+    work_res_support_size = max(work_res_seed_kernel.shape)
+    mapped_kernel_size = (
+        work_res_support_size
+        * max(full_res_gray.shape)
+        / max(work_res_component.shape)
+    )
+    full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
+    full_res_seed_kernel = generate_kernel(
+        (full_res_kernel_size, full_res_kernel_size),
+        round_kernel=False,
+    )
+
+    full_res_seed_point = brightest_supported_component_point(
+        full_res_gray,
+        full_res_search_mask,
+        full_res_seed_kernel,
+    )
+    if full_res_seed_point is None:
+        raise ThresholdResolutionError(
+            f"Transferred solar component has no {full_res_kernel_size}x"
+            f"{full_res_kernel_size}-supported full-resolution seed"
+        )
+
+    image_scale = math.sqrt(full_res_gray.shape[0] * full_res_gray.shape[1])
+    full_res_guard_mask = dilate_component_mask(
+        full_res_search_mask,
+        AUTO_T_GUARD_DILATION_FRACTION * image_scale,
+    )
+    return full_res_seed_point, full_res_guard_mask
+
+
 def find_separation_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
@@ -781,44 +824,17 @@ def find_separation_threshold(
             work_res_component
         )
 
-        # Transfer only the mature work component geometry onto the exact source raster.
-        full_res_search_mask = resize_img(
-            work_res_component,
-            full_res_gray.shape,
-            mask=True,
-        )
-
-        # Scale the fixed 5x5 square work support to the realized full-resolution scale.
-        work_res_support_size = max(work_res_seed_kernel.shape)
-        mapped_kernel_size = (
-            work_res_support_size
-            * max(full_res_gray.shape)
-            / max(work_res_gray.shape)
-        )
-        full_res_kernel_size = nearest_positive_odd(mapped_kernel_size)
-        full_res_seed_kernel = generate_kernel(
-            (full_res_kernel_size, full_res_kernel_size),
-            round_kernel=False,
-        )
-
         resolution_step = "full-resolution seed selection"
-        auto_threshold_result.full_res_seed_point = brightest_supported_component_point(
+        (
+            auto_threshold_result.full_res_seed_point,
+            full_res_guard_mask,
+        ) = derive_full_res_seed_and_guard(
             full_res_gray,
-            full_res_search_mask,
-            full_res_seed_kernel,
+            work_res_component,
+            work_res_seed_kernel,
         )
-        if auto_threshold_result.full_res_seed_point is None:
-            raise ThresholdResolutionError(
-                f"Transferred solar component has no {full_res_kernel_size}x"
-                f"{full_res_kernel_size}-supported full-resolution seed"
-            )
 
         resolution_step = "full-resolution guard construction"
-        image_scale = math.sqrt(full_res_width * full_res_height)
-        full_res_guard_mask = dilate_component_mask(
-            full_res_search_mask,
-            AUTO_T_GUARD_DILATION_FRACTION * image_scale,
-        )
         auto_threshold_result.full_res_separation_guard_mask = compress_image(
             full_res_guard_mask
         )
@@ -1193,6 +1209,23 @@ def measure_edge_alignment(
     return edge_distance, edge_reliability
 
 
+def extract_separated_seed_component(
+    threshold_mask: np.ndarray,
+    seed_point: tuple[int, int],
+    guard_mask: np.ndarray,
+    guard_boundary: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return the P3/P5/P7-cleaned seeded component and contour when separated."""
+    cleaned = threshold_mask
+    for kernel in SOLAR_CLEANUP_KERNELS:
+        cleaned = morphological_cleanup(cleaned, kernel)
+    cleaned[~guard_mask] = 0
+    component = extract_component(cleaned, seed_point)
+    if component is None or np.any(component & guard_boundary):
+        return None
+    return component, find_external_contour(component)
+
+
 def refine_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
@@ -1271,17 +1304,15 @@ def refine_threshold(
         for threshold in range(base_threshold, max_threshold + 1):
             threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
 
-            cleaned = threshold_mask
-            for kernel in SOLAR_CLEANUP_KERNELS:
-                cleaned = morphological_cleanup(cleaned, kernel)
-            cleaned[~full_res_guard_mask] = 0
-            cleaned_component = extract_component(cleaned, full_res_seed_point)
+            candidate = extract_separated_seed_component(
+                threshold_mask,
+                full_res_seed_point,
+                full_res_guard_mask,
+                full_res_guard_boundary,
+            )
 
-            if (
-                cleaned_component is not None
-                and not np.any(cleaned_component & full_res_guard_boundary)
-            ):
-                contour = find_external_contour(cleaned_component)
+            if candidate is not None:
+                cleaned_component, contour = candidate
                 filled_area = measure_filled_area(contour)
                 roughness = measure_roughness(contour, filled_area)
                 component_area = int(np.count_nonzero(cleaned_component))
