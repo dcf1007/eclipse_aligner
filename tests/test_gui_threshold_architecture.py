@@ -57,11 +57,15 @@ def test_auto_select_calls_both_stages_and_reads_failure_state_without_gui_retry
     del app.threshold_canvas
     calls = []
 
-    def stage_a(gray, result):
+    def stage_a(gray, state):
+        result = cad.AutoThresholdResult(
+            failure_reason="work-resolution separation: no component"
+        )
+        state["auto_threshold_result"] = result
         calls.append(("separation", result))
-        result.failure_reason = "work-resolution separation: no component"
 
-    def stage_b(gray, result):
+    def stage_b(gray, state):
+        result = state["auto_threshold_result"]
         calls.append(("refinement", result))
         return None
 

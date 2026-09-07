@@ -723,13 +723,21 @@ def find_full_res_separation_threshold(
 
 def find_separation_threshold(
     full_res_gray: np.ndarray,
-    auto_threshold_result: AutoThresholdResult,
+    image_state: dict[str, object],
 ) -> None:
-    """Run Auto-T Stage A and fill separation results in the supplied state object."""
+    """Run or reuse Auto-T Stage A, owning creation and Stage-A lifecycle state."""
     if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
         raise ValueError("automatic thresholding requires authoritative 2D uint8 grayscale")
-    if not isinstance(auto_threshold_result, AutoThresholdResult):
-        raise ValueError("Stage A requires an AutoThresholdResult")
+    if not isinstance(image_state, dict):
+        raise ValueError("Stage A requires the current image state")
+
+    auto_threshold_result = image_state.get("auto_threshold_result")
+    if auto_threshold_result is None:
+        auto_threshold_result = AutoThresholdResult()
+        image_state["auto_threshold_result"] = auto_threshold_result
+    elif not isinstance(auto_threshold_result, AutoThresholdResult):
+        raise ValueError("stored Auto-T state must be an AutoThresholdResult or None")
+
     if auto_threshold_result.failure_reason is not None:
         return
     if auto_threshold_result.separation_threshold_complete:
@@ -1187,19 +1195,29 @@ def measure_edge_alignment(
 
 def refine_threshold(
     full_res_gray: np.ndarray,
-    auto_threshold_result: AutoThresholdResult,
+    image_state: dict[str, object],
 ) -> int | None:
     """Run or reuse Auto-T Stage B and return its winning T when available."""
     if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
         raise ValueError("threshold refinement requires authoritative uint8 grayscale")
+    if not isinstance(image_state, dict):
+        raise ValueError("Stage B requires the current image state")
+
+    auto_threshold_result = image_state.get("auto_threshold_result")
     if not isinstance(auto_threshold_result, AutoThresholdResult):
-        raise ValueError("Stage B requires an AutoThresholdResult")
+        find_separation_threshold(full_res_gray, image_state)
+        auto_threshold_result = image_state.get("auto_threshold_result")
+    if not isinstance(auto_threshold_result, AutoThresholdResult):
+        raise ValueError("Stage A returned without establishing AutoThresholdResult")
 
     if (
         auto_threshold_result.failure_reason is None
         and not auto_threshold_result.separation_threshold_complete
     ):
-        find_separation_threshold(full_res_gray, auto_threshold_result)
+        find_separation_threshold(full_res_gray, image_state)
+        auto_threshold_result = image_state.get("auto_threshold_result")
+        if not isinstance(auto_threshold_result, AutoThresholdResult):
+            raise ValueError("Stage A returned without establishing AutoThresholdResult")
 
     if (
         auto_threshold_result.failure_reason is None
@@ -2101,31 +2119,25 @@ class DetectorApp:
         state = self.image_state[self.current_path]
 
         with self.processing_ui():
-            if not isinstance(state.get("auto_threshold_result"), AutoThresholdResult):
-                state["auto_threshold_result"] = AutoThresholdResult()
+            find_separation_threshold(self.gray_image, state)
+            auto_threshold_result = state.get("auto_threshold_result")
+            if not isinstance(auto_threshold_result, AutoThresholdResult):
+                raise ValueError("Stage A returned without establishing AutoThresholdResult")
 
-            find_separation_threshold(
-                self.gray_image,
-                state["auto_threshold_result"],
-            )
             if (
-                state["auto_threshold_result"].full_res_separation_component_mask
-                is not None
+                auto_threshold_result.full_res_separation_component_mask is not None
                 and hasattr(self, "threshold_canvas")
             ):
                 self.render_canvas_content(
                     self.threshold_canvas,
                     decompress_image(
-                        state["auto_threshold_result"].full_res_separation_component_mask
+                        auto_threshold_result.full_res_separation_component_mask
                     ),
                 )
 
-            selected_threshold = refine_threshold(
-                self.gray_image,
-                state["auto_threshold_result"],
-            )
+            selected_threshold = refine_threshold(self.gray_image, state)
             if selected_threshold is None:
-                reason = state["auto_threshold_result"].failure_reason
+                reason = auto_threshold_result.failure_reason
                 self.status.set(
                     "Automatic threshold could not be resolved"
                     + (f" ({reason})." if reason is not None else ".")
@@ -2137,15 +2149,13 @@ class DetectorApp:
             self.commit_setting_change("threshold", selected_threshold)
 
             if (
-                state["auto_threshold_result"].full_res_refined_component_mask is not None
+                auto_threshold_result.full_res_refined_component_mask is not None
                 and hasattr(self, "threshold_canvas")
             ):
                 self.render_canvas_content(
                     self.threshold_canvas,
                     decompress_image(
-                        state[
-                            "auto_threshold_result"
-                        ].full_res_refined_component_mask
+                        auto_threshold_result.full_res_refined_component_mask
                     ),
                 )
 
@@ -2153,9 +2163,9 @@ class DetectorApp:
                 "Automatic grayscale threshold selected: "
                 f"T={selected_threshold} "
                 f"(work-res separation T="
-                f"{state['auto_threshold_result'].work_res_separation_threshold}, "
+                f"{auto_threshold_result.work_res_separation_threshold}, "
                 f"histogram start="
-                f"{state['auto_threshold_result'].histogram_start_threshold}); "
+                f"{auto_threshold_result.histogram_start_threshold}); "
                 "Stage-B refined component displayed."
             )
 

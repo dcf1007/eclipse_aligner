@@ -33,7 +33,7 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
     cv2.circle(gray, (30, 30), 18, 180, -1)
     gray[30, 30] = 240
     result = cad.AutoThresholdResult()
-    cad.find_separation_threshold(gray, result)
+    cad.find_separation_threshold(gray, {"auto_threshold_result": result})
     assert result.separation_threshold_complete
     base_threshold = result.full_res_separation_threshold
 
@@ -47,7 +47,7 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
 
     monkeypatch.setattr(cad, "morphological_cleanup", record)
     monkeypatch.setattr(cad, "measure_edge_alignment", lambda *_: (0.5, 1.0))
-    cad.refine_threshold(gray, result)
+    cad.refine_threshold(gray, {"auto_threshold_result": result})
     # Stage B thresholds once then applies P357 to the existing mask, so no
     # threshold-mode morphology is used during refinement.
     assert seen == []
@@ -61,7 +61,7 @@ def test_refinement_inlines_progressive_p357_cleanup(monkeypatch):
     cv2.circle(gray, (40, 40), 20, 180, -1)
     gray[40, 40] = 240
     result = cad.AutoThresholdResult()
-    cad.find_separation_threshold(gray, result)
+    cad.find_separation_threshold(gray, {"auto_threshold_result": result})
     assert result.separation_threshold_complete
 
     calls = []
@@ -73,6 +73,6 @@ def test_refinement_inlines_progressive_p357_cleanup(monkeypatch):
 
     monkeypatch.setattr(cad, "morphological_cleanup", record)
     monkeypatch.setattr(cad, "measure_edge_alignment", lambda *_: (0.5, 1.0))
-    cad.refine_threshold(gray, result)
+    cad.refine_threshold(gray, {"auto_threshold_result": result})
     assert calls[:3] == [(3, 3), (5, 5), (7, 7)]
     assert len(calls) % 3 == 0
