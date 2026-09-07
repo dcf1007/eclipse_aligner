@@ -148,17 +148,26 @@ def test_solardata_masks_use_shared_self_describing_codec_and_reuse_exact_state(
     gray = np.zeros((81, 81), np.uint8)
     cv2.circle(gray, (40, 40), 18, 180, -1)
     gray[40, 40] = 240
-    state = {"settings": cad.ImageSettings(threshold=100), "auto_threshold_result": None, "solar_data": None}
+    state = {
+        "settings": cad.ImageSettings(threshold=100),
+        "auto_threshold_result": None,
+        "solar_data": None,
+    }
     first = cad.resolve_threshold(gray, 100, state)
     solar = state["solar_data"]
     assert isinstance(solar, cad.SolarData)
     assert np.array_equal(cad.decompress_image(solar.component_mask), first)
-    assert cad.decompress_image(solar.roi_6_5_mask).shape == gray.shape
-    assert cad.decompress_image(solar.guard_19_5_mask).shape == gray.shape
+    guard = cad.decompress_image(solar.guard_mask)
+    assert guard.shape == gray.shape
+    assert guard.dtype == bool
     contour = cad.decompress_contour(solar.component_contour)
     assert contour.dtype == np.int32
     assert contour.ndim == 2 and contour.shape[1] == 2
-    monkeypatch.setattr(cad, 'largest_enclosed_bright_component', lambda *_: (_ for _ in ()).throw(AssertionError('recomputed')))
+    monkeypatch.setattr(
+        cad,
+        "find_separation_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("Auto-T reran")),
+    )
     second = cad.resolve_threshold(gray, 100, state)
-    assert state['solar_data'] is solar
+    assert state["solar_data"] is solar
     assert np.array_equal(second, first)

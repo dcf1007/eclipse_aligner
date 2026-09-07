@@ -29,15 +29,19 @@ def test_commit_threshold_is_state_only_and_clears_canvas():
     assert rendered == [(app.threshold_canvas,None)]
 
 
-def test_commit_threshold_invalidates_mismatched_solardata_only():
-    app=_app()
-    solar=SimpleNamespace(threshold=10)
-    # Need actual SolarData type for isinstance check.
-    solar=cad.SolarData(10,(0,0),b'',b'',b'',cad.compress_contour(np.array([[0,0]],np.int32)))
-    app.image_state['x']['solar_data']=solar
-    app.render_canvas_content=lambda *_:None
-    app.commit_setting_change('threshold',11)
-    assert app.image_state['x']['solar_data'] is None
+def test_commit_threshold_leaves_solardata_lifecycle_to_resolver():
+    app = _app()
+    solar = cad.SolarData(
+        10,
+        (0, 0),
+        b"component",
+        b"guard",
+        cad.compress_contour(np.array([[0, 0]], np.int32)),
+    )
+    app.image_state["x"]["solar_data"] = solar
+    app.render_canvas_content = lambda *_: None
+    app.commit_setting_change("threshold", 11)
+    assert app.image_state["x"]["solar_data"] is solar
 
 
 def test_canvas_resize_renders_only_event_widget_retained_raster():

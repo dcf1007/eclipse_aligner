@@ -33,6 +33,10 @@ def test_removed_cumbersome_helpers_and_old_codecs():
         "master_bgra16_to_display_bgra8",
         "normalize_master_bgra16",
         "master_image_shape",
+        "refine_solar_component_mask",
+        "ROI_DILATION_FRACTION",
+        "\nGUARD_DILATION_FRACTION =",
+        "SOLAR_COMPONENT_KERNEL",
     ):
         assert name not in TEXT
 
@@ -49,6 +53,9 @@ def test_expected_stage_names_and_shared_helpers_exist():
         "def find_separation_threshold(",
         "def refine_threshold(",
         "def find_external_contour(",
+        "def calculate_work_res_shape(",
+        "def derive_full_res_seed_and_guard(",
+        "def extract_separated_seed_component(",
     ):
         assert name in TEXT
 
