@@ -59,9 +59,10 @@ def authoritative_gray(path: Path) -> np.ndarray:
     else:
         raise ValueError(f"unsupported source shape: {source.shape}")
     if master.dtype == np.uint8:
-        master = master.astype(np.uint16) * 257
+        master = master.astype(np.uint16)
+        master *= 257
     gray16 = cv2.cvtColor(np.ascontiguousarray(master, dtype=np.uint16), cv2.COLOR_BGRA2GRAY)
-    return ((gray16.astype(np.uint32) + 128) // 257).astype(np.uint8)
+    return cv2.convertScaleAbs(gray16, alpha=1.0 / 257.0)
 
 
 def frame_for_prefix(corpus: Path, prefix: str) -> Path:

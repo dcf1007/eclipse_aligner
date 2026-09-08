@@ -44,7 +44,10 @@ def test_extract_separated_seed_component_runs_exact_progressive_p357(monkeypatc
 
     monkeypatch.setattr(cad, "morphological_cleanup", record)
     candidate = cad.extract_separated_seed_component(
-        threshold_mask, (46, 40), guard, boundary
+        threshold_mask,
+        (46, 40),
+        cad.bool_mask_to_uint8(guard),
+        np.flatnonzero(boundary),
     )
     assert candidate is not None
     component, contour = candidate
@@ -58,5 +61,8 @@ def test_extract_separated_seed_component_rejects_guard_boundary_contact():
     guard = np.ones((41, 51), bool)
     boundary = cad.find_guard_boundary(guard)
     assert cad.extract_separated_seed_component(
-        threshold_mask, (25, 20), guard, boundary
+        threshold_mask,
+        (25, 20),
+        cad.bool_mask_to_uint8(guard),
+        np.flatnonzero(boundary),
     ) is None

@@ -145,12 +145,15 @@ def test_resolve_threshold_is_atomic_solardata_writer_and_does_not_write_setting
     assert "settings.threshold" not in source
 
 
-def test_resize_redraw_reuses_each_canvas_own_retained_raster():
+def test_resize_redraw_reuses_each_canvas_own_retained_content():
     app = cad.DetectorApp.__new__(cad.DetectorApp)
-    c1 = SimpleNamespace(_unscaled_render_raster=np.ones((2, 3, 4), np.uint8))
-    c2 = SimpleNamespace(_unscaled_render_raster=np.zeros((4, 5, 4), np.uint8))
+    r1 = np.ones((2, 3), np.uint8)
+    r2 = np.zeros((4, 5, 3), np.uint8)
+    c1 = SimpleNamespace(_rendered_content=r1)
+    c2 = SimpleNamespace(_rendered_content=r2)
     calls = []
-    app.render_canvas_content = lambda c, r: calls.append((c, r.copy()))
-    app._handle_canvas_resize(SimpleNamespace(widget=c1)); app._handle_canvas_resize(SimpleNamespace(widget=c2))
-    assert calls[0][0] is c1 and np.array_equal(calls[0][1], c1._unscaled_render_raster)
-    assert calls[1][0] is c2 and np.array_equal(calls[1][1], c2._unscaled_render_raster)
+    app.render_canvas_content = lambda c, r: calls.append((c, r))
+    app._finish_canvas_resize(c1)
+    app._finish_canvas_resize(c2)
+    assert calls[0] == (c1, r1)
+    assert calls[1] == (c2, r2)

@@ -115,3 +115,30 @@ def test_gui_button_callbacks_name_the_widget_boundary():
         "full_button_clicked",
     ):
         assert f"def {name}(" in TEXT
+
+
+def test_stageb_converts_full_resolution_gray_to_float32_once_before_candidate_loop():
+    refine_block = TEXT.split("def refine_threshold(", 1)[1].split("\n\ndef ", 1)[0]
+    profile_block = TEXT.split("def sample_grayscale_profiles(", 1)[1].split("\n\ndef ", 1)[0]
+    assert refine_block.count("full_res_gray.astype(np.float32)") == 1
+    assert "full_res_gray.astype(np.float32" not in profile_block
+
+
+def test_bool_mask_conversion_is_centralized_without_np_where_integer_intermediates():
+    assert "def bool_mask_to_uint8(" in TEXT
+    assert "mask_u8 = mask.astype(np.uint8)" in TEXT
+    assert "mask_u8 *= 255" in TEXT
+    assert "np.where(source != 0, 255, 0)" not in TEXT
+    assert "np.where(binary_mask != 0, 255, 0)" not in TEXT
+    assert "np.where(component != 0, 255, 0)" not in TEXT
+
+
+def test_canvas_renderer_uses_rendered_content_and_raw_png_bytes_without_base64():
+    renderer = TEXT.split("    def render_canvas_content(self, canvas, content):", 1)[1].split(
+        "\n\ndef main():", 1
+    )[0]
+    assert "_rendered_content" in renderer
+    assert "_unscaled_render_raster" not in TEXT
+    assert "import base64" not in TEXT
+    assert "data=encoded_png.tobytes()" in renderer
+    assert 'anchor="nw"' in renderer

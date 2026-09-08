@@ -171,3 +171,48 @@ def test_solardata_masks_use_shared_self_describing_codec_and_reuse_exact_state(
     second = cad.resolve_threshold(gray, 100, state)
     assert state["solar_data"] is solar
     assert np.array_equal(second, first)
+
+
+def test_image_compressor_preserves_established_payload_bytes_without_full_image_copies():
+    def established_compressor(image):
+        image = np.asarray(image)
+        if image.ndim == 2:
+            height, width = image.shape
+            channels = 0
+        else:
+            height, width, channels = image.shape
+
+        if image.dtype == bool:
+            bit_depth = 1
+            encoded_pixels = np.packbits(image.reshape(-1)).tobytes()
+        elif image.dtype == np.uint8:
+            bit_depth = 8
+            encoded_pixels = np.ascontiguousarray(image).tobytes()
+        elif image.dtype == np.uint16:
+            bit_depth = 16
+            encoded_pixels = np.ascontiguousarray(
+                image.astype(np.dtype("<u2"), copy=False)
+            ).tobytes()
+        else:
+            raise AssertionError("test input must use a supported codec dtype")
+
+        header = struct.pack("<IIBB", height, width, channels, bit_depth)
+        return zlib.compress(header + encoded_pixels, level=1)
+
+    mask = np.zeros((13, 17), dtype=bool)
+    mask[2:10, 3:15] = True
+    gray8 = np.arange(15 * 19, dtype=np.uint8).reshape(15, 19)
+    bgra16 = (
+        np.arange(9 * 11 * 4, dtype=np.uint16).reshape(9, 11, 4) * 137
+    )
+
+    # Include non-contiguous 8- and 16-bit views because the established codec
+    # accepted them through np.ascontiguousarray().
+    for image in (
+        mask,
+        gray8,
+        gray8[:, ::2],
+        bgra16,
+        bgra16[::2, ::2],
+    ):
+        assert cad.compress_image(image) == established_compressor(image)

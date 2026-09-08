@@ -59,7 +59,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
     cv2.circle(mask, (110, 110), 55, 255, -1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     contour = contours[0].reshape(-1, 2).astype(np.int32)
-    profiles, lengths = cad.sample_grayscale_profiles(gray, contour)
+    profiles, lengths = cad.sample_grayscale_profiles(gray.astype(np.float32), contour)
     assert profiles.shape[1] == 2 * cad.EDGE_PROFILE_RADIUS_PX + 1
     assert len(profiles) == len(lengths)
     assert 0 < len(profiles) < len(contour)
@@ -69,7 +69,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
 def test_clean_error_function_edge_gets_high_reliability_and_finite_distance():
     gray = _erf_edge_image(center=120.0, sigma=3.0)
     contour = _rectangle_contour(45, 45, 116, 174)
-    distance, reliability = cad.measure_edge_alignment(gray, contour)
+    distance, reliability = cad.measure_edge_alignment(gray.astype(np.float32), contour)
     assert math.isfinite(distance)
     assert 0.0 <= distance < 15.0
     assert reliability > 0.25
@@ -81,8 +81,8 @@ def test_non_sigmoid_profile_reduces_edge_reliability():
     disturbance = 55.0 * np.sin((x - 105.0) * math.pi / 6.0)
     disturbed = np.clip(clean.astype(np.float64) + disturbance[None, :], 0, 255).astype(np.uint8)
     contour = _rectangle_contour(45, 45, 116, 174)
-    _, clean_reliability = cad.measure_edge_alignment(clean, contour)
-    _, disturbed_reliability = cad.measure_edge_alignment(disturbed, contour)
+    _, clean_reliability = cad.measure_edge_alignment(clean.astype(np.float32), contour)
+    _, disturbed_reliability = cad.measure_edge_alignment(disturbed.astype(np.float32), contour)
     assert disturbed_reliability < clean_reliability
 
 

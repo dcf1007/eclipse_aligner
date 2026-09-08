@@ -59,7 +59,6 @@ horizon special case in automatic threshold selection.
 
 
 import argparse
-import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
 import math
@@ -79,16 +78,20 @@ IMAGE_FILE_TYPES = (
 )
 
 SLIDER_KEY_RELEASE_SETTLE_MS = 45
+CANVAS_RESIZE_SETTLE_MS = 100
 
 
 # ---------------------------------------------------------------------------
 # Generic image and kernel utilities
 # ---------------------------------------------------------------------------
-def transparent_bgra(width: int = 1, height: int = 1) -> np.ndarray:
-    """Return a BGRA frame whose pixels are fully transparent (alpha = 0)."""
-    if width <= 0 or height <= 0:
-        raise ValueError("transparent raster dimensions must be positive")
-    return np.zeros((height, width, 4), dtype=np.uint8)
+def bool_mask_to_uint8(mask: np.ndarray) -> np.ndarray:
+    """Convert one two-dimensional bool mask to uint8 values 0/255."""
+    mask = np.asarray(mask)
+    if mask.ndim != 2 or mask.dtype != bool:
+        raise ValueError("mask must be a two-dimensional bool array")
+    mask_u8 = mask.astype(np.uint8)
+    mask_u8 *= 255
+    return mask_u8
 
 
 def generate_kernel(
@@ -136,7 +139,7 @@ def morphological_cleanup(
     else:
         if source.ndim != 2 or source.dtype not in (bool, np.uint8):
             raise ValueError("binary morphology requires a 2D bool or uint8 mask")
-        cleaned = np.where(source != 0, 255, 0).astype(np.uint8)
+        cleaned = bool_mask_to_uint8(source if source.dtype == bool else source != 0)
 
     cleaned = cv2.morphologyEx(
         cleaned,
@@ -169,7 +172,7 @@ def resize_img(
 
     if mask:
         # OpenCV cannot resize bool directly; preserve mask membership with exact nearest.
-        resize_source = img.astype(np.uint8) if img.dtype == bool else img
+        resize_source = bool_mask_to_uint8(img) if img.dtype == bool else img
         interpolation = cv2.INTER_NEAREST_EXACT
     elif height < original_height or width < original_width:
         resize_source = img
@@ -210,16 +213,16 @@ def compress_image(image: np.ndarray) -> bytes:
                 "1-bit images must have no explicit channel axis or exactly one channel"
             )
         bit_depth = 1
-        encoded_pixels = np.packbits(image.reshape(-1)).tobytes()
+        encoded_pixels = np.packbits(image.reshape(-1))
     elif image.dtype == np.uint8:
         bit_depth = 8
-        encoded_pixels = np.ascontiguousarray(image).tobytes()
+        encoded_pixels = np.ascontiguousarray(image)
     elif image.dtype == np.uint16:
         bit_depth = 16
         # Persist uint16 samples in an explicit byte order rather than native endian.
         encoded_pixels = np.ascontiguousarray(
             image.astype(np.dtype("<u2"), copy=False)
-        ).tobytes()
+        )
     else:
         raise ValueError("image dtype must be bool, uint8, or uint16")
 
@@ -228,7 +231,22 @@ def compress_image(image: np.ndarray) -> bytes:
         raise ValueError("image shape does not match its declared channel structure")
 
     header = struct.pack("<IIBB", height, width, channels, bit_depth)
-    return zlib.compress(header + encoded_pixels, level=1)
+
+    # Give zlib a byte view of the existing contiguous pixel storage instead of
+    # image.tobytes(), which would allocate another complete copy of the image.
+    encoded_pixel_bytes = memoryview(encoded_pixels).cast("B")
+
+    # Compress the header and pixels as one continuous zlib stream without first
+    # constructing header + encoded_pixels, which would make another full-size
+    # uncompressed copy.
+    compressor = zlib.compressobj(level=1)
+    return b"".join(
+        (
+            compressor.compress(header),
+            compressor.compress(encoded_pixel_bytes),
+            compressor.flush(),
+        )
+    )
 
 
 def decompress_image(payload: bytes) -> np.ndarray:
@@ -248,7 +266,7 @@ def decompress_image(payload: bytes) -> np.ndarray:
             f"compressed image has unsupported channel count: {channels}"
         )
 
-    encoded_pixels = raw[header_size:]
+    encoded_pixel_byte_count = len(raw) - header_size
     samples_per_pixel = 1 if channels == 0 else channels
     sample_count = height * width * samples_per_pixel
     shape = (height, width) if channels == 0 else (height, width, channels)
@@ -260,12 +278,20 @@ def decompress_image(payload: bytes) -> np.ndarray:
                 "or exactly one channel"
             )
         expected_bytes = (sample_count + 7) // 8
-        if len(encoded_pixels) != expected_bytes:
+        if encoded_pixel_byte_count != expected_bytes:
             raise ValueError(
-                f"compressed 1-bit image has {len(encoded_pixels)} bytes; "
+                f"compressed 1-bit image has {encoded_pixel_byte_count} bytes; "
                 f"expected {expected_bytes}"
             )
-        packed = np.frombuffer(encoded_pixels, dtype=np.uint8)
+
+        # Read the packed pixels directly from the decompressed payload after its
+        # header. Using an offset avoids copying the complete pixel payload.
+        packed = np.frombuffer(
+            raw,
+            dtype=np.uint8,
+            count=expected_bytes,
+            offset=header_size,
+        )
         return np.unpackbits(packed, count=sample_count).reshape(shape) != 0
 
     if bit_depth == 8:
@@ -278,13 +304,20 @@ def decompress_image(payload: bytes) -> np.ndarray:
         raise ValueError(f"unsupported compressed image bit depth: {bit_depth}")
 
     expected_bytes = sample_count * bytes_per_sample
-    if len(encoded_pixels) != expected_bytes:
+    if encoded_pixel_byte_count != expected_bytes:
         raise ValueError(
-            f"compressed image pixel payload has {len(encoded_pixels)} bytes; "
+            f"compressed image pixel payload has {encoded_pixel_byte_count} bytes; "
             f"expected {expected_bytes}"
         )
 
-    restored = np.frombuffer(encoded_pixels, dtype=dtype).reshape(shape)
+    # Interpret the pixel portion of raw directly instead of creating
+    # raw[header_size:], which would duplicate the complete decompressed image.
+    restored = np.frombuffer(
+        raw,
+        dtype=dtype,
+        count=sample_count,
+        offset=header_size,
+    ).reshape(shape)
     return restored.astype(np.uint16, copy=False) if bit_depth == 16 else restored
 
 
@@ -451,7 +484,7 @@ def brightest_supported_component_point(
     The caller owns support geometry and the meaning of an unavailable point. Empty
     or unsupported components return ``None``; malformed caller inputs remain errors.
     """
-    source = (np.asarray(component) != 0).astype(np.uint8)
+    source = bool_mask_to_uint8(np.asarray(component) != 0)
     support_kernel = np.asarray(support_kernel, dtype=np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
@@ -481,7 +514,7 @@ def brightest_supported_component_point(
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (binary != 0).astype(np.uint8),
+        bool_mask_to_uint8(binary != 0),
         connectivity=8,
     )
     height, width = binary.shape
@@ -553,7 +586,7 @@ def extract_component(
     if binary_mask[seed_y, seed_x] == 0:
         return None
 
-    flood = np.where(binary_mask != 0, 255, 0).astype(np.uint8)
+    flood = bool_mask_to_uint8(binary_mask != 0)
     cv2.floodFill(flood, None, (seed_x, seed_y), 128, flags=8)
     component = flood == 128
     return component if np.any(component) else None
@@ -623,7 +656,7 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     # distanceTransform measures each non-component pixel's L2 distance to the
     # nearest zero pixel, so encode the component itself as zero and threshold the
     # resulting full-frame distance field at the requested dilation margin.
-    outside = np.where(component, 0, 255).astype(np.uint8)
+    outside = bool_mask_to_uint8(~component)
     distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
     return distance <= margin
 
@@ -633,7 +666,7 @@ def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
     if guard_mask.ndim != 2 or not np.any(guard_mask):
         raise ValueError("guard must be a non-empty two-dimensional mask")
 
-    guard_u8 = np.where(guard_mask, 255, 0).astype(np.uint8)
+    guard_u8 = bool_mask_to_uint8(guard_mask != 0)
     eroded_guard = cv2.erode(
         guard_u8,
         GUARD_BOUNDARY_KERNEL,
@@ -669,6 +702,8 @@ def find_full_res_separation_threshold(
         raise ValueError("full-resolution tracking seed lies outside the Auto-T guard")
 
     full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
+    full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
+    full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
 
     # Evaluate the starting T after the fixed D7 cleanup used by coarse separation.
     binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, start_T)
@@ -676,14 +711,14 @@ def find_full_res_separation_threshold(
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
         )
-    binary[~full_res_guard_mask] = 0
+    cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
     component = extract_component(binary, full_res_seed_point)
     if component is None:
         raise ValueError(
             "full-resolution tracking seed disappeared after clipping to its containing guard"
         )
 
-    if not np.any(component & full_res_guard_boundary):
+    if not np.any(component.ravel()[full_res_guard_boundary_indices]):
         best_T = start_T
         best_component = component
         for threshold in range(start_T - 1, -1, -1):
@@ -692,13 +727,13 @@ def find_full_res_separation_threshold(
                 SEPARATION_KERNEL,
                 threshold,
             )
-            binary[~full_res_guard_mask] = 0
+            cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
             component = extract_component(binary, full_res_seed_point)
             if component is None:
                 raise ValueError(
                     "tracked full-resolution seed component disappeared while lowering T"
                 )
-            if np.any(component & full_res_guard_boundary):
+            if np.any(component.ravel()[full_res_guard_boundary_indices]):
                 break
             best_T = threshold
             best_component = component
@@ -708,13 +743,13 @@ def find_full_res_separation_threshold(
         binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, threshold)
         if binary[seed_y, seed_x] == 0:
             break
-        binary[~full_res_guard_mask] = 0
+        cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
         component = extract_component(binary, full_res_seed_point)
         if component is None:
             raise ValueError(
                 "full-resolution tracking seed disappeared after surviving D7 cleanup"
             )
-        if not np.any(component & full_res_guard_boundary):
+        if not np.any(component.ravel()[full_res_guard_boundary_indices]):
             return threshold, component
 
     raise ThresholdResolutionError(
@@ -899,7 +934,7 @@ def find_external_contour(component: np.ndarray) -> np.ndarray:
     """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
     if component.ndim != 2 or not np.any(component):
         raise ValueError("solar component is empty or not two-dimensional")
-    component_u8 = np.where(component != 0, 255, 0).astype(np.uint8)
+    component_u8 = bool_mask_to_uint8(component != 0)
     contours, _ = cv2.findContours(
         component_u8,
         cv2.RETR_EXTERNAL,
@@ -954,10 +989,12 @@ def measure_hole_quality(
 
 
 def sample_grayscale_profiles(
-    full_res_gray: np.ndarray,
+    full_res_gray_float: np.ndarray,
     contour: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return one averaged outward grayscale profile per raster-scale polygon side."""
+    if full_res_gray_float.ndim != 2 or full_res_gray_float.dtype != np.float32:
+        raise ValueError("edge-profile grayscale must be a two-dimensional float32 array")
     radius = EDGE_PROFILE_RADIUS_PX
     profile_width = 2 * radius + 1
     empty = (
@@ -993,8 +1030,7 @@ def sample_grayscale_profiles(
     counts = np.maximum(1, np.ceil(lengths).astype(np.int32))
 
     offsets = np.arange(-radius, radius + 1, dtype=np.float32)
-    height, width = full_res_gray.shape
-    full_res_gray_float = full_res_gray.astype(np.float32, copy=False)
+    height, width = full_res_gray_float.shape
     bases: list[np.ndarray] = []
     kept_outwards: list[np.ndarray] = []
     sample_counts: list[int] = []
@@ -1059,11 +1095,11 @@ def sample_grayscale_profiles(
 
 
 def measure_edge_alignment(
-    full_res_gray: np.ndarray,
+    full_res_gray_float: np.ndarray,
     contour: np.ndarray,
 ) -> tuple[float, float]:
     """Return photometric edge distance and image-local profile reliability."""
-    profiles, segment_lengths = sample_grayscale_profiles(full_res_gray, contour)
+    profiles, segment_lengths = sample_grayscale_profiles(full_res_gray_float, contour)
     if len(profiles) == 0:
         return math.nan, 0.0
 
@@ -1250,16 +1286,16 @@ def measure_edge_alignment(
 def extract_separated_seed_component(
     threshold_mask: np.ndarray,
     seed_point: tuple[int, int],
-    guard_mask: np.ndarray,
-    guard_boundary: np.ndarray,
+    guard_u8: np.ndarray,
+    guard_boundary_indices: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Return the P3/P5/P7-cleaned seeded component and contour when separated."""
     cleaned = threshold_mask
     for kernel in SOLAR_CLEANUP_KERNELS:
         cleaned = morphological_cleanup(cleaned, kernel)
-    cleaned[~guard_mask] = 0
+    cv2.bitwise_and(cleaned, guard_u8, dst=cleaned)
     component = extract_component(cleaned, seed_point)
-    if component is None or np.any(component & guard_boundary):
+    if component is None or np.any(component.ravel()[guard_boundary_indices]):
         return None
     return component, find_external_contour(component)
 
@@ -1299,6 +1335,9 @@ def refine_threshold(
 
     try:
         full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
+        full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
+        full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
+        full_res_gray_float = full_res_gray.astype(np.float32)
         measurements: list[ThresholdMeasurement] = []
         compressed_masks: dict[int, bytes] = {}
         candidate_contours: dict[int, np.ndarray] = {}
@@ -1312,8 +1351,8 @@ def refine_threshold(
             candidate = extract_separated_seed_component(
                 threshold_mask,
                 full_res_seed_point,
-                full_res_guard_mask,
-                full_res_guard_boundary,
+                full_res_guard_u8,
+                full_res_guard_boundary_indices,
             )
 
             if candidate is not None:
@@ -1327,7 +1366,7 @@ def refine_threshold(
                     filled_area,
                 )
                 edge_distance, edge_reliability = measure_edge_alignment(
-                    full_res_gray,
+                    full_res_gray_float,
                     contour,
                 )
                 measurements.append(
@@ -1347,11 +1386,13 @@ def refine_threshold(
             # Measure the first separated raw component once, then stop evaluating raw.
             if raw_reference_area is None:
                 raw_mask = threshold_mask.copy()
-                raw_mask[~full_res_guard_mask] = 0
+                cv2.bitwise_and(raw_mask, full_res_guard_u8, dst=raw_mask)
                 raw_component = extract_component(raw_mask, full_res_seed_point)
                 if (
                     raw_component is not None
-                    and not np.any(raw_component & full_res_guard_boundary)
+                    and not np.any(
+                        raw_component.ravel()[full_res_guard_boundary_indices]
+                    )
                 ):
                     raw_contour = find_external_contour(raw_component)
                     raw_reference_area = measure_filled_area(raw_contour)
@@ -1608,12 +1649,14 @@ def resolve_threshold(
             )
 
         full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
+        full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
+        full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
         threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
         candidate = extract_separated_seed_component(
             threshold_mask,
             full_res_seed_point,
-            full_res_guard_mask,
-            full_res_guard_boundary,
+            full_res_guard_u8,
+            full_res_guard_boundary_indices,
         )
         if candidate is None:
             raise ThresholdResolutionError(
@@ -1773,15 +1816,9 @@ class DetectorApp:
                     self.master_image_payload = None
                     self.gray_image = None
                     if hasattr(self, "threshold_canvas"):
-                        self.render_canvas_content(
-                            self.threshold_canvas,
-                            transparent_bgra(),
-                        )
+                        self.render_canvas_content(self.threshold_canvas, None)
                     if hasattr(self, "color_canvas"):
-                        self.render_canvas_content(
-                            self.color_canvas,
-                            transparent_bgra(),
-                        )
+                        self.render_canvas_content(self.color_canvas, None)
                     self.status.set(f"Could not load image: {path}")
                     return
 
@@ -1802,21 +1839,24 @@ class DetectorApp:
                 else:
                     raise ValueError(f"unsupported master image shape: {source.shape}")
                 if master_image.dtype == np.uint8:
-                    master_image = master_image.astype(np.uint16) * 257
+                    master_image = master_image.astype(np.uint16)
+                    master_image *= 257
                 master_image = np.ascontiguousarray(master_image, dtype=np.uint16)
 
-                # Authoritative threshold processing is always uint8 grayscale derived
-                # directly from the lossless master with the fixed full-range mapping.
-                gray16 = cv2.cvtColor(master_image, cv2.COLOR_BGRA2GRAY)
-                self.gray_image = (
-                    (gray16.astype(np.uint32) + 128) // 257
-                ).astype(np.uint8)
+                # The unchanged source has now served its only purpose: constructing the
+                # normalized lossless master. Drop those references before allocating any
+                # additional full-resolution representations.
+                del source
+                del unchanged_image
 
-                # The canvas receives an explicit uint8 display raster. The master itself
-                # remains untouched and retained losslessly for later transforms/export.
-                display_image = (
-                    (master_image.astype(np.uint32) + 128) // 257
-                ).astype(np.uint8)
+                # Authoritative threshold processing is always uint8 grayscale derived
+                # directly from the lossless master with the exact full-range mapping.
+                gray16 = cv2.cvtColor(master_image, cv2.COLOR_BGRA2GRAY)
+                self.gray_image = cv2.convertScaleAbs(
+                    gray16,
+                    alpha=1.0 / 257.0,
+                )
+                del gray16
 
                 if path in self.image_state:
                     state = self.image_state[path]
@@ -1834,10 +1874,15 @@ class DetectorApp:
 
                 # Retain the exact master in the shared self-describing array format.
                 self.master_image_payload = compress_image(master_image)
+                del master_image
 
-                # First visible processing stage: source color + authoritative grayscale.
+                # First visible processing stage: lossless source color + authoritative
+                # grayscale. The color canvas retains the already-compressed master.
                 if hasattr(self, "color_canvas"):
-                    self.render_canvas_content(self.color_canvas, display_image)
+                    self.render_canvas_content(
+                        self.color_canvas,
+                        self.master_image_payload,
+                    )
                 if hasattr(self, "threshold_canvas"):
                     self.render_canvas_content(
                         self.threshold_canvas,
@@ -2412,29 +2457,13 @@ class DetectorApp:
                 return
 
             if hasattr(self, "threshold_canvas"):
-                # render_canvas_content() retains bool masks as canonical uint8 BGRA.
-                # Compare the desired canonical mask directly with that retained raster
-                # so restoring defaults does not repaint an already-identical pane, while
-                # stale horizon/ellipse overlays are still cleared back to the plain mask.
-                component_raster = cv2.cvtColor(
-                    np.where(refined_component != 0, 255, 0).astype(np.uint8),
-                    cv2.COLOR_GRAY2BGRA,
-                )
-                displayed_raster = getattr(
+                # The processing pane retains the plain solar mask as 2D uint8.
+                # render_canvas_content() owns byte-equivalence and repaint decisions,
+                # including replacement of stale downstream BGR overlays.
+                self.render_canvas_content(
                     self.threshold_canvas,
-                    "_unscaled_render_raster",
-                    None,
+                    bool_mask_to_uint8(refined_component != 0),
                 )
-                if (
-                    displayed_raster is None
-                    or displayed_raster.shape != component_raster.shape
-                    or displayed_raster.dtype != component_raster.dtype
-                    or not np.array_equal(displayed_raster, component_raster)
-                ):
-                    self.render_canvas_content(
-                        self.threshold_canvas,
-                        refined_component,
-                    )
 
             self.status.set(
                 f"{setting_name} applied; SolarData synchronized at T={threshold}."
@@ -2601,76 +2630,133 @@ class DetectorApp:
 
 
     def _handle_canvas_resize(self, event):
-        """Refit only the resized canvas from its retained unscaled display raster."""
+        """Refit once after a canvas resize interaction has settled."""
         canvas = event.widget
-        unscaled_raster = getattr(canvas, "_unscaled_render_raster", None)
-        if unscaled_raster is not None:
-            self.render_canvas_content(canvas, unscaled_raster)
+        pending_job = getattr(canvas, "_resize_render_job", None)
+        if pending_job is not None:
+            self.root.after_cancel(pending_job)
+        canvas._resize_render_job = self.root.after(
+            CANVAS_RESIZE_SETTLE_MS,
+            self._finish_canvas_resize,
+            canvas,
+        )
+
+    def _finish_canvas_resize(self, canvas):
+        """Render retained canvas content once after resize events stop arriving."""
+        canvas._resize_render_job = None
+        rendered_content = getattr(canvas, "_rendered_content", None)
+        if rendered_content is not None:
+            self.render_canvas_content(canvas, rendered_content)
 
 
     def render_canvas_content(self, canvas, content):
-        """Render supplied content, retain its unscaled raster, flush Tk repaint work."""
-        if content is None:
-            # Use the canonical transparent placeholder when no raster is supplied.
-            unscaled_render_raster = transparent_bgra()
-        else:
-            unscaled_render_raster = np.asarray(content)
-            if unscaled_render_raster.dtype == bool and unscaled_render_raster.ndim == 2:
-                unscaled_render_raster = cv2.cvtColor(
-                    np.where(unscaled_render_raster, 255, 0).astype(np.uint8),
-                    cv2.COLOR_GRAY2BGRA,
+        """Retain supplied content and render only when pixels or viewport changed."""
+        if content is not None and not isinstance(content, (bytes, np.ndarray)):
+            raise ValueError(
+                "canvas content must be None, compressed image bytes, or a NumPy array"
+            )
+
+        previous_content = getattr(canvas, "_rendered_content", None)
+        decoded_content = None
+
+        if content is previous_content:
+            equivalent = True
+        elif content is None or previous_content is None:
+            equivalent = content is None and previous_content is None
+        elif isinstance(content, bytes):
+            if isinstance(previous_content, bytes):
+                equivalent = content == previous_content
+            elif isinstance(previous_content, np.ndarray):
+                decoded_content = decompress_image(content)
+                equivalent = (
+                    decoded_content.dtype == previous_content.dtype
+                    and decoded_content.shape == previous_content.shape
+                    and np.array_equal(decoded_content, previous_content)
                 )
-            elif (
-                unscaled_render_raster.dtype == np.uint8
-                and unscaled_render_raster.ndim == 2
-            ):
-                unscaled_render_raster = cv2.cvtColor(
-                    unscaled_render_raster,
-                    cv2.COLOR_GRAY2BGRA,
-                )
-            elif not (
-                unscaled_render_raster.dtype == np.uint8
-                and unscaled_render_raster.ndim == 3
-                and unscaled_render_raster.shape[2] == 4
-            ):
+            else:
                 raise ValueError(
-                    "canvas content must be a 2D bool mask, 2D uint8 grayscale, "
-                    "or uint8 BGRA image"
+                    "retained canvas content must be None, compressed image bytes, "
+                    "or a NumPy array"
                 )
+        elif isinstance(previous_content, bytes):
+            decoded_previous_content = decompress_image(previous_content)
+            equivalent = (
+                content.dtype == decoded_previous_content.dtype
+                and content.shape == decoded_previous_content.shape
+                and np.array_equal(content, decoded_previous_content)
+            )
+        elif isinstance(previous_content, np.ndarray):
+            equivalent = (
+                content.dtype == previous_content.dtype
+                and content.shape == previous_content.shape
+                and np.array_equal(content, previous_content)
+            )
+        else:
+            raise ValueError(
+                "retained canvas content must be None, compressed image bytes, "
+                "or a NumPy array"
+            )
 
-        # Canvas-owned display cache retains exactly the normalized unscaled raster.
-        canvas._unscaled_render_raster = unscaled_render_raster.copy()
+        # Retain exactly the representation supplied by the caller. Immutable bytes
+        # stay compressed; ndarray content is retained by reference rather than copied.
+        canvas._rendered_content = content
 
-        # Tk may transiently report a 1-pixel unrealized canvas during initial layout;
-        # this clamp is GUI lifecycle handling, not image-geometry repair.
-        canvas_width = max(2, canvas.winfo_width() - 2)
-        canvas_height = max(2, canvas.winfo_height() - 2)
-        raster_height, raster_width = unscaled_render_raster.shape[:2]
-        scale = min(canvas_width / raster_width, canvas_height / raster_height)
-        fitted_shape = (
-            round(raster_height * scale),
-            round(raster_width * scale),
+        # NumPy and resize_img both use (height, width), so keep that ordering here.
+        canvas_shape = np.asarray(
+            (
+                max(2, canvas.winfo_height() - 2),
+                max(2, canvas.winfo_width() - 2),
+            )
+        )
+        canvas_size = tuple(int(value) for value in canvas_shape)
+
+        if (
+            equivalent
+            and getattr(canvas, "_rendered_canvas_size", None) == canvas_size
+        ):
+            return
+
+        if content is None:
+            canvas.delete("all")
+            canvas._tk_photo_image = None
+            canvas._rendered_canvas_size = canvas_size
+            self.root.update_idletasks()
+            return
+
+        # Only now has rendering been selected. Reuse a decompression already required
+        # for cross-representation equivalence; otherwise decode compressed content once.
+        if decoded_content is not None:
+            render_raster = decoded_content
+        elif isinstance(content, bytes):
+            render_raster = decompress_image(content)
+        else:
+            render_raster = content
+
+        raster_shape = np.asarray(render_raster.shape[:2])
+        scale = np.min(canvas_shape / raster_shape)
+        fitted_shape = tuple(
+            int(value) for value in np.rint(raster_shape * scale)
         )
 
-        # Resize the retained raster to the exact fitted canvas dimensions.
-        scaled_raster = resize_img(unscaled_render_raster, fitted_shape)
+        scaled_raster = resize_img(render_raster, fitted_shape)
         ok, encoded_png = cv2.imencode(".png", scaled_raster)
         if not ok:
             raise ValueError("could not encode canvas content")
 
         tk_photo = tk.PhotoImage(
-            data=base64.b64encode(encoded_png).decode("ascii"),
+            data=encoded_png.tobytes(),
             format="png",
         )
         canvas.delete("all")
         canvas.create_image(
-            canvas_width // 2 + 1,
-            canvas_height // 2 + 1,
+            0,
+            0,
             image=tk_photo,
-            anchor="center",
+            anchor="nw",
         )
         # Tk does not retain the Python PhotoImage object. Keep it alive while displayed.
         canvas._tk_photo_image = tk_photo
+        canvas._rendered_canvas_size = canvas_size
 
         # Flush pending repaint work before synchronous processing continues.
         self.root.update_idletasks()

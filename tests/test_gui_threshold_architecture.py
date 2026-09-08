@@ -64,7 +64,7 @@ def test_apply_changed_setting_persists_then_renders_grayscale_and_refined_compo
     assert app.image_state["x"]["settings"].threshold == 11
     assert calls[0][1] == 11
     assert np.array_equal(rendered[0][1], app.gray_image)
-    assert np.array_equal(rendered[1][1], refined)
+    assert np.array_equal(rendered[1][1], cad.bool_mask_to_uint8(refined))
     assert app.image_state["x"]["solar_data"].threshold == 11
 
 
@@ -83,33 +83,31 @@ def test_apply_changed_setting_failure_leaves_grayscale_displayed(monkeypatch):
     assert "SolarData could not be established" in app.status.get()
 
 
-def test_nonthreshold_setting_keeps_identical_plain_mask_without_repaint(monkeypatch):
+def test_nonthreshold_setting_delegates_plain_mask_repaint_decision_to_renderer(monkeypatch):
     app = _app()
     calls = []
     refined = np.ones_like(app.gray_image, bool)
-    component_raster = cad.cv2.cvtColor(
-        np.where(refined, 255, 0).astype(np.uint8),
-        cad.cv2.COLOR_GRAY2BGRA,
-    )
-    app.threshold_canvas._unscaled_render_raster = component_raster.copy()
     monkeypatch.setattr(
         cad,
         "resolve_threshold",
         lambda gray, threshold, state: calls.append(threshold) or refined,
     )
     rendered = []
-    app.render_canvas_content = lambda *args: rendered.append(args)
+    app.render_canvas_content = lambda canvas, content: rendered.append(
+        (canvas, np.asarray(content).copy())
+    )
     app.apply_changed_setting("min_radius", 1100)
     assert app.image_state["x"]["settings"].min_radius == 1100
     assert calls == [10]
-    assert rendered == []
+    assert len(rendered) == 1
+    assert np.array_equal(rendered[0][1], cad.bool_mask_to_uint8(refined))
 
 
 def test_nonthreshold_setting_clears_stale_downstream_overlay_to_plain_mask(monkeypatch):
     app = _app()
     refined = np.ones_like(app.gray_image, bool)
-    app.threshold_canvas._unscaled_render_raster = np.zeros(
-        (*app.gray_image.shape, 4), dtype=np.uint8
+    app.threshold_canvas._rendered_content = np.zeros(
+        (*app.gray_image.shape, 3), dtype=np.uint8
     )
     monkeypatch.setattr(cad, "resolve_threshold", lambda *_: refined)
     rendered = []
@@ -118,7 +116,7 @@ def test_nonthreshold_setting_clears_stale_downstream_overlay_to_plain_mask(monk
     )
     app.apply_changed_setting("min_radius", 1100)
     assert len(rendered) == 1
-    assert np.array_equal(rendered[0], refined)
+    assert np.array_equal(rendered[0], cad.bool_mask_to_uint8(refined))
 
 
 def test_apply_changed_setting_does_not_hide_valueerror(monkeypatch):
@@ -134,14 +132,15 @@ def test_apply_changed_setting_does_not_hide_valueerror(monkeypatch):
         app.apply_changed_setting("threshold", 11)
 
 
-def test_canvas_resize_renders_only_event_widget_retained_raster():
+def test_canvas_resize_completion_renders_only_event_widget_retained_content():
     app = cad.DetectorApp.__new__(cad.DetectorApp)
-    canvas = SimpleNamespace(_unscaled_render_raster=np.ones((2, 3, 4), np.uint8))
+    retained = np.ones((2, 3, 3), np.uint8)
+    canvas = SimpleNamespace(_rendered_content=retained)
     calls = []
-    app.render_canvas_content = lambda c, r: calls.append((c, r.copy()))
-    app._handle_canvas_resize(SimpleNamespace(widget=canvas))
+    app.render_canvas_content = lambda c, r: calls.append((c, r))
+    app._finish_canvas_resize(canvas)
     assert len(calls) == 1 and calls[0][0] is canvas
-    assert np.array_equal(calls[0][1], canvas._unscaled_render_raster)
+    assert calls[0][1] is retained
 
 
 def test_auto_select_button_calls_parent_then_apply_changed_setting(monkeypatch):

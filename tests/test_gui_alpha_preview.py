@@ -14,13 +14,6 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 
 
-def test_transparent_bgra_has_real_alpha_channel():
-    frame = module.transparent_bgra(7, 5)
-    assert frame.shape == (5, 7, 4)
-    assert frame.dtype == np.uint8
-    assert np.all(frame[:, :, 3] == 0)
-
-
 def test_loaded_bgr_becomes_lossless_opaque_uint16_bgra(tmp_path, monkeypatch):
     source = np.zeros((3, 4, 3), np.uint8)
     source[:, :, 1] = 123
@@ -54,13 +47,16 @@ def test_loaded_bgr_becomes_lossless_opaque_uint16_bgra(tmp_path, monkeypatch):
     assert master.dtype == np.uint16
     assert np.all(master[:, :, 3] == 65535)
     assert np.all(master[:, :, 1] == 123 * 257)
+    assert app.color_canvas._rendered_content is app.master_image_payload
+    assert isinstance(app.color_canvas._rendered_content, bytes)
     assert "def opaque_bgra(" not in TEXT
 
 
-def test_transparency_is_not_faked_with_canvas_background():
+def test_empty_canvas_uses_none_instead_of_a_transparent_placeholder_raster():
     assert 'preview_background = frame.cget("background")' not in TEXT
-    assert "def transparent_bgra(" in TEXT
-    assert "alpha=0" in TEXT or "alpha = 0" in TEXT
+    assert "def transparent_bgra(" not in TEXT
+    assert "self.render_canvas_content(self.threshold_canvas, None)" in TEXT
+    assert "self.render_canvas_content(self.color_canvas, None)" in TEXT
 
 
 def test_no_in_pane_placeholder_text():

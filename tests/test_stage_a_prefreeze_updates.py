@@ -17,25 +17,47 @@ def test_coarse_d7_removes_thin_background_bridge_and_returns_component():
 
 def test_stage_b_consumes_same_stage_a_seed_and_guard(monkeypatch):
     gray=np.zeros((81,81),np.uint8); cv2.circle(gray,(40,40),20,180,-1); gray[40,40]=240; state={'auto_threshold_result':cad.AutoThresholdResult()}
-    cad.find_separation_threshold(gray,state); result=state['auto_threshold_result']; seed=result.full_res_seed_point; guard=cad.decompress_image(result.full_res_separation_guard_mask); seen=[]
+    cad.find_separation_threshold(gray,state); result=state['auto_threshold_result']; seed=result.full_res_seed_point; guard=cad.decompress_image(result.full_res_separation_guard_mask); boundary=cad.find_guard_boundary(guard); seen=[]
+    expected_guard_u8=cad.bool_mask_to_uint8(guard); expected_boundary_indices=np.flatnonzero(boundary)
     real=cad.extract_separated_seed_component
-    def record(mask,s,g,b): seen.append((s,np.array_equal(g,guard))); return real(mask,s,g,b)
+    def record(mask,s,g,b): seen.append((s,np.array_equal(g,expected_guard_u8),np.array_equal(b,expected_boundary_indices))); return real(mask,s,g,b)
     monkeypatch.setattr(cad,'extract_separated_seed_component',record); cad.refine_threshold(gray,state)
-    assert seen and all(s==seed and same for s,same in seen)
+    assert seen and all(s==seed and same_guard and same_boundary for s,same_guard,same_boundary in seen)
 
 def test_uint8_bgr_load_path_expands_exactly_to_uint16_master():
     block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
-    assert 'master_image.astype(np.uint16) * 257' in block and 'cv2.COLOR_BGR2BGRA' in block
+    assert 'master_image = master_image.astype(np.uint16)' in block
+    assert 'master_image *= 257' in block and 'cv2.COLOR_BGR2BGRA' in block
 
 def test_uint16_bgra_master_is_retained_by_shared_codec():
     master=np.zeros((5,7,4),np.uint16); master[...,0]=1234; master[...,3]=65535
     assert np.array_equal(cad.decompress_image(cad.compress_image(master)),master)
 
-def test_display_mapping_is_fixed_full_range_and_preserves_alpha_scale_in_load_source():
+def test_grayscale_mapping_is_fixed_full_range_and_color_canvas_uses_lossless_master_payload():
     block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
-    assert '(master_image.astype(np.uint32) + 128) // 257' in block
+    assert 'cv2.convertScaleAbs(' in block and 'alpha=1.0 / 257.0' in block
+    assert 'self.render_canvas_content(\n                        self.color_canvas,\n                        self.master_image_payload,' in block
+    assert 'display_image' not in block
 
 def test_production_load_path_uses_unchanged_master_and_numpy_shape_convention():
     block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
     assert 'cv2.IMREAD_UNCHANGED' in block and 'compress_image(master_image)' in block
     assert 'master_image_shape' not in block
+
+
+def test_load_releases_large_intermediates_as_soon_as_their_outputs_exist():
+    block = SOURCE.split('def load_image_at(self, index: int):', 1)[1].split(
+        'def previous_button_clicked', 1
+    )[0]
+    master_ready = block.index('master_image = np.ascontiguousarray(master_image, dtype=np.uint16)')
+    source_release = block.index('del source')
+    gray16_create = block.index('gray16 = cv2.cvtColor(master_image, cv2.COLOR_BGRA2GRAY)')
+    gray16_release = block.index('del gray16')
+    master_compress = block.index('self.master_image_payload = compress_image(master_image)')
+    master_release = block.index('del master_image')
+    color_render = block.index('self.render_canvas_content(\n                        self.color_canvas,')
+
+    assert master_ready < source_release < gray16_create
+    assert 'del unchanged_image' in block[source_release:gray16_create]
+    assert gray16_create < gray16_release < master_compress
+    assert master_compress < master_release < color_render
