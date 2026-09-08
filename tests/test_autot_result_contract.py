@@ -97,19 +97,24 @@ def test_stage_b_mutates_same_result_and_returns_final_t():
     assert np.array_equal(stored_contour, expected_contour)
 
 
-def test_stage_a_complete_result_is_reused_without_rerun(monkeypatch):
+def test_complete_result_is_reused_by_find_auto_threshold_without_rerun(monkeypatch):
     gray = _disk_gray()
-    result = cad.AutoThresholdResult()
-    cad.find_separation_threshold(gray, {"auto_threshold_result": result})
+    state = {"auto_threshold_result": None}
+    selected = cad.find_auto_threshold(gray, state)
+    result = state["auto_threshold_result"]
     before = vars(result).copy()
 
     monkeypatch.setattr(
         cad,
-        "find_histogram_start_threshold",
+        "find_separation_threshold",
         lambda *_: (_ for _ in ()).throw(AssertionError("Stage A reran")),
     )
-    cad.find_separation_threshold(gray, {"auto_threshold_result": result})
-
+    monkeypatch.setattr(
+        cad,
+        "refine_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("Stage B reran")),
+    )
+    assert cad.find_auto_threshold(gray, state) == selected
     assert vars(result) == before
 
 
@@ -147,34 +152,38 @@ def test_stage_a_domain_failure_is_registered_and_not_propagated(monkeypatch):
     assert not result.separation_threshold_complete
 
 
-def test_stage_a_existing_failed_result_returns_unchanged_without_retry(monkeypatch):
+def test_existing_failed_result_returns_unchanged_without_retry(monkeypatch):
     result = cad.AutoThresholdResult(failure_reason="existing failure")
+    state = {"auto_threshold_result": result}
     before = vars(result).copy()
     monkeypatch.setattr(
         cad,
-        "find_histogram_start_threshold",
+        "find_separation_threshold",
         lambda *_: (_ for _ in ()).throw(AssertionError("failed Stage A retried")),
     )
-
-    cad.find_separation_threshold(_disk_gray(), {"auto_threshold_result": result})
-
+    monkeypatch.setattr(
+        cad,
+        "refine_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("failed Stage B retried")),
+    )
+    assert cad.find_auto_threshold(_disk_gray(), state) is None
     assert vars(result) == before
 
 
-def test_stage_b_calls_stage_a_for_nonfailed_incomplete_separation(monkeypatch):
+def test_find_auto_threshold_calls_stage_a_for_nonfailed_incomplete_separation(monkeypatch):
     gray = _disk_gray()
     result = cad.AutoThresholdResult()
+    state = {"auto_threshold_result": result}
     real_stage_a = cad.find_separation_threshold
     calls = []
 
-    def counted_stage_a(source, state):
-        calls.append(id(state["auto_threshold_result"]))
-        return real_stage_a(source, state)
+    def counted_stage_a(source, target_state):
+        calls.append(id(target_state["auto_threshold_result"]))
+        return real_stage_a(source, target_state)
 
     monkeypatch.setattr(cad, "find_separation_threshold", counted_stage_a)
     monkeypatch.setattr(cad, "measure_edge_alignment", lambda *_: (0.5, 1.0))
-
-    selected = cad.refine_threshold(gray, {"auto_threshold_result": result})
+    selected = cad.find_auto_threshold(gray, state)
 
     assert calls == [id(result)]
     assert selected is not None
@@ -182,39 +191,52 @@ def test_stage_b_calls_stage_a_for_nonfailed_incomplete_separation(monkeypatch):
     assert result.threshold_refinement_complete
 
 
-def test_stage_b_rejects_impossible_normal_stage_a_return(monkeypatch):
+def test_find_auto_threshold_rejects_impossible_normal_stage_a_return(monkeypatch):
     result = cad.AutoThresholdResult()
+    state = {"auto_threshold_result": result}
     monkeypatch.setattr(cad, "find_separation_threshold", lambda *_: None)
 
     with pytest.raises(
         ValueError,
         match="separation threshold remained incomplete without a recorded failure",
     ):
-        cad.refine_threshold(_disk_gray(), {"auto_threshold_result": result})
+        cad.find_auto_threshold(_disk_gray(), state)
 
 
-def test_stage_b_existing_failed_result_returns_none_without_stage_a_retry(monkeypatch):
+def test_find_auto_threshold_failed_result_returns_none_without_stage_retry(monkeypatch):
     result = cad.AutoThresholdResult(failure_reason="failed")
+    state = {"auto_threshold_result": result}
     monkeypatch.setattr(
         cad,
         "find_separation_threshold",
         lambda *_: (_ for _ in ()).throw(AssertionError("failed Auto-T retried")),
     )
+    monkeypatch.setattr(
+        cad,
+        "refine_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("failed Auto-T refined")),
+    )
 
-    assert cad.refine_threshold(_disk_gray(), {"auto_threshold_result": result}) is None
+    assert cad.find_auto_threshold(_disk_gray(), state) is None
     assert result.failure_reason == "failed"
 
 
-def test_stage_b_complete_result_reuses_stored_threshold_without_processing(monkeypatch):
+def test_find_auto_threshold_complete_result_reuses_stored_threshold_without_processing(monkeypatch):
     result = _structurally_complete_result()
     result.full_res_refined_threshold = 17
+    state = {"auto_threshold_result": result}
     monkeypatch.setattr(
         cad,
-        "decompress_image",
+        "find_separation_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("Stage A reran")),
+    )
+    monkeypatch.setattr(
+        cad,
+        "refine_threshold",
         lambda *_: (_ for _ in ()).throw(AssertionError("Stage B reran")),
     )
 
-    assert cad.refine_threshold(_disk_gray(), {"auto_threshold_result": result}) == 17
+    assert cad.find_auto_threshold(_disk_gray(), state) == 17
 
 
 def test_stage_b_partial_result_is_cleared_before_refinement_retry(monkeypatch):

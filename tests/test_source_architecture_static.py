@@ -7,7 +7,6 @@ TEXT = Path(cad.__file__).read_text(encoding="utf-8")
 
 def test_removed_obsolete_autot_and_gui_scaffolding():
     for name in (
-        "find_auto_threshold",
         "separation_result_callback",
         "_display_auto_separation_result",
         "display_raw_threshold",
@@ -50,6 +49,7 @@ def test_expected_stage_names_and_shared_helpers_exist():
         "def decompress_contour(",
         "def find_work_res_separation_threshold(",
         "def find_full_res_separation_threshold(",
+        "def find_auto_threshold(",
         "def find_separation_threshold(",
         "def refine_threshold(",
         "def find_external_contour(",
@@ -87,12 +87,11 @@ def test_stageb_descriptor_set_is_roughness_holes_area_and_edge_only():
     assert "q_solidity" not in score_block
 
 
-def test_gui_auto_select_delegates_autot_lifecycle_to_stage_functions():
+def test_gui_auto_select_delegates_complete_autot_lifecycle_to_parent():
     block = TEXT.split("    def auto_select_threshold(self):", 1)[1].split(
         "\n    def auto_select_radius", 1
     )[0]
     assert "except ThresholdResolutionError" not in block
-    assert "separation_threshold_complete" not in block
-    assert "threshold_refinement_complete" not in block
-    assert "find_separation_threshold(" in block
-    assert "refine_threshold(" in block
+    assert "find_auto_threshold(" in block
+    assert "find_separation_threshold(" not in block
+    assert "refine_threshold(" not in block

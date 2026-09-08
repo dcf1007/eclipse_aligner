@@ -53,7 +53,7 @@ def test_canvas_resize_renders_only_event_widget_retained_raster():
     assert np.array_equal(calls[0][1],canvas._unscaled_render_raster)
 
 
-def test_auto_select_calls_both_stages_and_reads_failure_state_without_gui_retry_logic(monkeypatch):
+def test_auto_select_calls_complete_autot_parent_and_reads_failure_state(monkeypatch):
     app = _app()
     app.gray_image = np.zeros((9, 9), np.uint8)
     app.status = Var("")
@@ -61,23 +61,17 @@ def test_auto_select_calls_both_stages_and_reads_failure_state_without_gui_retry
     del app.threshold_canvas
     calls = []
 
-    def stage_a(gray, state):
+    def complete_autot(gray, state):
         result = cad.AutoThresholdResult(
             failure_reason="work-resolution separation: no component"
         )
         state["auto_threshold_result"] = result
-        calls.append(("separation", result))
-
-    def stage_b(gray, state):
-        result = state["auto_threshold_result"]
-        calls.append(("refinement", result))
+        calls.append(result)
         return None
 
-    monkeypatch.setattr(cad, "find_separation_threshold", stage_a)
-    monkeypatch.setattr(cad, "refine_threshold", stage_b)
-
+    monkeypatch.setattr(cad, "find_auto_threshold", complete_autot)
     app.auto_select_threshold()
 
     result = app.image_state["x"]["auto_threshold_result"]
-    assert calls == [("separation", result), ("refinement", result)]
+    assert calls == [result]
     assert "work-resolution separation: no component" in app.status.get()

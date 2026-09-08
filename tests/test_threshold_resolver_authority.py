@@ -16,8 +16,7 @@ def _disk_gray(shape=(61, 61), center=(30, 30), radius=18):
 
 def _run_autot(gray):
     state = {"auto_threshold_result": None, "solar_data": None}
-    cad.find_separation_threshold(gray, state)
-    selected = cad.refine_threshold(gray, state)
+    selected = cad.find_auto_threshold(gray, state)
     assert selected is not None
     return state, selected
 
@@ -145,15 +144,16 @@ def test_corrupt_same_t_solardata_raises_instead_of_rebuilding():
     assert state["solar_data"] is stale
 
 
-def test_resolver_requests_autot_stages_without_constructing_or_mutating_result_fields():
+def test_resolver_requests_complete_autot_without_constructing_or_mutating_result_fields():
     import ast
     import inspect
     import textwrap
 
     source = textwrap.dedent(inspect.getsource(cad.resolve_threshold))
     tree = ast.parse(source)
-    assert "find_separation_threshold(" in source
-    assert "refine_threshold(" in source
+    assert "find_auto_threshold(" in source
+    assert "find_separation_threshold(" not in source
+    assert "refine_threshold(" not in source
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -175,10 +175,17 @@ def test_resolver_requests_autot_stages_without_constructing_or_mutating_result_
                 raise AssertionError("resolver must not assign Auto-T result fields")
 
     gray = _disk_gray()
-    state = {"auto_threshold_result": None, "solar_data": None}
+    settings = cad.ImageSettings(threshold=100)
+    state = {
+        "settings": settings,
+        "auto_threshold_result": None,
+        "solar_data": None,
+    }
     resolved = cad.resolve_threshold(gray, 100, state)
     assert np.any(resolved)
     assert isinstance(state["auto_threshold_result"], cad.AutoThresholdResult)
+    assert settings.threshold == 100
+    assert state["solar_data"].threshold == 100
 
 
 def test_0114_t22_regression_reuses_autot_winner_when_raw_sun_is_boundary_connected(monkeypatch):

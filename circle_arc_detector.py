@@ -20,18 +20,17 @@ persists the per-image setting, invalidates incompatible derived state, and clea
 stale threshold-canvas content. Processing is started only by explicit processing
 actions such as Auto T or Refresh Preview.
 
-Automatic threshold selection has two explicit algorithmic stages. Stage A,
-``find_separation_threshold()``, progressively fills the current image's single
-``AutoThresholdResult`` through work-resolution and full-resolution separation.
-The GUI renders the completed Stage-A component, then Stage B,
-``refine_threshold()``, fills the refined threshold and component in that same
-object and returns the final T. Auto T stops after rendering this refined component;
-it does not build SolarData.
+Automatic threshold selection is orchestrated by ``find_auto_threshold()``, which
+owns the current image's single ``AutoThresholdResult`` and runs the two tested
+algorithmic stages as needed. Stage A, ``find_separation_threshold()``, fills the
+work-resolution and full-resolution separation fields; Stage B,
+``refine_threshold()``, fills the refined threshold, component, and contour fields.
+Neither stage creates or replaces the result object.
 
 Selected-T resolution consumes the authoritative Auto-T identity instead of
 independently re-identifying the Sun. ``resolve_threshold()`` owns SolarData cache
-reuse/invalidation/construction, may explicitly request the Auto-T stages to advance
-their own state, and never writes Auto-T result fields itself. Exact Auto-T winners
+reuse/invalidation/construction, requests complete Auto-T orchestration through
+``find_auto_threshold()``, and never writes Auto-T result fields itself. Exact Auto-T winners
 reuse their stored component and contour; manual T uses one exact guarded P3/P5/P7
 component evaluation without neighboring-threshold search.
 
@@ -765,15 +764,15 @@ def derive_full_res_seed_and_guard(
     return full_res_seed_point, full_res_guard_mask
 
 
-def find_separation_threshold(
+def find_auto_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
-) -> None:
-    """Run or reuse Auto-T Stage A, owning creation and Stage-A lifecycle state."""
+) -> int | None:
+    """Run or reuse the complete Auto-T operation and return its winning T."""
     if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
         raise ValueError("automatic thresholding requires authoritative 2D uint8 grayscale")
     if not isinstance(image_state, dict):
-        raise ValueError("Stage A requires the current image state")
+        raise ValueError("automatic thresholding requires the current image state")
 
     auto_threshold_result = image_state.get("auto_threshold_result")
     if auto_threshold_result is None:
@@ -783,9 +782,44 @@ def find_separation_threshold(
         raise ValueError("stored Auto-T state must be an AutoThresholdResult or None")
 
     if auto_threshold_result.failure_reason is not None:
-        return
-    if auto_threshold_result.separation_threshold_complete:
-        return
+        return None
+
+    if not auto_threshold_result.separation_threshold_complete:
+        find_separation_threshold(full_res_gray, image_state)
+        auto_threshold_result = image_state.get("auto_threshold_result")
+        if not isinstance(auto_threshold_result, AutoThresholdResult):
+            raise ValueError("Stage A returned without preserving AutoThresholdResult")
+
+    if auto_threshold_result.failure_reason is not None:
+        return None
+    if not auto_threshold_result.separation_threshold_complete:
+        raise ValueError(
+            "separation threshold remained incomplete without a recorded failure"
+        )
+
+    if auto_threshold_result.threshold_refinement_complete:
+        return auto_threshold_result.full_res_refined_threshold
+
+    refine_threshold(full_res_gray, image_state)
+    auto_threshold_result = image_state.get("auto_threshold_result")
+    if not isinstance(auto_threshold_result, AutoThresholdResult):
+        raise ValueError("Stage B returned without preserving AutoThresholdResult")
+
+    if auto_threshold_result.failure_reason is not None:
+        return None
+    if not auto_threshold_result.threshold_refinement_complete:
+        raise ValueError(
+            "threshold refinement remained incomplete without a recorded failure"
+        )
+    return auto_threshold_result.full_res_refined_threshold
+
+
+def find_separation_threshold(
+    full_res_gray: np.ndarray,
+    image_state: dict[str, object],
+) -> None:
+    """Run Auto-T Stage A on the result established by :func:`find_auto_threshold`."""
+    auto_threshold_result = image_state["auto_threshold_result"]
 
     # An incomplete non-failed separation is a recoverable interrupted attempt.
     # Restart Auto-T from Stage A without allowing stale downstream values to mix
@@ -1231,41 +1265,8 @@ def refine_threshold(
     full_res_gray: np.ndarray,
     image_state: dict[str, object],
 ) -> int | None:
-    """Run or reuse Auto-T Stage B and return its winning T when available."""
-    if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
-        raise ValueError("threshold refinement requires authoritative uint8 grayscale")
-    if not isinstance(image_state, dict):
-        raise ValueError("Stage B requires the current image state")
-
-    auto_threshold_result = image_state.get("auto_threshold_result")
-    if not isinstance(auto_threshold_result, AutoThresholdResult):
-        find_separation_threshold(full_res_gray, image_state)
-        auto_threshold_result = image_state.get("auto_threshold_result")
-    if not isinstance(auto_threshold_result, AutoThresholdResult):
-        raise ValueError("Stage A returned without establishing AutoThresholdResult")
-
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.separation_threshold_complete
-    ):
-        find_separation_threshold(full_res_gray, image_state)
-        auto_threshold_result = image_state.get("auto_threshold_result")
-        if not isinstance(auto_threshold_result, AutoThresholdResult):
-            raise ValueError("Stage A returned without establishing AutoThresholdResult")
-
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.separation_threshold_complete
-    ):
-        raise ValueError(
-            "separation threshold remained incomplete without a recorded failure"
-        )
-
-    if auto_threshold_result.failure_reason is not None:
-        return None
-
-    if auto_threshold_result.threshold_refinement_complete:
-        return auto_threshold_result.full_res_refined_threshold
+    """Run Auto-T Stage B on the completed Stage-A result."""
+    auto_threshold_result = image_state["auto_threshold_result"]
 
     auto_threshold_result.full_res_refined_threshold = None
     auto_threshold_result.full_res_refined_component_mask = None
@@ -1485,44 +1486,10 @@ def resolve_threshold(
 
         image_state["solar_data"] = None
 
+    find_auto_threshold(full_res_gray, image_state)
     auto_threshold_result = image_state.get("auto_threshold_result")
     if not isinstance(auto_threshold_result, AutoThresholdResult):
-        find_separation_threshold(full_res_gray, image_state)
-        auto_threshold_result = image_state.get("auto_threshold_result")
-    if not isinstance(auto_threshold_result, AutoThresholdResult):
-        raise ValueError("Stage A returned without establishing AutoThresholdResult")
-
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.separation_threshold_complete
-    ):
-        find_separation_threshold(full_res_gray, image_state)
-        auto_threshold_result = image_state.get("auto_threshold_result")
-        if not isinstance(auto_threshold_result, AutoThresholdResult):
-            raise ValueError("Stage A returned without establishing AutoThresholdResult")
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.separation_threshold_complete
-    ):
-        raise ValueError(
-            "separation threshold remained incomplete without a recorded failure"
-        )
-
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.threshold_refinement_complete
-    ):
-        refine_threshold(full_res_gray, image_state)
-        auto_threshold_result = image_state.get("auto_threshold_result")
-        if not isinstance(auto_threshold_result, AutoThresholdResult):
-            raise ValueError("Stage B returned without preserving AutoThresholdResult")
-    if (
-        auto_threshold_result.failure_reason is None
-        and not auto_threshold_result.threshold_refinement_complete
-    ):
-        raise ValueError(
-            "threshold refinement remained incomplete without a recorded failure"
-        )
+        raise ValueError("Auto-T returned without preserving AutoThresholdResult")
 
     if (
         auto_threshold_result.failure_reason is None
@@ -2209,10 +2176,10 @@ class DetectorApp:
         state = self.image_state[self.current_path]
 
         with self.processing_ui():
-            find_separation_threshold(self.gray_image, state)
+            selected_threshold = find_auto_threshold(self.gray_image, state)
             auto_threshold_result = state.get("auto_threshold_result")
             if not isinstance(auto_threshold_result, AutoThresholdResult):
-                raise ValueError("Stage A returned without establishing AutoThresholdResult")
+                raise ValueError("Auto-T returned without establishing AutoThresholdResult")
 
             if (
                 auto_threshold_result.full_res_separation_component_mask is not None
@@ -2225,7 +2192,6 @@ class DetectorApp:
                     ),
                 )
 
-            selected_threshold = refine_threshold(self.gray_image, state)
             if selected_threshold is None:
                 reason = auto_threshold_result.failure_reason
                 self.status.set(

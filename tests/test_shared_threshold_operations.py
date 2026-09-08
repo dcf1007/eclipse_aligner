@@ -20,7 +20,7 @@ def test_derive_full_res_seed_and_guard_matches_stage_a_identity_products():
         gray, work_component, kernel
     )
     state = {"auto_threshold_result": None}
-    cad.find_separation_threshold(gray, state)
+    cad.find_auto_threshold(gray, state)
     result = state["auto_threshold_result"]
     assert result.full_res_seed_point == expected_seed
     assert np.array_equal(
