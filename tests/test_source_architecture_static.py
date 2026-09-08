@@ -87,11 +87,26 @@ def test_stageb_descriptor_set_is_roughness_holes_area_and_edge_only():
     assert "q_solidity" not in score_block
 
 
-def test_gui_auto_select_delegates_complete_autot_lifecycle_to_parent():
-    block = TEXT.split("    def auto_select_threshold(self):", 1)[1].split(
-        "\n    def auto_select_radius", 1
+def test_gui_auto_select_button_delegates_parent_then_setting_application():
+    block = TEXT.split("    def auto_select_threshold_button(self):", 1)[1].split(
+        "\n    def auto_select_radius_button", 1
     )[0]
-    assert "except ThresholdResolutionError" not in block
     assert "find_auto_threshold(" in block
     assert "find_separation_threshold(" not in block
     assert "refine_threshold(" not in block
+    assert 'self.apply_changed_setting("threshold", selected_threshold)' in block
+    assert "resolve_threshold(" not in block
+
+
+def test_gui_button_callbacks_name_the_widget_boundary():
+    for name in (
+        "load_images_button",
+        "save_centered_images_button",
+        "previous_image_button",
+        "next_image_button",
+        "auto_select_threshold_button",
+        "auto_select_radius_button",
+        "refresh_preview_button",
+        "apply_full_resolution_button",
+    ):
+        assert f"def {name}(" in TEXT

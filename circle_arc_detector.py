@@ -12,20 +12,21 @@ has never been initialized, and once initialized its exact integer value is alwa
 stored regardless of whether it came from Auto T or manual input. Other controls may
 still use sparse overrides relative to application defaults.
 
-Slider labels update continuously, but a setting is committed only after mouse
-release or the final keyboard key release. Checkboxes and radio buttons commit
+Slider labels update continuously, but a setting is applied only after mouse
+release or the final keyboard key release. Checkboxes and radio buttons apply
 immediately. Every actual setting change passes through
-``commit_setting_change(setting_name, value)``, which synchronizes the Tk variable,
-persists the per-image setting, invalidates incompatible derived state, and clears
-stale threshold-canvas content. Processing is started only by explicit processing
-actions such as Auto T or Refresh Preview.
+``apply_changed_setting(setting_name, value)``, which synchronizes the Tk variable,
+persists the per-image setting, displays authoritative grayscale, resolves current
+SolarData, and then displays that refined solar component. Heavy downstream
+processing remains reserved for Refresh Preview / Apply Full Resolution.
 
 Automatic threshold selection is orchestrated by ``find_auto_threshold()``, which
 owns the current image's single ``AutoThresholdResult`` and runs the two tested
 algorithmic stages as needed. Stage A, ``find_separation_threshold()``, fills the
 work-resolution and full-resolution separation fields; Stage B,
 ``refine_threshold()``, fills the refined threshold, component, and contour fields.
-Neither stage creates or replaces the result object.
+Neither stage creates or replaces the result object. The Auto Select button commits
+the winning T through the same setting-change path used by manual GUI interaction.
 
 Selected-T resolution consumes the authoritative Auto-T identity instead of
 independently re-identifying the Sun. ``resolve_threshold()`` owns SolarData cache
@@ -1682,7 +1683,7 @@ class DetectorApp:
         # Use it to clear slider keyboard focus as soon as the user clicks
         # anywhere outside the currently focused slider.
         root.bind("<ButtonPress-1>", self._release_slider_focus_if_clicked_elsewhere, add="+")
-        root.bind("<Return>", self.apply_full_resolution)
+        root.bind("<Return>", self.apply_full_resolution_button)
         root.bind("<Escape>", self.close)
 
         if self.image_paths:
@@ -1693,7 +1694,7 @@ class DetectorApp:
     # ------------------------------------------------------------------
     # Image list / navigation (GUI support only)
     # ------------------------------------------------------------------
-    def load_images(self):
+    def load_images_button(self):
         selected = filedialog.askopenfilenames(
             parent=self.root,
             title="Select eclipse images",
@@ -1782,14 +1783,6 @@ class DetectorApp:
                     self.image_state[path] = state
 
                 settings = state["settings"]
-                for setting_name, variable in self.setting_variables.items():
-                    if setting_name == "threshold":
-                        continue
-                    baseline = getattr(self.default_settings, setting_name)
-                    override = getattr(settings, setting_name)
-                    variable.set(baseline if override is None else override)
-
-                self._update_center_preview_label()
 
                 # Retain the exact master in the shared self-describing array format.
                 self.master_image_payload = compress_image(master_image)
@@ -1801,21 +1794,55 @@ class DetectorApp:
                     self.render_canvas_content(self.threshold_canvas, self.gray_image)
 
             # Image preparation and Auto T own separate, sequential processing-ui
-            # contexts. There is no nested processing_ui() state or bypass flag.
+            # contexts. Auto T establishes its result without selecting a GUI T yet.
+            with self.processing_ui():
+                automatic_threshold = find_auto_threshold(self.gray_image, state)
+                auto_threshold_result = state.get("auto_threshold_result")
+                if not isinstance(auto_threshold_result, AutoThresholdResult):
+                    raise ValueError("Auto-T returned without establishing AutoThresholdResult")
+
+            # Restore every per-image setting through the same application path used
+            # by completed GUI interaction. A stored threshold overrides Auto T; an
+            # uninitialized threshold takes the current Auto-T winner.
+            for setting_name in self.setting_variables:
+                if setting_name == "threshold":
+                    value = (
+                        settings.threshold
+                        if settings.threshold is not None
+                        else automatic_threshold
+                    )
+                    if value is None:
+                        continue
+                else:
+                    stored_value = getattr(settings, setting_name)
+                    value = (
+                        getattr(self.default_settings, setting_name)
+                        if stored_value is None
+                        else stored_value
+                    )
+                self.apply_changed_setting(setting_name, value)
+
+            self._update_center_preview_label()
             if settings.threshold is None:
-                self.auto_select_threshold()
-            else:
-                self.threshold.set(settings.threshold)
-                self.refresh_preview(changed_setting="image load")
+                reason = auto_threshold_result.failure_reason
+                self.status.set(
+                    "Automatic threshold could not initialize this image"
+                    + (f" ({reason})." if reason is not None else ".")
+                )
+                return
+
+            # Load, Previous, and Next all execute the complete workflow. SolarData
+            # is already current because restoration ran through apply_changed_setting.
+            self.refresh_preview_button()
         finally:
             self.update_navigation_state()
 
 
-    def previous_image(self):
+    def previous_image_button(self):
         if self.current_index > 0:
             self.load_image_at(self.current_index - 1)
 
-    def next_image(self):
+    def next_image_button(self):
         if 0 <= self.current_index < len(self.image_paths) - 1:
             self.load_image_at(self.current_index + 1)
 
@@ -1879,22 +1906,22 @@ class DetectorApp:
         frame.grid(row=0, column=0, sticky="ew", pady=(8, 0))
         frame.columnconfigure(4, weight=1)
 
-        tk.Button(frame, text="Load images...", width=14, command=self.load_images).grid(
+        tk.Button(frame, text="Load images...", width=14, command=self.load_images_button).grid(
             row=0, column=0, padx=(0, 8)
         )
         self.save_centered_button = tk.Button(
             frame,
             text="Save centered images",
             width=20,
-            command=self.save_centered_images,
+            command=self.save_centered_images_button,
         )
         self.save_centered_button.grid(row=0, column=1, padx=(0, 10))
         self.previous_button = tk.Button(
-            frame, text="◀ Previous", width=12, command=self.previous_image
+            frame, text="◀ Previous", width=12, command=self.previous_image_button
         )
         self.previous_button.grid(row=0, column=2, padx=(0, 5))
         self.next_button = tk.Button(
-            frame, text="Next ▶", width=12, command=self.next_image
+            frame, text="Next ▶", width=12, command=self.next_image_button
         )
         self.next_button.grid(row=0, column=3, padx=(0, 10))
         tk.Label(frame, textvariable=self.image_info, anchor="w").grid(
@@ -1924,7 +1951,7 @@ class DetectorApp:
             frame,
             text="Auto select",
             width=12,
-            command=self.auto_select_threshold,
+            command=self.auto_select_threshold_button,
         )
         self.threshold_auto_button.grid(
             row=0, column=3, sticky="ns", padx=(10, 0), pady=2
@@ -1933,7 +1960,7 @@ class DetectorApp:
             frame,
             text="Auto select",
             width=12,
-            command=self.auto_select_radius,
+            command=self.auto_select_radius_button,
         )
         self.radius_auto_button.grid(
             row=1, column=3, rowspan=2, sticky="nsew", padx=(10, 0), pady=2
@@ -1945,19 +1972,19 @@ class DetectorApp:
             options,
             text="Morphology cleanup for candidate search",
             variable=self.morphology,
-            command=self._handle_morphology_change,
+            command=self._morphology_checkbox_changed,
         ).grid(row=0, column=0, sticky="w", padx=(0, 20))
         tk.Checkbutton(
             options,
             text="Outer-limb assistance",
             variable=self.outer_limb_assistance,
-            command=self._handle_outer_limb_assistance_change,
+            command=self._outer_limb_assistance_checkbox_changed,
         ).grid(row=0, column=1, sticky="w", padx=(0, 20))
         self.horizon_checkbox = tk.Checkbutton(
             options,
             text="Use detected horizon",
             variable=self.use_horizon,
-            command=self._handle_horizon_change,
+            command=self._horizon_checkbox_changed,
             state=tk.DISABLED,
         )
         self.horizon_checkbox.grid(row=0, column=2, sticky="w")
@@ -1972,14 +1999,14 @@ class DetectorApp:
             text="Light ellipse",
             variable=self.center_target,
             value="light",
-            command=self._handle_center_target_change,
+            command=self._center_target_radiobutton_changed,
         ).grid(row=0, column=1, sticky="w", padx=(0, 14))
         tk.Radiobutton(
             center_frame,
             text="Dark ellipse",
             variable=self.center_target,
             value="dark",
-            command=self._handle_center_target_change,
+            command=self._center_target_radiobutton_changed,
         ).grid(row=0, column=2, sticky="w")
 
         button_frame = tk.Frame(frame)
@@ -1988,14 +2015,14 @@ class DetectorApp:
             button_frame,
             text="Refresh Preview",
             width=16,
-            command=self.refresh_preview,
+            command=self.refresh_preview_button,
         )
         self.preview_button.grid(row=0, column=0, padx=(0, 8))
         self.full_button = tk.Button(
             button_frame,
             text="Apply Full Resolution",
             width=20,
-            command=self.apply_full_resolution,
+            command=self.apply_full_resolution_button,
         )
         self.full_button.grid(row=0, column=1)
 
@@ -2083,7 +2110,7 @@ class DetectorApp:
         """Refresh once after a mouse slider change has actually finished."""
         start_value = getattr(event.widget, "_preview_mouse_start_value", None)
         if start_value is not None and event.widget.get() != start_value:
-            self.commit_setting_change(event.widget._setting_name, event.widget.get())
+            self.apply_changed_setting(event.widget._setting_name, event.widget.get())
 
     def _cancel_pending_slider_keyboard_commit(self):
         """Cancel a release callback superseded by continuing keyboard input."""
@@ -2116,7 +2143,7 @@ class DetectorApp:
         self.slider_keyboard_widget = None
         self.slider_keyboard_start_value = None
         if widget is not None and start_value is not None and widget.get() != start_value:
-            self.commit_setting_change(widget._setting_name, widget.get())
+            self.apply_changed_setting(widget._setting_name, widget.get())
 
     def _release_slider_focus_if_clicked_elsewhere(self, event):
         """Release slider focus immediately when the mouse clicks elsewhere.
@@ -2162,71 +2189,36 @@ class DetectorApp:
     # ------------------------------------------------------------------
     # Application actions and threshold preview
     # ------------------------------------------------------------------
-    def save_centered_images(self):
+    def save_centered_images_button(self):
         self.status.set(
             "Save centered images: export functionality is not implemented in the threshold-finder stage."
         )
 
-    def auto_select_threshold(self):
-        """Run or reuse image-only Auto T and stop after the Stage-B refined display."""
+    def auto_select_threshold_button(self):
+        """Run/reuse complete Auto T, apply its winning threshold, and stop at SolarData."""
         if self.gray_image is None or self.current_path is None:
             self.status.set("Auto select threshold: no readable image is loaded.")
             return
 
         state = self.image_state[self.current_path]
-
         with self.processing_ui():
             selected_threshold = find_auto_threshold(self.gray_image, state)
             auto_threshold_result = state.get("auto_threshold_result")
             if not isinstance(auto_threshold_result, AutoThresholdResult):
                 raise ValueError("Auto-T returned without establishing AutoThresholdResult")
 
-            if (
-                auto_threshold_result.full_res_separation_component_mask is not None
-                and hasattr(self, "threshold_canvas")
-            ):
-                self.render_canvas_content(
-                    self.threshold_canvas,
-                    decompress_image(
-                        auto_threshold_result.full_res_separation_component_mask
-                    ),
-                )
-
-            if selected_threshold is None:
-                reason = auto_threshold_result.failure_reason
-                self.status.set(
-                    "Automatic threshold could not be resolved"
-                    + (f" ({reason})." if reason is not None else ".")
-                )
-                return
-
-            # The setting commit invalidates stale downstream/display state. Publish the
-            # newly valid Stage-B display only after that state transition completes.
-            self.commit_setting_change("threshold", selected_threshold)
-
-            if (
-                auto_threshold_result.full_res_refined_component_mask is not None
-                and hasattr(self, "threshold_canvas")
-            ):
-                self.render_canvas_content(
-                    self.threshold_canvas,
-                    decompress_image(
-                        auto_threshold_result.full_res_refined_component_mask
-                    ),
-                )
-
+        if selected_threshold is None:
+            reason = auto_threshold_result.failure_reason
             self.status.set(
-                "Automatic grayscale threshold selected: "
-                f"T={selected_threshold} "
-                f"(work-res separation T="
-                f"{auto_threshold_result.work_res_separation_threshold}, "
-                f"histogram start="
-                f"{auto_threshold_result.histogram_start_threshold}); "
-                "Stage-B refined component displayed."
+                "Automatic threshold could not be resolved"
+                + (f" ({reason})." if reason is not None else ".")
             )
+            return
+
+        self.apply_changed_setting("threshold", selected_threshold)
 
 
-    def auto_select_radius(self):
+    def auto_select_radius_button(self):
         self.status.set(
             "Auto select radius range: algorithm not implemented in the threshold-finder stage."
         )
@@ -2234,8 +2226,8 @@ class DetectorApp:
 
 
 
-    def commit_setting_change(self, setting_name, value):
-        """Synchronize and persist one completed setting change, invalidating stale display."""
+    def apply_changed_setting(self, setting_name, value):
+        """Persist one completed GUI setting change and synchronize through SolarData."""
         variable = self.setting_variables[setting_name]
         variable.set(value)
         value = variable.get()
@@ -2253,32 +2245,60 @@ class DetectorApp:
             baseline = getattr(self.default_settings, setting_name)
             setattr(settings, setting_name, None if value == baseline else value)
 
-        if hasattr(self, "threshold_canvas"):
-            self.render_canvas_content(self.threshold_canvas, None)
+        if self.gray_image is None:
+            return
+
+        with self.processing_ui():
+            if hasattr(self, "threshold_canvas"):
+                self.render_canvas_content(self.threshold_canvas, self.gray_image)
+
+            if settings.threshold is None:
+                self.status.set("Threshold is not initialized for the current image.")
+                return
+
+            threshold = settings.threshold
+            try:
+                refined_component = resolve_threshold(
+                    self.gray_image,
+                    threshold,
+                    state,
+                )
+            except (ThresholdResolutionError, ValueError) as exc:
+                self.status.set(
+                    f"Grayscale remains displayed; SolarData could not be established "
+                    f"at T={threshold} ({exc})."
+                )
+                return
+
+            if hasattr(self, "threshold_canvas"):
+                self.render_canvas_content(self.threshold_canvas, refined_component)
+            self.status.set(
+                f"{setting_name} applied; SolarData synchronized at T={threshold}."
+            )
 
 
     def _selected_center_target_name(self):
         """Return the user-facing name of the selected centering target."""
         return "light ellipse" if self.center_target.get() == "light" else "dark ellipse"
 
-    def _handle_morphology_change(self):
+    def _morphology_checkbox_changed(self):
         """Commit the morphology checkbox immediately."""
-        self.commit_setting_change("morphology", self.morphology.get())
+        self.apply_changed_setting("morphology", self.morphology.get())
 
-    def _handle_outer_limb_assistance_change(self):
+    def _outer_limb_assistance_checkbox_changed(self):
         """Commit the outer-limb-assistance checkbox immediately."""
-        self.commit_setting_change(
+        self.apply_changed_setting(
             "outer_limb_assistance",
             self.outer_limb_assistance.get(),
         )
 
-    def _handle_horizon_change(self):
+    def _horizon_checkbox_changed(self):
         """Commit the horizon checkbox immediately."""
-        self.commit_setting_change("use_horizon", self.use_horizon.get())
+        self.apply_changed_setting("use_horizon", self.use_horizon.get())
 
-    def _handle_center_target_change(self):
+    def _center_target_radiobutton_changed(self):
         self._update_center_preview_label()
-        self.commit_setting_change("center_target", self.center_target.get())
+        self.apply_changed_setting("center_target", self.center_target.get())
         self.status.set(
             f"Centering target set to {self._selected_center_target_name()}. "
             "Actual centering will be implemented with ellipse detection."
@@ -2289,70 +2309,60 @@ class DetectorApp:
         target = self._selected_center_target_name()
         self.center_preview_label.set(f"Full-color image — center on {target}")
 
-    def refresh_preview(
-        self,
-        changed_setting: str | None = None,
-        full_resolution: bool = False,
-    ):
-        """Run the current explicit preview-processing cascade from raw threshold onward."""
+    def refresh_preview_button(self):
+        """Run heavy preview processing from authoritative current SolarData."""
         if self.gray_image is None or self.current_path is None:
-            action = "Apply Full Resolution" if full_resolution else "Refresh Preview"
-            self.status.set(f"{action}: no readable image is loaded.")
+            self.status.set("Refresh Preview: no readable image is loaded.")
             return
 
         state = self.image_state[self.current_path]
         settings = state["settings"]
-        if settings.threshold is None:
-            self.status.set("Threshold is not initialized for the current image.")
+        solar_data = state.get("solar_data")
+        if (
+            settings.threshold is None
+            or not isinstance(solar_data, SolarData)
+            or solar_data.threshold != settings.threshold
+        ):
+            self.status.set("Refresh Preview requires current SolarData for the selected threshold.")
             return
 
         with self.processing_ui():
-            threshold = settings.threshold
-            existing = state.get("solar_data")
-            reused = isinstance(existing, SolarData) and existing.threshold == threshold
-
-            threshold_mask = self.gray_image > threshold
-            if hasattr(self, "threshold_canvas"):
-                self.render_canvas_content(self.threshold_canvas, threshold_mask)
-
-            try:
-                refined_component = resolve_threshold(
-                    self.gray_image,
-                    threshold,
-                    state,
-                )
-            except (ThresholdResolutionError, ValueError) as exc:
-                self.status.set(
-                    f"Pure threshold remains displayed at T={threshold}; SolarData could not be "
-                    f"established ({exc})."
-                )
-                return
-
-            if hasattr(self, "threshold_canvas"):
-                self.render_canvas_content(self.threshold_canvas, refined_component)
-
-            if full_resolution:
-                self.status.set(
-                    "Full-resolution refined solar-component preview applied at "
-                    f"T={threshold}. Ellipse detector backend not implemented yet."
-                )
-            elif changed_setting is not None:
-                self.status.set(
-                    f"{changed_setting} committed; refined current preview displayed at T={threshold}."
-                )
-            elif reused:
-                self.status.set(
-                    f"Threshold preview regenerated at T={threshold}; existing SolarData reused."
-                )
-            else:
-                self.status.set(
-                    f"Threshold preview regenerated at T={threshold}; SolarData rebuilt for this T."
-                )
+            # TODO: horizon finding consumes solar_data.
+            # TODO: ellipse finding consumes the horizon/SolarData products.
+            # TODO: center the full-color image from the validated geometry.
+            self.status.set(
+                f"SolarData ready at T={solar_data.threshold}; downstream preview "
+                "processing is not implemented in the threshold-finder branch."
+            )
 
 
-    def apply_full_resolution(self, _event=None):
-        # Reuse the same authoritative preview/resolution path with full-resolution status text.
-        self.refresh_preview(full_resolution=True)
+    def apply_full_resolution_button(self, _event=None):
+        """Run heavy full-resolution processing from authoritative current SolarData."""
+        if self.gray_image is None or self.current_path is None:
+            self.status.set("Apply Full Resolution: no readable image is loaded.")
+            return
+
+        state = self.image_state[self.current_path]
+        settings = state["settings"]
+        solar_data = state.get("solar_data")
+        if (
+            settings.threshold is None
+            or not isinstance(solar_data, SolarData)
+            or solar_data.threshold != settings.threshold
+        ):
+            self.status.set(
+                "Apply Full Resolution requires current SolarData for the selected threshold."
+            )
+            return
+
+        with self.processing_ui():
+            # TODO: full-resolution horizon finding consumes solar_data.
+            # TODO: full-resolution ellipse finding consumes those products.
+            # TODO: center/export the full-color image from the validated geometry.
+            self.status.set(
+                f"SolarData ready at T={solar_data.threshold}; downstream full-resolution "
+                "processing is not implemented in the threshold-finder branch."
+            )
 
 
     def _handle_canvas_resize(self, event):

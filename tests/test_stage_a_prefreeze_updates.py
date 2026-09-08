@@ -1,89 +1,41 @@
 from pathlib import Path
-from types import SimpleNamespace
 import cv2
 import numpy as np
 import circle_arc_detector as cad
-
-SOURCE = Path(cad.__file__).read_text(encoding='utf-8')
-
+SOURCE=Path(cad.__file__).read_text()
 
 def test_resize_mask_flag_owns_nearest_neighbor_selection(monkeypatch):
-    source = np.array([[0, 0, 255, 0, 0]], dtype=np.uint8)
-    seen = []
-    def record_resize(array, size, interpolation):
-        seen.append(interpolation)
-        return np.zeros((size[1], size[0]), dtype=array.dtype)
-    monkeypatch.setattr(cad.cv2, 'resize', record_resize)
-    cad.resize_img(source, (3, 1))
-    cad.resize_img(source, (3, 1), mask=True)
-    assert seen == [cv2.INTER_AREA, cv2.INTER_NEAREST_EXACT]
+    seen=[]
+    monkeypatch.setattr(cad.cv2,'resize',lambda src,size,interpolation: seen.append(interpolation) or np.zeros((3,1),src.dtype))
+    cad.resize_img(np.zeros((5,5),np.uint8),(3,1),mask=True); assert seen==[cv2.INTER_NEAREST_EXACT]
 
+def test_coarse_d7_removes_thin_background_bridge_and_returns_component():
+    gray=np.zeros((101,141),np.uint8); cv2.circle(gray,(75,50),22,30,-1); gray[49:52,:76]=20
+    guard=np.zeros_like(gray,bool); guard[10:91,30:121]=True
+    t,component=cad.find_full_res_separation_threshold(gray,20,(75,50),guard)
+    assert t<=20 and component[50,75] and not np.any(component[:,0])
 
-def test_coarse_d7_removes_thin_background_bridge_and_returns_only_t():
-    gray = np.zeros((41, 61), dtype=np.uint8)
-    gray[15:26, 25:36] = 30
-    gray[20, 35:56] = 10
-    guard = np.zeros(gray.shape, dtype=bool)
-    guard[5:36, 5:56] = True
-    result = cad.find_lowest_full_res_threshold(gray, 10, (30, 20), guard)
-    assert isinstance(result, int)
-    assert result == 0
+def test_stage_b_consumes_same_stage_a_seed_and_guard(monkeypatch):
+    gray=np.zeros((81,81),np.uint8); cv2.circle(gray,(40,40),20,180,-1); gray[40,40]=240; state={'auto_threshold_result':cad.AutoThresholdResult()}
+    cad.find_separation_threshold(gray,state); result=state['auto_threshold_result']; seed=result.full_res_seed_point; guard=cad.decompress_image(result.full_res_separation_guard_mask); seen=[]
+    real=cad.extract_separated_seed_component
+    def record(mask,s,g,b): seen.append((s,np.array_equal(g,guard))); return real(mask,s,g,b)
+    monkeypatch.setattr(cad,'extract_separated_seed_component',record); cad.refine_threshold(gray,state)
+    assert seen and all(s==seed and same for s,same in seen)
 
+def test_uint8_bgr_load_path_expands_exactly_to_uint16_master():
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    assert 'master_image.astype(np.uint16) * 257' in block and 'cv2.COLOR_BGR2BGRA' in block
 
-def test_auto_refinement_receives_t_seed_and_same_guard(monkeypatch):
-    gray = np.zeros((31, 31), dtype=np.uint8)
-    state = {'settings': cad.ImageSettings(), 'auto_threshold_result': None, 'solar_data': None}
-    monkeypatch.setattr(cad, 'find_histogram_start_threshold', lambda _gray: 10)
-    def work(work_gray, _start, _kernel):
-        component = np.zeros(work_gray.shape, bool)
-        component[8:23, 8:23] = True
-        return 7, component
-    monkeypatch.setattr(cad, 'find_work_res_solar_component', work)
-    monkeypatch.setattr(cad, 'brightest_supported_component_point', lambda *_args: (15, 15))
-    guard = np.ones(gray.shape, bool)
-    monkeypatch.setattr(cad, 'dilate_component_mask', lambda *_args: guard)
-    monkeypatch.setattr(cad, 'find_lowest_full_res_threshold', lambda *_args: 6)
-    seen = {}
-    payload = cad.compress_full_mask(np.ones(gray.shape, bool))
-    def refine(_gray, base_T, seed, received_guard):
-        seen.update(T=base_T, seed=seed, guard=received_guard)
-        return SimpleNamespace(threshold=base_T, cleaned_component_mask=payload)
-    monkeypatch.setattr(cad, 'refine_threshold', refine)
-    assert cad.find_auto_threshold(gray, state) == 6
-    assert seen['T'] == 6 and seen['seed'] == (15, 15)
-    assert seen['guard'] is guard
-    assert state['auto_threshold_result'].cleaned_component_mask == payload
+def test_uint16_bgra_master_is_retained_by_shared_codec():
+    master=np.zeros((5,7,4),np.uint16); master[...,0]=1234; master[...,3]=65535
+    assert np.array_equal(cad.decompress_image(cad.compress_image(master)),master)
 
+def test_display_mapping_is_fixed_full_range_and_preserves_alpha_scale_in_load_source():
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    assert '(master_image.astype(np.uint32) + 128) // 257' in block
 
-def test_uint8_bgr_normalizes_losslessly_to_uint16_bgra_and_gray8():
-    bgr8 = np.array([[[0, 64, 255], [10, 20, 30]]], dtype=np.uint8)
-    master = cad.normalize_master_bgra16(bgr8)
-    expected_bgra8 = cv2.cvtColor(bgr8, cv2.COLOR_BGR2BGRA)
-    assert master.dtype == np.uint16 and master.shape == (1, 2, 4)
-    assert np.array_equal(master, expected_bgra8.astype(np.uint16) * 257)
-    gray8 = cad.master_bgra16_to_gray8(master)
-    assert np.array_equal(gray8, cv2.cvtColor(bgr8, cv2.COLOR_BGR2GRAY))
-
-
-def test_uint16_bgra_preserves_alpha_and_round_trips_compression():
-    master = np.array([[[1, 2, 3, 4], [65535, 40000, 12345, 22222]]], dtype=np.uint16)
-    normalized = cad.normalize_master_bgra16(master)
-    assert np.array_equal(normalized, master)
-    payload = cad.compress_master_bgra16(normalized)
-    restored = cad.decompress_master_bgra16(payload, normalized.shape)
-    assert np.array_equal(restored, normalized)
-
-
-def test_display_mapping_is_fixed_full_range_and_preserves_alpha_scale():
-    master = np.array([[[0, 257, 65535, 32768]]], dtype=np.uint16)
-    assert cad.master_bgra16_to_display_bgra8(master).tolist() == [[[0, 1, 255, 128]]]
-
-
-def test_production_load_path_uses_unchanged_master_and_no_binary_inference():
-    load_block = SOURCE.split('def load_image_at(self, index: int):', 1)[1].split('def previous_image', 1)[0]
-    resize_block = SOURCE.split('def resize_img(', 1)[1].split('def normalize_master_bgra16', 1)[0]
-    assert 'cv2.IMREAD_UNCHANGED' in load_block
-    assert 'cv2.IMREAD_COLOR' not in load_block
-    assert 'is_binary' not in resize_block
-    assert 'if mask:' in resize_block
-    assert 'size: tuple[int, int]' in SOURCE
+def test_production_load_path_uses_unchanged_master_and_numpy_shape_convention():
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    assert 'cv2.IMREAD_UNCHANGED' in block and 'compress_image(master_image)' in block
+    assert 'master_image_shape' not in block

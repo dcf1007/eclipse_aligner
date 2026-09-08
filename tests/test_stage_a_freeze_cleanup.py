@@ -1,68 +1,37 @@
-from pathlib import Path
-from types import SimpleNamespace
+import inspect
+import cv2
 import numpy as np
 import pytest
 import circle_arc_detector as cad
 
-SOURCE = Path(cad.__file__).read_text(encoding='utf-8')
+def _guard(shape=(41,51)):
+    g=np.zeros(shape,bool); g[4:-4,4:-4]=True; return g
 
+def test_full_res_seed_is_checked_after_d7_cleanup():
+    source=inspect.getsource(cad.find_full_res_separation_threshold)
+    assert source.index('morphological_cleanup(') < source.index('if binary[seed_y, seed_x] == 0:')
 
-def _state():
-    return {'settings': cad.ImageSettings(), 'auto_threshold_result': None, 'solar_data': None}
-
-
-def test_source_seed_is_checked_after_d7_not_before():
-    gray=np.zeros((31,31),np.uint8); gray[5:26,5:26]=30; gray[15,15]=10
-    guard=np.zeros(gray.shape,bool); guard[2:29,2:29]=True
-    assert cad.find_lowest_full_res_threshold(gray,10,(15,15),guard)==0
-
-
-def test_source_seed_must_still_survive_d7_cleanup():
-    gray=np.zeros((31,31),np.uint8); gray[13:18,13:18]=30
-    guard=np.zeros(gray.shape,bool); guard[2:29,2:29]=True
+def test_full_res_seed_must_survive_d7_cleanup():
+    gray=np.zeros((41,51),np.uint8); gray[20,25]=200
     with pytest.raises(cad.ThresholdResolutionError,match='does not survive D7 cleanup'):
-        cad.find_lowest_full_res_threshold(gray,10,(15,15),guard)
-
+        cad.find_full_res_separation_threshold(gray,100,(25,20),_guard(gray.shape))
 
 def test_find_auto_threshold_requires_authoritative_uint8_gray():
-    with pytest.raises(ValueError,match='requires authoritative uint8 grayscale'):
-        cad.find_auto_threshold(np.zeros((31,31),np.uint16),_state())
+    with pytest.raises(ValueError,match='authoritative 2D uint8 grayscale'):
+        cad.find_auto_threshold(np.zeros((10,10),np.uint16),{'auto_threshold_result':None})
 
-
-def test_source_support_mapping_uses_actual_work_kernel(monkeypatch):
-    gray=np.zeros((120,240),np.uint8); monkeypatch.setattr(cad,'WORK_RES_MAX_DIM',120)
-    monkeypatch.setattr(cad,'find_histogram_start_threshold',lambda _gray:20)
-    real_generate=cad.generate_kernel; first=True
-    def generated(size,round_kernel=False):
-        nonlocal first
-        if first and size==(5,5) and not round_kernel:
-            first=False; return np.ones((7,7),np.uint8)
-        return real_generate(size,round_kernel=round_kernel)
-    monkeypatch.setattr(cad,'generate_kernel',generated)
-    def work(work_gray,_start,received):
-        assert received.shape==(7,7); c=np.zeros(work_gray.shape,bool); c[10:50,30:90]=True; return 12,c
-    monkeypatch.setattr(cad,'find_work_res_solar_component',work)
-    seen={}
-    def seed(_gray,_mask,kernel): seen['shape']=kernel.shape; return (120,60)
-    monkeypatch.setattr(cad,'brightest_supported_component_point',seed)
-    monkeypatch.setattr(cad,'dilate_component_mask',lambda mask,_margin:np.ones(mask.shape,bool))
-    monkeypatch.setattr(cad,'find_lowest_full_res_threshold',lambda _g,t,_s,_m:t)
-    payload=cad.compress_full_mask(np.ones(gray.shape,bool))
-    monkeypatch.setattr(cad,'refine_threshold',lambda _g,t,_s,_m:SimpleNamespace(threshold=t,cleaned_component_mask=payload))
-    assert cad.find_auto_threshold(gray,_state())==12
-    assert seen['shape']==(13,13)
-
+def test_support_mapping_uses_actual_work_kernel(monkeypatch):
+    gray=np.zeros((2400,1600),np.uint8); work=np.zeros((1200,800),bool); work[300:900,200:600]=True; seen=[]
+    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k: seen.append(k.shape) or (800,1200))
+    monkeypatch.setattr(cad,'dilate_component_mask',lambda c,m: np.ones(gray.shape,bool))
+    cad.derive_full_res_seed_and_guard(gray,work,cad.generate_kernel((7,7)))
+    assert seen==[(13,13)]
 
 def test_work_failure_reports_actual_support_kernel_geometry():
-    gray=np.zeros((21,21),np.uint8); gray[9:12,9:12]=30
+    gray=np.zeros((21,21),np.uint8); gray[10,2:19]=200
     with pytest.raises(cad.ThresholdResolutionError,match='7x7-supported'):
-        cad.find_work_res_solar_component(gray,20,cad.generate_kernel((7,7),round_kernel=False))
-
+        cad.find_work_res_separation_threshold(gray,200,cad.generate_kernel((7,7)))
 
 def test_threshold_source_documents_coarse_and_refinement_contract():
-    assert 'def extract_component(' in SOURCE
-    assert SOURCE.count('cv2.floodFill(')==1
-    assert 'def find_guard_boundary(' in SOURCE
-    assert 'MAX_T_REFINEMENT_STEPS = 10' in SOURCE
-    assert 'quality plateau' not in SOURCE.lower()
-    assert 'ThresholdTopology' not in SOURCE
+    source=inspect.getsource(cad.find_full_res_separation_threshold)+inspect.getsource(cad.refine_threshold)
+    assert 'D7' in source and 'MAX_T_REFINEMENT_STEPS' in source

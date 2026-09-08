@@ -11,7 +11,7 @@ import pandas as pd
 
 import circle_arc_detector as cad
 
-EXPECTED = Path(__file__).resolve().parent / "data" / "expected_seed_corpus_52.csv"
+EXPECTED = Path(__file__).resolve().parent / "expected_seed_corpus_52.csv"
 DEFAULT_FRAMES = [
     "0174__DSC0835.jpg",
     "0188__DSC0862.jpg",

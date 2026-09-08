@@ -16,7 +16,7 @@ import pandas as pd
 import circle_arc_detector as cad
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED = Path(__file__).resolve().parent / "data" / "expected_seed_corpus_52.csv"
+EXPECTED = Path(__file__).resolve().parent / "expected_seed_corpus_52.csv"
 
 
 def main() -> None:

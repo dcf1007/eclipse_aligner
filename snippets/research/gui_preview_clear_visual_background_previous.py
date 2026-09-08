@@ -6,7 +6,7 @@
 from pathlib import Path
 import ast
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "circle_arc_detector.py"
 TEXT = SOURCE.read_text(encoding="utf-8")
 

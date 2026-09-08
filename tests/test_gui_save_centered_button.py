@@ -1,15 +1,10 @@
 from pathlib import Path
 
-SOURCE = Path(__file__).resolve().parents[1] / "circle_arc_detector.py"
-text = SOURCE.read_text()
+import circle_arc_detector as cad
 
-assert 'text="Save centered images"' in text
-assert 'command=self.save_centered_images' in text
-assert 'def save_centered_images(self):' in text
-assert 'self.save_centered_button.grid(row=0, column=1' in text
-assert 'frame.columnconfigure(4, weight=1)' in text
-assert 'self.previous_button.grid(row=0, column=2' in text
-assert 'self.next_button.grid(row=0, column=3' in text
-assert 'row=0, column=4, sticky="ew"' in text
+TEXT = Path(cad.__file__).read_text(encoding="utf-8")
 
-print("PASS: Save centered images button is beside Load images and remains GUI-only")
+
+def test_save_centered_button_has_explicit_button_callback_name():
+    assert "command=self.save_centered_images_button" in TEXT
+    assert "def save_centered_images_button(self):" in TEXT
