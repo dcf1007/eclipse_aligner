@@ -30,11 +30,13 @@ Neither stage creates or replaces the result object. The Auto Select button comm
 the winning T through the same setting-change path used by manual GUI interaction.
 
 Selected-T resolution consumes the authoritative Auto-T identity instead of
-independently re-identifying the Sun. ``resolve_threshold()`` owns SolarData cache
-reuse/invalidation/construction, requests complete Auto-T orchestration through
-``find_auto_threshold()``, and never writes Auto-T result fields itself. Exact Auto-T winners
-reuse their stored component and contour; manual T uses one exact guarded P3/P5/P7
-component evaluation without neighboring-threshold search.
+independently re-identifying the Sun. ``resolve_threshold()`` owns SolarData reuse,
+invalidation, construction, and failure publication. ``solar_data is None`` means
+resolution has never been attempted for the selected T; a SolarData with
+``failure_reason`` records an expected failed attempt; a complete SolarData contains
+the authoritative geometry. Impossible partial or inconsistent states raise explicit
+errors. Preview/full-resolution downstream actions may construct genuinely missing
+SolarData, but never retry an already-recorded failed outcome.
 
 The automatic-threshold algorithm uses authoritative 8-bit grayscale with fixed
 semantics ``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel
@@ -585,7 +587,9 @@ def find_work_res_separation_threshold(
         else:
             component = extract_component(work_res_gray > threshold, work_res_seed_point)
             if component is None:
-                break
+                raise ValueError(
+                    "tracked work-resolution seed component disappeared while lowering T"
+                )
             if (
                 np.any(component[0])
                 or np.any(component[-1])
@@ -675,8 +679,8 @@ def find_full_res_separation_threshold(
     binary[~full_res_guard_mask] = 0
     component = extract_component(binary, full_res_seed_point)
     if component is None:
-        raise ThresholdResolutionError(
-            f"Full-resolution tracking seed is unavailable after guard clipping at start T={start_T}"
+        raise ValueError(
+            "full-resolution tracking seed disappeared after clipping to its containing guard"
         )
 
     if not np.any(component & full_res_guard_boundary):
@@ -690,7 +694,11 @@ def find_full_res_separation_threshold(
             )
             binary[~full_res_guard_mask] = 0
             component = extract_component(binary, full_res_seed_point)
-            if component is None or np.any(component & full_res_guard_boundary):
+            if component is None:
+                raise ValueError(
+                    "tracked full-resolution seed component disappeared while lowering T"
+                )
+            if np.any(component & full_res_guard_boundary):
                 break
             best_T = threshold
             best_component = component
@@ -702,7 +710,11 @@ def find_full_res_separation_threshold(
             break
         binary[~full_res_guard_mask] = 0
         component = extract_component(binary, full_res_seed_point)
-        if component is not None and not np.any(component & full_res_guard_boundary):
+        if component is None:
+            raise ValueError(
+                "full-resolution tracking seed disappeared after surviving D7 cleanup"
+            )
+        if not np.any(component & full_res_guard_boundary):
             return threshold, component
 
     raise ThresholdResolutionError(
@@ -1227,10 +1239,10 @@ def measure_edge_alignment(
         edge_distance = math.nan
 
     total_length = float(np.sum(segment_lengths))
-    edge_reliability = (
-        float(np.dot(segment_lengths, profile_reliability) / total_length)
-        if total_length > 0.0
-        else 0.0
+    if not math.isfinite(total_length) or total_length <= 0.0:
+        raise ValueError("sampled grayscale profile length must be finite and positive")
+    edge_reliability = float(
+        np.dot(segment_lengths, profile_reliability) / total_length
     )
     return edge_distance, edge_reliability
 
@@ -1366,13 +1378,13 @@ def refine_threshold(
             *(measurement.filled_area for measurement in measurements),
         )
         if not math.isfinite(max_roughness) or max_roughness <= 0.0 or max_area <= 0:
-            raise ThresholdResolutionError("invalid within-image score scale")
+            raise ValueError("invalid within-image score scale")
 
         edge_reliability = float(
             np.median([measurement.edge_reliability for measurement in measurements])
         )
         if not math.isfinite(edge_reliability):
-            edge_reliability = 0.0
+            raise ValueError("median edge reliability must be finite")
 
         best_threshold: int | None = None
         best_score = -math.inf
@@ -1397,7 +1409,7 @@ def refine_threshold(
                 best_threshold = measurement.threshold
 
         if best_threshold is None:
-            raise ThresholdResolutionError("threshold refinement produced no score winner")
+            raise ValueError("threshold refinement produced no score winner")
 
         winning_contour = candidate_contours[best_threshold]
 
@@ -1419,13 +1431,25 @@ def refine_threshold(
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class SolarData:
-    """Authoritative solar geometry established at exactly one selected threshold T."""
+    """Outcome of solar-geometry resolution at exactly one selected threshold T."""
 
     threshold: int
-    seed_point: tuple[int, int]
-    component_mask: bytes
-    guard_mask: bytes
-    component_contour: bytes
+    seed_point: tuple[int, int] | None = None
+    component_mask: bytes | None = None
+    guard_mask: bytes | None = None
+    component_contour: bytes | None = None
+    failure_reason: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Return whether this object contains the complete authoritative geometry."""
+        return (
+            self.failure_reason is None
+            and self.seed_point is not None
+            and self.component_mask is not None
+            and self.guard_mask is not None
+            and self.component_contour is not None
+        )
 
 
 def resolve_threshold(
@@ -1433,9 +1457,9 @@ def resolve_threshold(
     threshold: int,
     image_state: dict[str, object],
 ) -> np.ndarray:
-    """Resolve selected T, consuming Auto-T identity and atomically publishing SolarData."""
-    if full_res_gray.ndim != 2:
-        raise ValueError("grayscale image must be two-dimensional")
+    """Resolve selected T and atomically publish complete or failed SolarData."""
+    if full_res_gray.ndim != 2 or full_res_gray.dtype != np.uint8:
+        raise ValueError("threshold resolution requires authoritative 2D uint8 grayscale")
     if not 0 <= threshold <= 255:
         raise ValueError("threshold must be 0..255")
     if not isinstance(image_state, dict):
@@ -1445,7 +1469,23 @@ def resolve_threshold(
     if existing is not None and not isinstance(existing, SolarData):
         raise ValueError("stored solar data must be SolarData or None")
     if isinstance(existing, SolarData):
-        if existing.threshold == threshold:
+        if existing.threshold != threshold:
+            image_state["solar_data"] = None
+        elif existing.failure_reason is not None:
+            if any(
+                value is not None
+                for value in (
+                    existing.seed_point,
+                    existing.component_mask,
+                    existing.guard_mask,
+                    existing.component_contour,
+                )
+            ):
+                raise ValueError("failed same-T SolarData must not contain geometry")
+            raise ThresholdResolutionError(existing.failure_reason)
+        else:
+            if not existing.complete:
+                raise ValueError("stored same-T SolarData is incomplete without a failure")
             try:
                 component = decompress_image(existing.component_mask)
                 guard_mask = decompress_image(existing.guard_mask)
@@ -1475,114 +1515,127 @@ def resolve_threshold(
                 raise ValueError("stored same-T SolarData is inconsistent")
             return component
 
-        image_state["solar_data"] = None
+    try:
+        find_auto_threshold(full_res_gray, image_state)
+        auto_threshold_result = image_state.get("auto_threshold_result")
+        if not isinstance(auto_threshold_result, AutoThresholdResult):
+            raise ValueError("Auto-T returned without preserving AutoThresholdResult")
 
-    find_auto_threshold(full_res_gray, image_state)
-    auto_threshold_result = image_state.get("auto_threshold_result")
-    if not isinstance(auto_threshold_result, AutoThresholdResult):
-        raise ValueError("Auto-T returned without preserving AutoThresholdResult")
-
-    if (
-        auto_threshold_result.failure_reason is None
-        and auto_threshold_result.threshold_refinement_complete
-        and threshold == auto_threshold_result.full_res_refined_threshold
-    ):
-        component = decompress_image(
-            auto_threshold_result.full_res_refined_component_mask
-        )
-        solar_data = SolarData(
-            threshold=threshold,
-            seed_point=auto_threshold_result.full_res_seed_point,
-            component_mask=auto_threshold_result.full_res_refined_component_mask,
-            guard_mask=auto_threshold_result.full_res_separation_guard_mask,
-            component_contour=auto_threshold_result.full_res_refined_component_contour,
-        )
-        image_state["solar_data"] = solar_data
-        return component
-
-    full_res_seed_point = auto_threshold_result.full_res_seed_point
-    guard_payload = auto_threshold_result.full_res_separation_guard_mask
-    if (full_res_seed_point is None) != (guard_payload is None):
-        raise ValueError("stored Auto-T full-resolution identity is inconsistent")
-
-    if full_res_seed_point is not None:
-        full_res_guard_mask = decompress_image(guard_payload)
         if (
-            full_res_guard_mask.dtype != bool
-            or full_res_guard_mask.shape != full_res_gray.shape
-            or not np.any(full_res_guard_mask)
+            auto_threshold_result.failure_reason is None
+            and auto_threshold_result.threshold_refinement_complete
+            and threshold == auto_threshold_result.full_res_refined_threshold
         ):
-            raise ValueError("stored Auto-T guard must be a non-empty mask matching grayscale")
-        seed_x, seed_y = full_res_seed_point
-        height, width = full_res_gray.shape
-        if not (0 <= seed_x < width and 0 <= seed_y < height):
-            raise ValueError("stored Auto-T full-resolution seed lies outside grayscale")
-        if not full_res_guard_mask[seed_y, seed_x]:
-            raise ValueError("stored Auto-T full-resolution seed lies outside its guard")
-    else:
-        work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
-        work_component_payload = auto_threshold_result.work_res_separation_component_mask
-        if work_component_payload is not None:
-            work_res_component = decompress_image(work_component_payload)
-            if (
-                work_res_component.dtype != bool
-                or work_res_component.ndim != 2
-                or not np.any(work_res_component)
-            ):
-                raise ValueError("stored Auto-T work component is invalid")
-        else:
-            work_res_shape = calculate_work_res_shape(full_res_gray.shape)
-            work_res_gray = resize_img(full_res_gray, work_res_shape)
-            work_res_component = largest_enclosed_bright_component(
-                work_res_gray > threshold
+            component = decompress_image(
+                auto_threshold_result.full_res_refined_component_mask
             )
-            if work_res_component is None:
-                raise ThresholdResolutionError(
-                    f"No enclosed work-resolution solar proposal exists at selected T={threshold}"
+            solar_data = SolarData(
+                threshold=threshold,
+                seed_point=auto_threshold_result.full_res_seed_point,
+                component_mask=auto_threshold_result.full_res_refined_component_mask,
+                guard_mask=auto_threshold_result.full_res_separation_guard_mask,
+                component_contour=auto_threshold_result.full_res_refined_component_contour,
+            )
+            image_state["solar_data"] = solar_data
+            return component
+
+        full_res_seed_point = auto_threshold_result.full_res_seed_point
+        guard_payload = auto_threshold_result.full_res_separation_guard_mask
+        if (full_res_seed_point is None) != (guard_payload is None):
+            raise ValueError("stored Auto-T full-resolution identity is inconsistent")
+
+        if full_res_seed_point is not None:
+            full_res_guard_mask = decompress_image(guard_payload)
+            if (
+                full_res_guard_mask.dtype != bool
+                or full_res_guard_mask.shape != full_res_gray.shape
+                or not np.any(full_res_guard_mask)
+            ):
+                raise ValueError(
+                    "stored Auto-T guard must be a non-empty mask matching grayscale"
                 )
-            work_res_seed = brightest_supported_component_point(
-                work_res_gray,
+            seed_x, seed_y = full_res_seed_point
+            height, width = full_res_gray.shape
+            if not (0 <= seed_x < width and 0 <= seed_y < height):
+                raise ValueError(
+                    "stored Auto-T full-resolution seed lies outside grayscale"
+                )
+            if not full_res_guard_mask[seed_y, seed_x]:
+                raise ValueError(
+                    "stored Auto-T full-resolution seed lies outside its guard"
+                )
+        else:
+            work_res_seed_kernel = generate_kernel((5, 5), round_kernel=False)
+            work_component_payload = (
+                auto_threshold_result.work_res_separation_component_mask
+            )
+            if work_component_payload is not None:
+                work_res_component = decompress_image(work_component_payload)
+                if (
+                    work_res_component.dtype != bool
+                    or work_res_component.ndim != 2
+                    or not np.any(work_res_component)
+                ):
+                    raise ValueError("stored Auto-T work component is invalid")
+            else:
+                work_res_shape = calculate_work_res_shape(full_res_gray.shape)
+                work_res_gray = resize_img(full_res_gray, work_res_shape)
+                work_res_component = largest_enclosed_bright_component(
+                    work_res_gray > threshold
+                )
+                if work_res_component is None:
+                    raise ThresholdResolutionError(
+                        f"No enclosed work-resolution solar proposal exists at selected T={threshold}"
+                    )
+                work_res_seed = brightest_supported_component_point(
+                    work_res_gray,
+                    work_res_component,
+                    work_res_seed_kernel,
+                )
+                if work_res_seed is None:
+                    raise ThresholdResolutionError(
+                        f"No 5x5-supported enclosed work-resolution solar proposal exists "
+                        f"at selected T={threshold}"
+                    )
+
+            (
+                full_res_seed_point,
+                full_res_guard_mask,
+            ) = derive_full_res_seed_and_guard(
+                full_res_gray,
                 work_res_component,
                 work_res_seed_kernel,
             )
-            if work_res_seed is None:
-                raise ThresholdResolutionError(
-                    f"No 5x5-supported enclosed work-resolution solar proposal exists "
-                    f"at selected T={threshold}"
-                )
 
-        (
+        full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
+        threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+        candidate = extract_separated_seed_component(
+            threshold_mask,
             full_res_seed_point,
             full_res_guard_mask,
-        ) = derive_full_res_seed_and_guard(
-            full_res_gray,
-            work_res_component,
-            work_res_seed_kernel,
+            full_res_guard_boundary,
         )
+        if candidate is None:
+            raise ThresholdResolutionError(
+                f"No separated cleaned solar component exists at selected T={threshold}"
+            )
+        component, contour = candidate
 
-    full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
-    threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
-    candidate = extract_separated_seed_component(
-        threshold_mask,
-        full_res_seed_point,
-        full_res_guard_mask,
-        full_res_guard_boundary,
-    )
-    if candidate is None:
-        raise ThresholdResolutionError(
-            f"No separated cleaned solar component exists at selected T={threshold}"
+        solar_data = SolarData(
+            threshold=threshold,
+            seed_point=full_res_seed_point,
+            component_mask=compress_image(component),
+            guard_mask=compress_image(full_res_guard_mask),
+            component_contour=compress_contour(contour),
         )
-    component, contour = candidate
-
-    solar_data = SolarData(
-        threshold=threshold,
-        seed_point=full_res_seed_point,
-        component_mask=compress_image(component),
-        guard_mask=compress_image(full_res_guard_mask),
-        component_contour=compress_contour(contour),
-    )
-    image_state["solar_data"] = solar_data
-    return component
+        image_state["solar_data"] = solar_data
+        return component
+    except ThresholdResolutionError as exc:
+        image_state["solar_data"] = SolarData(
+            threshold=threshold,
+            failure_reason=str(exc),
+        )
+        raise
 
 
 class DetectorApp:
@@ -1603,7 +1656,7 @@ class DetectorApp:
         self.gray_image = None
 
         # Per-image state keeps sparse settings, the cached automatic threshold
-        # result, and post-threshold SolarData when solar geometry has been built.
+        # result, and the attempted SolarData outcome for the selected threshold.
         self.image_state: dict[str, dict[str, object]] = {}
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
@@ -2426,16 +2479,54 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         settings = state["settings"]
-        solar_data = state.get("solar_data")
-        if (
-            settings.threshold is None
-            or not isinstance(solar_data, SolarData)
-            or solar_data.threshold != settings.threshold
-        ):
-            self.status.set("Refresh Preview requires current SolarData for the selected threshold.")
+        if settings.threshold is None:
+            self.status.set("Refresh Preview requires an initialized threshold.")
             return
 
         with self.blocked_gui():
+            solar_data = state.get("solar_data")
+            if solar_data is None:
+                try:
+                    resolve_threshold(
+                        self.gray_image,
+                        settings.threshold,
+                        state,
+                    )
+                except ThresholdResolutionError as exc:
+                    self.status.set(
+                        f"Refresh Preview stopped: SolarData could not be established "
+                        f"at T={settings.threshold} ({exc})."
+                    )
+                    return
+                solar_data = state.get("solar_data")
+
+            if not isinstance(solar_data, SolarData):
+                raise ValueError("Refresh Preview requires SolarData or None")
+            if solar_data.threshold != settings.threshold:
+                raise ValueError(
+                    "Refresh Preview found SolarData for a different threshold"
+                )
+            if solar_data.failure_reason is not None:
+                if any(
+                    value is not None
+                    for value in (
+                        solar_data.seed_point,
+                        solar_data.component_mask,
+                        solar_data.guard_mask,
+                        solar_data.component_contour,
+                    )
+                ):
+                    raise ValueError("failed SolarData must not contain geometry")
+                self.status.set(
+                    f"Refresh Preview stopped: SolarData failed at "
+                    f"T={solar_data.threshold} ({solar_data.failure_reason})."
+                )
+                return
+            if not solar_data.complete:
+                raise ValueError(
+                    "Refresh Preview found incomplete SolarData without a failure"
+                )
+
             # TODO: horizon finding consumes solar_data.
             # TODO: ellipse finding consumes the horizon/SolarData products.
             # TODO: center the full-color image from the validated geometry.
@@ -2452,18 +2543,54 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         settings = state["settings"]
-        solar_data = state.get("solar_data")
-        if (
-            settings.threshold is None
-            or not isinstance(solar_data, SolarData)
-            or solar_data.threshold != settings.threshold
-        ):
-            self.status.set(
-                "Apply Full Resolution requires current SolarData for the selected threshold."
-            )
+        if settings.threshold is None:
+            self.status.set("Apply Full Resolution requires an initialized threshold.")
             return
 
         with self.blocked_gui():
+            solar_data = state.get("solar_data")
+            if solar_data is None:
+                try:
+                    resolve_threshold(
+                        self.gray_image,
+                        settings.threshold,
+                        state,
+                    )
+                except ThresholdResolutionError as exc:
+                    self.status.set(
+                        f"Apply Full Resolution stopped: SolarData could not be established "
+                        f"at T={settings.threshold} ({exc})."
+                    )
+                    return
+                solar_data = state.get("solar_data")
+
+            if not isinstance(solar_data, SolarData):
+                raise ValueError("Apply Full Resolution requires SolarData or None")
+            if solar_data.threshold != settings.threshold:
+                raise ValueError(
+                    "Apply Full Resolution found SolarData for a different threshold"
+                )
+            if solar_data.failure_reason is not None:
+                if any(
+                    value is not None
+                    for value in (
+                        solar_data.seed_point,
+                        solar_data.component_mask,
+                        solar_data.guard_mask,
+                        solar_data.component_contour,
+                    )
+                ):
+                    raise ValueError("failed SolarData must not contain geometry")
+                self.status.set(
+                    f"Apply Full Resolution stopped: SolarData failed at "
+                    f"T={solar_data.threshold} ({solar_data.failure_reason})."
+                )
+                return
+            if not solar_data.complete:
+                raise ValueError(
+                    "Apply Full Resolution found incomplete SolarData without a failure"
+                )
+
             # TODO: full-resolution horizon finding consumes solar_data.
             # TODO: full-resolution ellipse finding consumes those products.
             # TODO: center/export the full-color image from the validated geometry.

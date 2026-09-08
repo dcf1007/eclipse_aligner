@@ -2,6 +2,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import circle_arc_detector as cad
 
@@ -52,16 +53,117 @@ def test_heavy_preview_and_full_resolution_do_not_resolve_threshold(monkeypatch)
     assert "downstream full-resolution" in app.status.get()
 
 
-def test_heavy_actions_require_same_t_solardata():
+@pytest.mark.parametrize(
+    "action_name",
+    ("preview_button_clicked", "full_button_clicked"),
+)
+def test_heavy_actions_reject_stale_different_t_solardata(action_name):
     app = _app()
-    app.image_state["img"]["solar_data"] = cad.SolarData(9, (0, 0), b"c", b"g", b"q")
-    app.preview_button_clicked()
-    assert "requires current SolarData" in app.status.get()
+    app.image_state["img"]["solar_data"] = cad.SolarData(
+        9, (0, 0), b"c", b"g", b"q"
+    )
+    with pytest.raises(ValueError, match="different threshold"):
+        getattr(app, action_name)()
 
-def test_gui_source_contains_downstream_placeholders_after_solardata_precondition():
+
+def test_gui_source_constructs_only_missing_solardata_before_downstream_placeholders():
     text = Path(cad.__file__).read_text(encoding="utf-8")
-    preview = text.split("def preview_button_clicked(self):", 1)[1].split("def full_button_clicked", 1)[0]
-    assert "resolve_threshold(" not in preview
-    assert "# TODO: horizon finding consumes solar_data." in preview
+    preview = text.split("def preview_button_clicked(self):", 1)[1].split(
+        "def full_button_clicked", 1
+    )[0]
+    assert preview.index("if solar_data is None:") < preview.index("resolve_threshold(")
+    assert preview.index("resolve_threshold(") < preview.index(
+        "# TODO: horizon finding consumes solar_data."
+    )
+    assert "solar_data.failure_reason is not None" in preview
+    assert "not solar_data.complete" in preview
     assert "# TODO: ellipse finding" in preview
     assert "# TODO: center the full-color image" in preview
+
+
+def _complete_solar_data(threshold=10):
+    return cad.SolarData(threshold, (0, 0), b"c", b"g", b"q")
+
+
+@pytest.mark.parametrize(
+    "action_name, status_fragment",
+    (
+        ("preview_button_clicked", "downstream preview"),
+        ("full_button_clicked", "downstream full-resolution"),
+    ),
+)
+def test_heavy_actions_construct_missing_solardata_once(
+    monkeypatch, action_name, status_fragment
+):
+    app = _app()
+    solar = _complete_solar_data()
+    calls = []
+
+    def resolve(gray, threshold, state):
+        calls.append(threshold)
+        state["solar_data"] = solar
+        return gray > threshold
+
+    monkeypatch.setattr(cad, "resolve_threshold", resolve)
+    getattr(app, action_name)()
+    assert calls == [10]
+    assert app.image_state["img"]["solar_data"] is solar
+    assert status_fragment in app.status.get()
+
+
+@pytest.mark.parametrize(
+    "action_name",
+    ("preview_button_clicked", "full_button_clicked"),
+)
+def test_heavy_actions_stop_on_newly_failed_solardata(monkeypatch, action_name):
+    app = _app()
+    calls = []
+
+    def resolve(gray, threshold, state):
+        calls.append(threshold)
+        state["solar_data"] = cad.SolarData(
+            threshold=threshold,
+            failure_reason="no solar component",
+        )
+        raise cad.ThresholdResolutionError("no solar component")
+
+    monkeypatch.setattr(cad, "resolve_threshold", resolve)
+    getattr(app, action_name)()
+    assert calls == [10]
+    assert "stopped" in app.status.get()
+    assert "no solar component" in app.status.get()
+
+
+@pytest.mark.parametrize(
+    "action_name",
+    ("preview_button_clicked", "full_button_clicked"),
+)
+def test_heavy_actions_do_not_retry_cached_failed_solardata(
+    monkeypatch, action_name
+):
+    app = _app()
+    app.image_state["img"]["solar_data"] = cad.SolarData(
+        threshold=10,
+        failure_reason="known failure",
+    )
+    monkeypatch.setattr(
+        cad,
+        "resolve_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("cached failure retried")),
+    )
+    getattr(app, action_name)()
+    assert "known failure" in app.status.get()
+
+
+@pytest.mark.parametrize(
+    "action_name",
+    ("preview_button_clicked", "full_button_clicked"),
+)
+def test_heavy_actions_reject_partial_solardata(action_name):
+    app = _app()
+    app.image_state["img"]["solar_data"] = cad.SolarData(
+        threshold=10,
+        seed_point=(0, 0),
+    )
+    with pytest.raises(ValueError, match="incomplete SolarData"):
+        getattr(app, action_name)()

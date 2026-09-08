@@ -109,13 +109,18 @@ def test_threshold_change_rebuilds_solardata_through_resolver():
     assert state["solar_data"].threshold == threshold + 1
 
 
-def test_heavy_actions_begin_from_current_solardata_not_resolver():
-    source = inspect.getsource(cad.DetectorApp.preview_button_clicked)
-    assert "solar_data = state.get" in source
-    assert "resolve_threshold(" not in source
-    source = inspect.getsource(cad.DetectorApp.full_button_clicked)
-    assert "solar_data = state.get" in source
-    assert "resolve_threshold(" not in source
+def test_heavy_actions_construct_only_genuinely_missing_solardata():
+    for action in (
+        cad.DetectorApp.preview_button_clicked,
+        cad.DetectorApp.full_button_clicked,
+    ):
+        source = inspect.getsource(action)
+        lookup = source.index('solar_data = state.get("solar_data")')
+        missing = source.index("if solar_data is None:")
+        resolve = source.index("resolve_threshold(")
+        assert lookup < missing < resolve
+        assert "solar_data.failure_reason is not None" in source
+        assert "not solar_data.complete" in source
 
 
 def test_source_has_one_lightweight_setting_application_path():
