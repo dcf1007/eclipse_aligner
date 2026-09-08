@@ -59,7 +59,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
     cv2.circle(mask, (110, 110), 55, 255, -1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     contour = contours[0].reshape(-1, 2).astype(np.int32)
-    profiles, lengths = cad._sample_grayscale_profiles(gray, contour)
+    profiles, lengths = cad.sample_grayscale_profiles(gray, contour)
     assert profiles.shape[1] == 2 * cad.EDGE_PROFILE_RADIUS_PX + 1
     assert len(profiles) == len(lengths)
     assert 0 < len(profiles) < len(contour)
@@ -102,7 +102,7 @@ def test_stageb_source_has_only_one_edge_profile_helper_and_no_solidity_descript
         "EDGE_NORMAL_TANGENT_HALF_SPAN",
     ):
         assert removed not in text
-    assert "def _sample_grayscale_profiles(" in text
+    assert "def sample_grayscale_profiles(" in text
     assert "def measure_edge_alignment(" in text
     assert "def measure_hole_quality(" in text
     assert "edge_reliability**2" not in text

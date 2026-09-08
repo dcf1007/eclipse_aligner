@@ -9,7 +9,7 @@ TEXT = Path(cad.__file__).read_text(encoding="utf-8")
 
 def _load_block():
     return TEXT.split("def load_image_at(self, index: int):", 1)[1].split(
-        "\n    def previous_image_button", 1
+        "\n    def previous_button_clicked", 1
     )[0]
 
 
@@ -29,24 +29,26 @@ def test_load_runs_complete_autot_before_restoring_settings():
     assert "self.apply_changed_setting(setting_name, value)" in block
 
 
-def test_load_restored_threshold_overrides_auto_and_missing_threshold_uses_auto():
+def test_load_threshold_precedence_is_stored_then_auto_then_default():
     block = _load_block()
-    assert "settings.threshold" in block and "if settings.threshold is not None" in block
+    assert "value = settings.threshold" in block
+    assert "if value is None:" in block
     assert "automatic_threshold" in block
+    assert "self.default_settings.threshold" in block
 
 
 def test_load_finishes_with_heavy_refresh_after_lightweight_restoration():
     block = _load_block()
     assert block.index("self.apply_changed_setting(setting_name, value)") < block.index(
-        "self.refresh_preview_button()"
+        "self.preview_button_clicked()"
     )
 
 
 def test_previous_and_next_only_select_index_then_use_load_image_at():
-    previous = TEXT.split("def previous_image_button(self):", 1)[1].split(
-        "def next_image_button", 1
+    previous = TEXT.split("def previous_button_clicked(self):", 1)[1].split(
+        "def next_button_clicked", 1
     )[0]
-    next_block = TEXT.split("def next_image_button(self):", 1)[1].split(
+    next_block = TEXT.split("def next_button_clicked(self):", 1)[1].split(
         "@contextmanager", 1
     )[0]
     assert "self.load_image_at(self.current_index - 1)" in previous

@@ -22,7 +22,7 @@ def _app():
     app.default_settings = cad.ImageSettings(min_radius=1000)
     app.image_state = {"img": {"settings": cad.ImageSettings(threshold=10), "auto_threshold_result": None, "solar_data": None}}
     app.status = Var("")
-    app.processing_ui = nullcontext
+    app.blocked_gui = nullcontext
     return app
 
 
@@ -46,21 +46,21 @@ def test_heavy_preview_and_full_resolution_do_not_resolve_threshold(monkeypatch)
     app = _app()
     app.image_state["img"]["solar_data"] = cad.SolarData(10, (0, 0), b"c", b"g", b"q")
     monkeypatch.setattr(cad, "resolve_threshold", lambda *_: (_ for _ in ()).throw(AssertionError("resolver called")))
-    app.refresh_preview_button()
+    app.preview_button_clicked()
     assert "downstream preview" in app.status.get()
-    app.apply_full_resolution_button()
+    app.full_button_clicked()
     assert "downstream full-resolution" in app.status.get()
 
 
 def test_heavy_actions_require_same_t_solardata():
     app = _app()
     app.image_state["img"]["solar_data"] = cad.SolarData(9, (0, 0), b"c", b"g", b"q")
-    app.refresh_preview_button()
+    app.preview_button_clicked()
     assert "requires current SolarData" in app.status.get()
 
 def test_gui_source_contains_downstream_placeholders_after_solardata_precondition():
     text = Path(cad.__file__).read_text(encoding="utf-8")
-    preview = text.split("def refresh_preview_button(self):", 1)[1].split("def apply_full_resolution_button", 1)[0]
+    preview = text.split("def preview_button_clicked(self):", 1)[1].split("def full_button_clicked", 1)[0]
     assert "resolve_threshold(" not in preview
     assert "# TODO: horizon finding consumes solar_data." in preview
     assert "# TODO: ellipse finding" in preview

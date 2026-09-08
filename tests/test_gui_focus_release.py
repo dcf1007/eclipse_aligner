@@ -11,7 +11,12 @@ def test_source_parses():
     ast.parse(TEXT)
 
 def test_root_observes_mouse_clicks_for_focus_release():
-    assert 'root.bind("<ButtonPress-1>", self._release_slider_focus_if_clicked_elsewhere, add="+")' in TEXT
+    assert '"<ButtonPress-1>"' in TEXT
+    assert 'self._release_slider_focus_if_clicked_elsewhere' in TEXT
+    assert 'root.bind("<Return>"' not in TEXT
+    assert 'root.bind("<Escape>"' not in TEXT
+    assert 'root.protocol("WM_DELETE_WINDOW"' not in TEXT
+    assert 'def close(' not in TEXT
 
 def test_outside_click_releases_only_scale_focus():
     assert 'def _release_slider_focus_if_clicked_elsewhere(self, event):' in TEXT

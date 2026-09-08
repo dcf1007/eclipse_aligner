@@ -84,7 +84,7 @@ def test_apply_changed_setting_persists_exact_threshold_and_resolves(monkeypatch
     app.setting_variables = {"threshold": app.threshold}
     app.default_settings = cad.ImageSettings()
     app.image_state = {"image": {"settings": cad.ImageSettings(), "auto_threshold_result": None, "solar_data": None}}
-    app.processing_ui = nullcontext
+    app.blocked_gui = nullcontext
     app.status = Var("")
     calls = []
     monkeypatch.setattr(cad, "resolve_threshold", lambda gray, threshold, state: calls.append(threshold) or (gray > threshold))
@@ -102,7 +102,7 @@ def test_threshold_change_rebuilds_solardata_through_resolver():
     app = cad.DetectorApp.__new__(cad.DetectorApp)
     app.current_path = "image"; app.gray_image = gray; app.threshold = Var(threshold)
     app.setting_variables = {"threshold": app.threshold}; app.default_settings = cad.ImageSettings()
-    app.image_state = {"image": state}; app.processing_ui = nullcontext; app.status = Var("")
+    app.image_state = {"image": state}; app.blocked_gui = nullcontext; app.status = Var("")
     app.apply_changed_setting("threshold", threshold + 1)
     assert state["settings"].threshold == threshold + 1
     assert state["solar_data"] is not old
@@ -110,10 +110,10 @@ def test_threshold_change_rebuilds_solardata_through_resolver():
 
 
 def test_heavy_actions_begin_from_current_solardata_not_resolver():
-    source = inspect.getsource(cad.DetectorApp.refresh_preview_button)
+    source = inspect.getsource(cad.DetectorApp.preview_button_clicked)
     assert "solar_data = state.get" in source
     assert "resolve_threshold(" not in source
-    source = inspect.getsource(cad.DetectorApp.apply_full_resolution_button)
+    source = inspect.getsource(cad.DetectorApp.full_button_clicked)
     assert "solar_data = state.get" in source
     assert "resolve_threshold(" not in source
 
@@ -129,7 +129,7 @@ def test_source_has_one_lightweight_setting_application_path():
 def test_load_runs_autot_before_setting_restoration_and_refresh():
     source = inspect.getsource(cad.DetectorApp.load_image_at)
     assert source.index("find_auto_threshold(") < source.index("for setting_name in self.setting_variables:")
-    assert source.index("self.apply_changed_setting(setting_name, value)") < source.index("self.refresh_preview_button()")
+    assert source.index("self.apply_changed_setting(setting_name, value)") < source.index("self.preview_button_clicked()")
 
 
 def test_resolve_threshold_is_atomic_solardata_writer_and_does_not_write_settings():

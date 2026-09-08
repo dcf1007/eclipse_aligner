@@ -36,6 +36,11 @@ def test_removed_cumbersome_helpers_and_old_codecs():
         "ROI_DILATION_FRACTION",
         "\nGUARD_DILATION_FRACTION =",
         "SOLAR_COMPONENT_KERNEL",
+        "def opaque_bgra(",
+        "def nearest_positive_odd(",
+        "def build_parser(",
+        "def validate_args(",
+        "def close(",
     ):
         assert name not in TEXT
 
@@ -61,7 +66,7 @@ def test_expected_stage_names_and_shared_helpers_exist():
 
 
 def test_edge_descriptor_uses_one_profile_helper_without_old_scaffolding():
-    assert "def _sample_grayscale_profiles(" in TEXT
+    assert "def sample_grayscale_profiles(" in TEXT
     for removed in (
         "def _sample_edge_profiles(",
         "def _contour_normals(",
@@ -69,7 +74,7 @@ def test_edge_descriptor_uses_one_profile_helper_without_old_scaffolding():
         "def _linear_fit(",
     ):
         assert removed not in TEXT
-    block = TEXT.split("def _sample_grayscale_profiles(", 1)[1].split("\n\ndef ", 1)[0]
+    block = TEXT.split("def sample_grayscale_profiles(", 1)[1].split("\n\ndef ", 1)[0]
     assert "math.hypot(0.5, 0.5)" in block
     assert "cv2.GaussianBlur" not in block
 
@@ -88,8 +93,8 @@ def test_stageb_descriptor_set_is_roughness_holes_area_and_edge_only():
 
 
 def test_gui_auto_select_button_delegates_parent_then_setting_application():
-    block = TEXT.split("    def auto_select_threshold_button(self):", 1)[1].split(
-        "\n    def auto_select_radius_button", 1
+    block = TEXT.split("    def threshold_auto_button_clicked(self):", 1)[1].split(
+        "\n    def radius_auto_button_clicked", 1
     )[0]
     assert "find_auto_threshold(" in block
     assert "find_separation_threshold(" not in block
@@ -100,13 +105,13 @@ def test_gui_auto_select_button_delegates_parent_then_setting_application():
 
 def test_gui_button_callbacks_name_the_widget_boundary():
     for name in (
-        "load_images_button",
-        "save_centered_images_button",
-        "previous_image_button",
-        "next_image_button",
-        "auto_select_threshold_button",
-        "auto_select_radius_button",
-        "refresh_preview_button",
-        "apply_full_resolution_button",
+        "load_images_button_clicked",
+        "save_centered_button_clicked",
+        "previous_button_clicked",
+        "next_button_clicked",
+        "threshold_auto_button_clicked",
+        "radius_auto_button_clicked",
+        "preview_button_clicked",
+        "full_button_clicked",
     ):
         assert f"def {name}(" in TEXT

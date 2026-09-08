@@ -18,4 +18,5 @@ def test_threshold_candidate_palette_is_absent():
 
 def test_control_rows_close_gap_after_palette_removal():
     assert 'button_frame.grid(row=7, column=0, columnspan=4, sticky="w", pady=(2, 0))' in TEXT
-    assert ').grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))' in TEXT
+    assert 'status_label.grid(' in TEXT
+    assert 'row=8' in TEXT

@@ -9,9 +9,10 @@ ROOT=Path(__file__).parents[1]; SOURCE=ROOT/'circle_arc_detector.py'
 def _legacy(component,margin):
     outside=np.where(component,0,255).astype(np.uint8); return cv2.distanceTransform(outside,cv2.DIST_L2,5)<=margin
 
-def test_nearest_positive_odd_preserves_lower_tie_rule():
-    assert cad.nearest_positive_odd(23.9)==23 and cad.nearest_positive_odd(24.0)==23 and cad.nearest_positive_odd(24.1)==25
-    with pytest.raises(ValueError): cad.nearest_positive_odd(0)
+def test_mapped_seed_support_keeps_lower_odd_tie_rule_inline():
+    source=SOURCE.read_text()
+    assert 'def nearest_positive_odd(' not in source
+    assert '2 * math.ceil(mapped_kernel_size / 2) - 1' in source
 
 def test_uint16_binary_resize_preserves_exact_values_when_declared_mask():
     mask=np.zeros((5,7),np.uint16); mask[1:4,2:6]=65535; r=cad.resize_img(mask,(13,17),mask=True)

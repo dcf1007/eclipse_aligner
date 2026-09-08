@@ -24,7 +24,7 @@ def test_stage_b_consumes_same_stage_a_seed_and_guard(monkeypatch):
     assert seen and all(s==seed and same for s,same in seen)
 
 def test_uint8_bgr_load_path_expands_exactly_to_uint16_master():
-    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
     assert 'master_image.astype(np.uint16) * 257' in block and 'cv2.COLOR_BGR2BGRA' in block
 
 def test_uint16_bgra_master_is_retained_by_shared_codec():
@@ -32,10 +32,10 @@ def test_uint16_bgra_master_is_retained_by_shared_codec():
     assert np.array_equal(cad.decompress_image(cad.compress_image(master)),master)
 
 def test_display_mapping_is_fixed_full_range_and_preserves_alpha_scale_in_load_source():
-    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
     assert '(master_image.astype(np.uint32) + 128) // 257' in block
 
 def test_production_load_path_uses_unchanged_master_and_numpy_shape_convention():
-    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_image_button',1)[0]
+    block=SOURCE.split('def load_image_at(self, index: int):',1)[1].split('def previous_button_clicked',1)[0]
     assert 'cv2.IMREAD_UNCHANGED' in block and 'compress_image(master_image)' in block
     assert 'master_image_shape' not in block
