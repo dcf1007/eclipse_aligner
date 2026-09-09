@@ -495,12 +495,23 @@ def brightest_supported_component_point(
 ) -> tuple[int, int] | None:
     """Return the brightest support-eligible component pixel; depth breaks ties.
 
+    Selection is lexicographic: first keep only pixels whose complete support kernel
+    fits inside the component, then maximize grayscale, then maximize L2 distance to
+    the component background. The implementation deliberately reuses the erosion
+    raster as the brightest-supported mask and uses masked ``minMaxLoc`` operations
+    so the ranking does not require separate full-frame brightest or float32 score
+    rasters.
+
     The caller owns support geometry and the meaning of an unavailable point. Empty
     or unsupported components return ``None``; malformed caller inputs remain errors.
     """
     component = np.asarray(component)
+
+    # A bool mask already stores one byte per pixel. OpenCV only needs zero/nonzero
+    # membership here, so view False/True as uint8 0/1 without allocating a 0/255
+    # copy. Non-bool callers retain the existing explicit binary normalization.
     source = (
-        bool_mask_to_uint8(component)
+        component.view(np.uint8)
         if component.dtype == bool
         else cv2.compare(component, 0, cv2.CMP_NE)
     )
@@ -512,22 +523,34 @@ def brightest_supported_component_point(
     if not np.any(source):
         return None
 
+    # Erosion already returns an 8-bit binary raster. Keep that storage instead of
+    # allocating a second full-frame bool mask with ``!= 0``.
     supported = cv2.erode(
         source,
         support_kernel,
         iterations=1,
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
-    ) != 0
+    )
     if not np.any(supported):
         return None
 
-    max_gray = int(gray[supported].max())
-    brightest = supported & (gray == max_gray)
+    # Obtain the primary brightness winner directly under the support mask. This
+    # avoids materializing the packed ``gray[supported]`` advanced-indexing copy.
+    max_gray = int(cv2.minMaxLoc(gray, mask=supported)[1])
+
+    # The support mask is no longer needed in its original form. Reuse its bytes as
+    # the brightest-supported mask: unsupported pixels stay false, while supported
+    # pixels are replaced in place by whether they equal the winning gray value.
+    supported_bool = supported.view(np.bool_)
+    np.equal(gray, max_gray, out=supported_bool, where=supported_bool)
+
+    # Preserve the agreed L2-depth secondary tie-break, but select the maximum
+    # distance directly under the brightest-supported mask. This avoids allocating
+    # the second full-frame float32 ``scores`` raster used only for np.argmax().
     distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
-    scores = np.where(brightest, distance, -1.0)
-    y, x = np.unravel_index(int(np.argmax(scores)), scores.shape)
-    return int(x), int(y)
+    max_location = cv2.minMaxLoc(distance, mask=supported)[3]
+    return int(max_location[0]), int(max_location[1])
 
 
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
