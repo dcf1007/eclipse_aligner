@@ -34,9 +34,11 @@ independently re-identifying the Sun. ``resolve_threshold()`` owns SolarData reu
 invalidation, construction, and failure publication. ``solar_data is None`` means
 resolution has never been attempted for the selected T; a SolarData with
 ``failure_reason`` records an expected failed attempt; a complete SolarData contains
-the authoritative geometry. Impossible partial or inconsistent states raise explicit
-errors. Preview/full-resolution downstream actions may construct genuinely missing
-SolarData, but never retry an already-recorded failed outcome.
+the authoritative geometry. Complete same-T SolarData is immutable and reused directly;
+only its component is decoded to satisfy ``resolve_threshold()``'s ndarray return
+contract. Impossible partial states raise explicit errors. Preview/full-resolution
+downstream actions may construct genuinely missing SolarData, but never retry an
+already-recorded failed outcome.
 
 The automatic-threshold algorithm uses authoritative 8-bit grayscale with fixed
 semantics ``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel
@@ -1567,48 +1569,19 @@ def resolve_threshold(
         if existing.threshold != threshold:
             image_state["solar_data"] = None
         elif existing.failure_reason is not None:
-            if any(
-                value is not None
-                for value in (
-                    existing.seed_point,
-                    existing.component_mask,
-                    existing.guard_mask,
-                    existing.component_contour,
-                )
-            ):
-                raise ValueError("failed same-T SolarData must not contain geometry")
             raise ThresholdResolutionError(existing.failure_reason)
+        elif not existing.complete:
+            raise ValueError("stored same-T SolarData is incomplete without a failure")
         else:
-            if not existing.complete:
-                raise ValueError("stored same-T SolarData is incomplete without a failure")
+            # SolarData is frozen and its stored payloads are immutable once published.
+            # A complete same-T object is therefore authoritative; decode only the
+            # component required by this function's ndarray return contract.
             try:
-                component = decompress_image(existing.component_mask)
-                guard_mask = decompress_image(existing.guard_mask)
-                contour = decompress_contour(existing.component_contour)
+                return decompress_image(existing.component_mask)
             except (ValueError, zlib.error) as exc:
-                raise ValueError("stored same-T SolarData payload is corrupt") from exc
-
-            seed_x, seed_y = existing.seed_point
-            height, width = full_res_gray.shape
-            if (
-                component.dtype != bool
-                or component.shape != full_res_gray.shape
-                or not np.any(component)
-                or guard_mask.dtype != bool
-                or guard_mask.shape != full_res_gray.shape
-                or not np.any(guard_mask)
-                or not (0 <= seed_x < width and 0 <= seed_y < height)
-                or not component[seed_y, seed_x]
-                or not guard_mask[seed_y, seed_x]
-                or np.any(component & ~guard_mask)
-                or full_res_gray[seed_y, seed_x] <= threshold
-                or contour.dtype != np.int32
-                or contour.ndim != 2
-                or contour.shape[1] != 2
-                or len(contour) == 0
-            ):
-                raise ValueError("stored same-T SolarData is inconsistent")
-            return component
+                raise ValueError(
+                    "stored same-T SolarData component payload is corrupt"
+                ) from exc
 
     try:
         find_auto_threshold(full_res_gray, image_state)

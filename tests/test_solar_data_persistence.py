@@ -75,15 +75,17 @@ def test_same_t_partial_solardata_without_failure_is_invariant_error():
         cad.resolve_threshold(gray,100,state)
 
 
-def test_failed_solardata_with_geometry_is_invariant_error():
+def test_same_t_failed_solardata_uses_recorded_failure_without_geometry_revalidation():
     gray=_gray(); state=_state()
-    state['solar_data']=cad.SolarData(
+    failed = cad.SolarData(
         threshold=100,
         seed_point=(45,40),
         failure_reason='failed',
     )
-    with pytest.raises(ValueError,match='must not contain geometry'):
+    state['solar_data'] = failed
+    with pytest.raises(cad.ThresholdResolutionError, match='failed'):
         cad.resolve_threshold(gray,100,state)
+    assert state['solar_data'] is failed
 
 
 def test_resolver_validates_uint8_before_same_t_cache_reuse():
@@ -102,3 +104,26 @@ def test_invariant_valueerror_does_not_publish_failed_solardata(monkeypatch):
     with pytest.raises(ValueError,match='broken invariant'):
         cad.resolve_threshold(gray,100,state)
     assert state['solar_data'] is None
+
+
+def test_complete_same_t_solardata_trusts_immutable_guard_and_contour_payloads(monkeypatch):
+    gray=_gray(); state=_state()
+    component = gray > 100
+    solar = cad.SolarData(
+        threshold=100,
+        seed_point=(45,40),
+        component_mask=cad.compress_image(component),
+        guard_mask=b'guard-not-decoded',
+        component_contour=b'contour-not-decoded',
+    )
+    state['solar_data'] = solar
+    monkeypatch.setattr(
+        cad,
+        'decompress_contour',
+        lambda *_: (_ for _ in ()).throw(AssertionError('contour decoded')),
+    )
+
+    resolved = cad.resolve_threshold(gray,100,state)
+
+    assert np.array_equal(resolved, component)
+    assert state['solar_data'] is solar

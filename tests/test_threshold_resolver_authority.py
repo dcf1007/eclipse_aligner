@@ -139,7 +139,7 @@ def test_corrupt_same_t_solardata_raises_instead_of_rebuilding():
         component_contour=b"not-zlib",
     )
     state["solar_data"] = stale
-    with pytest.raises(ValueError, match="same-T SolarData payload is corrupt"):
+    with pytest.raises(ValueError, match="same-T SolarData component payload is corrupt"):
         cad.resolve_threshold(gray, selected, state)
     assert state["solar_data"] is stale
 
