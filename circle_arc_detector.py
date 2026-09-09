@@ -7,19 +7,19 @@ and cached automatic-threshold/SolarData outcomes. Color-to-grayscale conversion
 an input-stage responsibility and is performed before the threshold algorithm is called.
 
 All processing controls are per-image. ``DetectorApp.image_state`` is keyed by the
-absolute image path. Non-threshold settings are sparse overrides relative to the
-application defaults. ``settings.threshold`` is different: ``None`` means T has never
-been initialized, and once initialized its exact integer value is always stored. A new
-image uses a stored T when present, otherwise the Auto-T winner, and falls back to the
-application default T only when Auto T fails.
+absolute image path, and each ``ImageSettings`` stores the complete selected settings.
+A new image starts from the concrete ``ImageSettings`` defaults, then invokes the Auto
+Select threshold action: a successful Auto-T replaces the default T, while a failed
+Auto-T leaves the default T=8 unchanged. Existing images restore their exact stored
+settings without proactively rerunning Auto-T.
 
 Slider labels update continuously, but a setting is applied only after mouse release
 or the final keyboard key release. Checkboxes and radio buttons apply immediately.
 Every completed setting change passes through
 ``apply_changed_setting(setting_name, value)``. A genuinely changed T first restores
 authoritative grayscale, then resolves the selected-T SolarData and displays its solar
-component when successful. Non-T changes do not repaint an already-identical plain
-solar mask, but they replace stale downstream overlays with that authoritative mask.
+component when successful. Non-threshold settings are persisted without resolving or
+repainting SolarData; their downstream processing stages will own their effects.
 
 Automatic threshold selection is orchestrated by ``find_auto_threshold()``, which
 owns the current image's single ``AutoThresholdResult`` and runs the two tested
@@ -60,6 +60,7 @@ horizon special case in automatic threshold selection.
 
 import argparse
 from contextlib import contextmanager
+import dataclasses
 from dataclasses import dataclass
 import math
 import os
@@ -368,17 +369,17 @@ def decompress_contour(payload: bytes) -> np.ndarray:
 # ---------------------------------------------------------------------------
 @dataclass
 class ImageSettings:
-    """Per-image settings. Threshold ``None`` means never initialized; other ``None`` values use defaults."""
+    """Complete per-image processing settings."""
 
-    threshold: int | None = None
-    min_radius: int | None = None
-    max_radius: int | None = None
-    max_error: float | None = None
-    min_coverage: int | None = None
-    morphology: bool | None = None
-    outer_limb_assistance: bool | None = None
-    use_horizon: bool | None = None
-    center_target: str | None = None
+    threshold: int = 8
+    min_radius: int = 1000
+    max_radius: int = 1500
+    max_error: float = 8.0
+    min_coverage: int = 8
+    morphology: bool = False
+    outer_limb_assistance: bool = False
+    use_horizon: bool = True
+    center_target: str = "light"
 
 
 # ---------------------------------------------------------------------------
@@ -1754,8 +1755,8 @@ class DetectorApp:
         self.master_image_payload: bytes | None = None
         self.gray_image = None
 
-        # Per-image state keeps sparse settings, the cached automatic threshold
-        # result, and the attempted SolarData outcome for the selected threshold.
+        # Per-image state stores complete settings plus processing objects created
+        # by the stages that own them.
         self.image_state: dict[str, dict[str, object]] = {}
 
         # Keyboard auto-repeat can emit intermediate release/press pairs on some
@@ -1765,44 +1766,30 @@ class DetectorApp:
         self.slider_keyboard_widget = None
         self.slider_keyboard_start_value = None
 
-        self.threshold = tk.IntVar(value=8)
-        self.min_radius = tk.IntVar(value=1000)
-        self.max_radius = tk.IntVar(value=1500)
-        self.max_error = tk.DoubleVar(value=8.0)
-        self.min_coverage = tk.IntVar(value=8)
-        self.morphology = tk.BooleanVar(value=False)
-        self.outer_limb_assistance = tk.BooleanVar(value=False)
-        self.use_horizon = tk.BooleanVar(value=True)
-
-        # Mutually exclusive by construction: both Radiobuttons share this one
-        # StringVar. Light is the requested default.
-        self.center_target = tk.StringVar(value="light")
-        self.center_preview_text = tk.StringVar()
-
-        # Ordinary controls use these values as sparse baselines. Threshold is
-        # different: once initialized, its exact current integer is always stored.
-        self.default_settings = ImageSettings(
-            threshold=self.threshold.get(),
-            min_radius=self.min_radius.get(),
-            max_radius=self.max_radius.get(),
-            max_error=self.max_error.get(),
-            min_coverage=self.min_coverage.get(),
-            morphology=self.morphology.get(),
-            outer_limb_assistance=self.outer_limb_assistance.get(),
-            use_horizon=self.use_horizon.get(),
-            center_target=self.center_target.get(),
-        )
-        self.setting_variables = {
-            "threshold": self.threshold,
-            "min_radius": self.min_radius,
-            "max_radius": self.max_radius,
-            "max_error": self.max_error,
-            "min_coverage": self.min_coverage,
-            "morphology": self.morphology,
-            "outer_limb_assistance": self.outer_limb_assistance,
-            "use_horizon": self.use_horizon,
-            "center_target": self.center_target,
+        # ImageSettings is the single declaration of processing-setting names,
+        # types, and defaults. Build the matching typed Tk variables directly from it.
+        initial_settings = ImageSettings()
+        tk_variable_types = {
+            int: tk.IntVar,
+            float: tk.DoubleVar,
+            bool: tk.BooleanVar,
+            str: tk.StringVar,
         }
+        for setting_field in dataclasses.fields(ImageSettings):
+            variable_type = tk_variable_types.get(setting_field.type)
+            if variable_type is None:
+                raise ValueError(
+                    f"unsupported GUI setting type for {setting_field.name}: "
+                    f"{setting_field.type}"
+                )
+            setattr(
+                self,
+                setting_field.name,
+                variable_type(value=getattr(initial_settings, setting_field.name)),
+            )
+
+        # Display-only GUI state, not a per-image processing setting.
+        self.center_preview_text = tk.StringVar()
 
         self.status = tk.StringVar(
             value="Threshold finder integrated. Load images to inspect automatic T selection."
@@ -1914,20 +1901,6 @@ class DetectorApp:
                 )
                 del gray16
 
-                if path in self.image_state:
-                    state = self.image_state[path]
-                    state.setdefault("auto_threshold_result", None)
-                    state.setdefault("solar_data", None)
-                else:
-                    state = {
-                        "settings": ImageSettings(),
-                        "auto_threshold_result": None,
-                        "solar_data": None,
-                    }
-                    self.image_state[path] = state
-
-                settings = state["settings"]
-
                 # Retain the exact master in the shared self-describing array format.
                 self.master_image_payload = compress_image(master_image)
                 del master_image
@@ -1945,35 +1918,23 @@ class DetectorApp:
                         self.gray_image,
                     )
 
-            # Image preparation and Auto T own separate, sequential blocked-GUI
-            # contexts. Auto T establishes its result without selecting a GUI T yet.
-            with self.blocked_gui():
-                automatic_threshold = find_auto_threshold(self.gray_image, state)
-                auto_threshold_result = state.get("auto_threshold_result")
-                if not isinstance(auto_threshold_result, AutoThresholdResult):
-                    raise ValueError(
-                        "Auto-T returned without establishing AutoThresholdResult"
-                    )
+            state = self.image_state.setdefault(path, {})
+            settings = state.get("settings")
 
-            # Restore every per-image setting through the same application path used
-            # by completed GUI interaction. A stored threshold wins; otherwise Auto T
-            # initializes T, with the application default used only if Auto T failed.
-            for setting_name in self.setting_variables:
-                if setting_name == "threshold":
-                    value = settings.threshold
-                    if value is None:
-                        value = (
-                            automatic_threshold
-                            if automatic_threshold is not None
-                            else self.default_settings.threshold
-                        )
-                else:
-                    stored_value = getattr(settings, setting_name)
-                    value = (
-                        getattr(self.default_settings, setting_name)
-                        if stored_value is None
-                        else stored_value
-                    )
+            if settings is None:
+                settings = ImageSettings()
+                state["settings"] = settings
+
+                # The Auto Select action owns automatic threshold selection. On
+                # success it applies its winning T; on failure it leaves T=8 intact.
+                self.threshold_auto_button_clicked()
+            elif not isinstance(settings, ImageSettings):
+                raise ValueError("stored image settings must be ImageSettings")
+
+            # At this point settings contains the selected value for every processing
+            # setting: Auto-T may have replaced T for a new image, otherwise the
+            # concrete default or exact previously stored value remains authoritative.
+            for setting_name, value in vars(settings).items():
                 self.apply_changed_setting(setting_name, value)
 
             self._update_center_preview_label()
@@ -2464,65 +2425,65 @@ class DetectorApp:
         )
 
     def apply_changed_setting(self, setting_name, value):
-        """Persist one completed GUI setting change and synchronize through SolarData."""
-        variable = self.setting_variables[setting_name]
-        variable.set(value)
-        value = variable.get()
-
-        if self.current_path is None or self.current_path not in self.image_state:
-            return
-
-        state = self.image_state[self.current_path]
-        settings = state["settings"]
-
-        threshold_changed = False
-        if setting_name == "threshold":
-            # Threshold is never sparse once initialized. None means never initialized.
-            threshold_changed = settings.threshold != value
-            settings.threshold = value
-        else:
-            baseline = getattr(self.default_settings, setting_name)
-            setattr(settings, setting_name, None if value == baseline else value)
-
-        if self.gray_image is None:
-            return
-
+        """Persist one completed setting change and run only the stages it affects."""
         with self.blocked_gui():
-            if settings.threshold is None:
-                self.status.set("Threshold is not initialized for the current image.")
+            variable = getattr(self, setting_name)
+            variable.set(value)
+
+            if variable.get() != value:
+                raise ValueError(
+                    f"{setting_name} GUI variable did not retain the applied value"
+                )
+
+            value = variable.get()
+
+            if self.current_path is None or self.current_path not in self.image_state:
                 return
 
-            threshold = settings.threshold
+            state = self.image_state[self.current_path]
+            settings = state["settings"]
+            setting_changed = getattr(settings, setting_name) != value
 
-            # A genuinely new T explicitly resets the threshold pane to authoritative
-            # grayscale before the new selected-T solar resolution is attempted.
-            if threshold_changed and hasattr(self, "threshold_canvas"):
-                self.render_canvas_content(self.threshold_canvas, self.gray_image)
+            if setting_changed:
+                setattr(settings, setting_name, value)
 
-            try:
-                refined_component = resolve_threshold(
-                    self.gray_image,
-                    threshold,
-                    state,
-                )
-            except ThresholdResolutionError as exc:
+            if setting_name == "threshold":
+                if self.gray_image is None:
+                    raise ValueError(
+                        "current image settings exist without authoritative grayscale"
+                    )
+
+                threshold = settings.threshold
+
+                # A genuinely changed T resets the processing pane to authoritative
+                # grayscale before resolving the newly selected threshold.
+                if setting_changed and hasattr(self, "threshold_canvas"):
+                    self.render_canvas_content(self.threshold_canvas, self.gray_image)
+
+                try:
+                    refined_component = resolve_threshold(
+                        self.gray_image,
+                        threshold,
+                        state,
+                    )
+                except ThresholdResolutionError as exc:
+                    self.status.set(
+                        f"Grayscale remains displayed; SolarData could not be established "
+                        f"at T={threshold} ({exc})."
+                    )
+                    return
+
+                if hasattr(self, "threshold_canvas"):
+                    # Retain the authoritative boolean solar component. The renderer
+                    # owns display resizing/conversion and repaint decisions.
+                    self.render_canvas_content(
+                        self.threshold_canvas,
+                        refined_component,
+                    )
+
                 self.status.set(
-                    f"Grayscale remains displayed; SolarData could not be established "
-                    f"at T={threshold} ({exc})."
+                    f"threshold applied; SolarData synchronized at T={threshold}."
                 )
-                return
-
-            if hasattr(self, "threshold_canvas"):
-                # Retain the authoritative boolean solar component. The renderer owns
-                # display resizing/conversion and byte-equivalence/repaint decisions.
-                self.render_canvas_content(
-                    self.threshold_canvas,
-                    refined_component,
-                )
-
-            self.status.set(
-                f"{setting_name} applied; SolarData synchronized at T={threshold}."
-            )
 
     def _selected_center_target_name(self):
         """Return the user-facing name of the selected centering target."""
@@ -2563,9 +2524,6 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         settings = state["settings"]
-        if settings.threshold is None:
-            self.status.set("Refresh Preview requires an initialized threshold.")
-            return
 
         with self.blocked_gui():
             solar_data = state.get("solar_data")
@@ -2627,9 +2585,6 @@ class DetectorApp:
 
         state = self.image_state[self.current_path]
         settings = state["settings"]
-        if settings.threshold is None:
-            self.status.set("Apply Full Resolution requires an initialized threshold.")
-            return
 
         with self.blocked_gui():
             solar_data = state.get("solar_data")

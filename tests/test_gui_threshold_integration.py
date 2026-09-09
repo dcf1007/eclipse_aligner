@@ -1,5 +1,7 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import dataclasses
 from pathlib import Path
+import tkinter as tk
 
 import numpy as np
 import pytest
@@ -19,21 +21,92 @@ def _app():
     app.gray_image = np.full((11, 13), 100, np.uint8)
     app.threshold = Var(10)
     app.min_radius = Var(1000)
-    app.setting_variables = {"threshold": app.threshold, "min_radius": app.min_radius}
-    app.default_settings = cad.ImageSettings(min_radius=1000)
     app.image_state = {"img": {"settings": cad.ImageSettings(threshold=10), "auto_threshold_result": None, "solar_data": None}}
     app.status = Var("")
     app.blocked_gui = nullcontext
     return app
 
 
-def test_apply_changed_setting_keeps_sparse_nonthreshold_persistence(monkeypatch):
+def test_imagesettings_owns_concrete_defaults_and_gui_variable_schema():
+    defaults = cad.ImageSettings()
+    assert vars(defaults) == {
+        "threshold": 8,
+        "min_radius": 1000,
+        "max_radius": 1500,
+        "max_error": 8.0,
+        "min_coverage": 8,
+        "morphology": False,
+        "outer_limb_assistance": False,
+        "use_horizon": True,
+        "center_target": "light",
+    }
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = cad.DetectorApp(root, [])
+        variable_types = {
+            int: tk.IntVar,
+            float: tk.DoubleVar,
+            bool: tk.BooleanVar,
+            str: tk.StringVar,
+        }
+        for setting_field in dataclasses.fields(cad.ImageSettings):
+            variable = getattr(app, setting_field.name)
+            assert isinstance(variable, variable_types[setting_field.type])
+            assert variable.get() == getattr(defaults, setting_field.name)
+        assert not hasattr(app, "default_settings")
+        assert not hasattr(app, "setting_variables")
+    finally:
+        root.destroy()
+
+
+def test_setting_variable_write_and_resolver_run_inside_blocked_gui(monkeypatch):
     app = _app()
-    monkeypatch.setattr(cad, "resolve_threshold", lambda gray, threshold, state: gray > threshold)
+    active = False
+
+    @contextmanager
+    def blocked():
+        nonlocal active
+        assert not active
+        active = True
+        try:
+            yield
+        finally:
+            active = False
+
+    class CheckedVar(Var):
+        def set(self, value):
+            assert active
+            super().set(value)
+        def get(self):
+            assert active
+            return super().get()
+
+    app.threshold = CheckedVar(10)
+    app.blocked_gui = blocked
+
+    def resolve(gray, threshold, state):
+        assert active
+        return gray > threshold
+
+    monkeypatch.setattr(cad, "resolve_threshold", resolve)
+    app.apply_changed_setting("threshold", 11)
+    assert not active
+    assert app.image_state["img"]["settings"].threshold == 11
+
+
+def test_apply_changed_setting_keeps_complete_nonthreshold_persistence(monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        cad,
+        "resolve_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("resolver called")),
+    )
     app.apply_changed_setting("min_radius", 1100)
     assert app.image_state["img"]["settings"].min_radius == 1100
     app.apply_changed_setting("min_radius", 1000)
-    assert app.image_state["img"]["settings"].min_radius is None
+    assert app.image_state["img"]["settings"].min_radius == 1000
 
 
 def test_threshold_is_persisted_exactly_even_when_equal_to_gui_default(monkeypatch):

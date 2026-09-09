@@ -21,8 +21,6 @@ def _app():
     app.gray_image = np.arange(81, dtype=np.uint8).reshape(9, 9)
     app.threshold = Var(10)
     app.min_radius = Var(1000)
-    app.setting_variables = {"threshold": app.threshold, "min_radius": app.min_radius}
-    app.default_settings = cad.ImageSettings(min_radius=1000)
     app.image_state = {
         "x": {
             "settings": cad.ImageSettings(threshold=10),
@@ -83,40 +81,34 @@ def test_apply_changed_setting_failure_leaves_grayscale_displayed(monkeypatch):
     assert "SolarData could not be established" in app.status.get()
 
 
-def test_nonthreshold_setting_delegates_plain_mask_repaint_decision_to_renderer(monkeypatch):
+def test_nonthreshold_setting_persists_without_resolving_or_repainting(monkeypatch):
     app = _app()
-    calls = []
-    refined = np.ones_like(app.gray_image, bool)
     monkeypatch.setattr(
         cad,
         "resolve_threshold",
-        lambda gray, threshold, state: calls.append(threshold) or refined,
+        lambda *_: (_ for _ in ()).throw(AssertionError("resolver called")),
     )
-    rendered = []
-    app.render_canvas_content = lambda canvas, content: rendered.append(
-        (canvas, np.asarray(content).copy())
+    app.render_canvas_content = lambda *_: (_ for _ in ()).throw(
+        AssertionError("threshold pane repainted")
     )
+
     app.apply_changed_setting("min_radius", 1100)
+
     assert app.image_state["x"]["settings"].min_radius == 1100
-    assert calls == [10]
-    assert len(rendered) == 1
-    assert np.array_equal(rendered[0][1], refined)
 
 
-def test_nonthreshold_setting_clears_stale_downstream_overlay_to_plain_mask(monkeypatch):
+def test_nonthreshold_setting_stores_concrete_default_value(monkeypatch):
     app = _app()
-    refined = np.ones_like(app.gray_image, bool)
-    app.threshold_canvas._rendered_content = np.zeros(
-        (*app.gray_image.shape, 3), dtype=np.uint8
+    app.image_state["x"]["settings"].min_radius = 1100
+    monkeypatch.setattr(
+        cad,
+        "resolve_threshold",
+        lambda *_: (_ for _ in ()).throw(AssertionError("resolver called")),
     )
-    monkeypatch.setattr(cad, "resolve_threshold", lambda *_: refined)
-    rendered = []
-    app.render_canvas_content = lambda canvas, content: rendered.append(
-        np.asarray(content).copy()
-    )
-    app.apply_changed_setting("min_radius", 1100)
-    assert len(rendered) == 1
-    assert np.array_equal(rendered[0], refined)
+
+    app.apply_changed_setting("min_radius", 1000)
+
+    assert app.image_state["x"]["settings"].min_radius == 1000
 
 
 def test_apply_changed_setting_does_not_hide_valueerror(monkeypatch):
