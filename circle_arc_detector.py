@@ -494,15 +494,23 @@ def brightest_supported_component_point(
     gray: np.ndarray,
     component: np.ndarray,
     support_kernel: np.ndarray,
+    use_knn_depth: bool = False,
 ) -> tuple[int, int] | None:
     """Return the brightest support-eligible component pixel; depth breaks ties.
 
     Selection is lexicographic: first keep only pixels whose complete support kernel
-    fits inside the component, then maximize grayscale, then maximize L2 distance to
-    the component background. The implementation deliberately reuses the erosion
-    raster as the brightest-supported mask and uses masked ``minMaxLoc`` operations
-    so the ranking does not require separate full-frame brightest or float32 score
-    rasters.
+    fits inside the component, then maximize grayscale, then maximize interior
+    distance to the component background. Work-resolution callers retain OpenCV's
+    dense ``DIST_L2,5`` transform: that raster is small and bright plateaus can
+    contain thousands of tied candidates. The full-resolution caller requests a
+    sparse k=1 Euclidean nearest-neighbor search instead, so only the
+    brightest-supported candidates are compared with the one-pixel background
+    boundary and no full-frame float32 distance raster is allocated.
+
+    The erosion raster is deliberately reused first as the brightest-supported mask
+    and, on the sparse path, as boundary workspace. This keeps the full-resolution
+    path to one existing byte-per-pixel scratch raster plus coordinate-sized nearest-
+    neighbor data.
 
     The caller owns support geometry and the meaning of an unavailable point. Empty
     or unsupported components return ``None``; malformed caller inputs remain errors.
@@ -547,12 +555,66 @@ def brightest_supported_component_point(
     supported_bool = supported.view(np.bool_)
     np.equal(gray, max_gray, out=supported_bool, where=supported_bool)
 
-    # Preserve the agreed L2-depth secondary tie-break, but select the maximum
-    # distance directly under the brightest-supported mask. This avoids allocating
-    # the second full-frame float32 ``scores`` raster used only for np.argmax().
-    distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
-    max_location = cv2.minMaxLoc(distance, mask=supported)[3]
-    return int(max_location[0]), int(max_location[1])
+    # Materialize only the already-filtered candidate coordinates. This both gives
+    # the full-resolution nearest-neighbor path its tiny query set and lets every
+    # caller bypass depth computation completely when support/brightness leave one
+    # unique winner.
+    candidate_locations = cv2.findNonZero(supported)
+    if candidate_locations is None:
+        return None
+    candidate_points = candidate_locations.reshape(-1, 2)
+    if len(candidate_points) == 1:
+        x, y = candidate_points[0]
+        return int(x), int(y)
+
+    if not use_knn_depth:
+        # Work resolution deliberately stays on the established 5x5 chamfer-L2
+        # transform. Its raster is small, while work-resolution bright plateaus can
+        # contain thousands of candidates and are a poor sparse-search workload.
+        distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
+        max_location = cv2.minMaxLoc(distance, mask=supported)[3]
+        return int(max_location[0]), int(max_location[1])
+
+    # Sort explicitly so equal Euclidean depths retain the historical row-major
+    # winner instead of depending on OpenCV coordinate-enumeration ordering.
+    candidate_order = np.lexsort((candidate_points[:, 0], candidate_points[:, 1]))
+    candidate_points = candidate_points[candidate_order]
+
+    # The candidate mask is no longer needed as a raster. Reuse those bytes to form
+    # the one-pixel *background* ring touching the component. Dilating the component
+    # reaches background at both its external edge and internal holes; XOR removes
+    # the original foreground and leaves exactly the relevant nearest-zero boundary.
+    cv2.dilate(
+        source,
+        np.ones((3, 3), dtype=np.uint8),
+        dst=supported,
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    cv2.bitwise_xor(supported, source, dst=supported)
+    boundary_locations = cv2.findNonZero(supported)
+    if boundary_locations is None:
+        raise ValueError("component has no in-raster background boundary")
+
+    # batchDistance is OpenCV core's naive nearest-neighbor finder. With K=1 and
+    # NORM_L2SQR it returns each candidate's exact squared Euclidean distance to its
+    # nearest background-boundary pixel. Squaring is monotonic, so the candidate with
+    # the largest returned value is the deepest; no square-root or frame-sized
+    # distance image is needed. Float32 coordinates are exact for image-sized integer
+    # pixel positions, and the boundary/candidate arrays scale with geometry, not area.
+    boundary_samples = boundary_locations.reshape(-1, 2).astype(np.float32)
+    candidate_samples = candidate_points.astype(np.float32)
+    squared_distances, _ = cv2.batchDistance(
+        candidate_samples,
+        boundary_samples,
+        cv2.CV_32F,
+        normType=cv2.NORM_L2SQR,
+        K=1,
+    )
+    best_index = int(np.argmax(squared_distances[:, 0]))
+    x, y = candidate_points[best_index]
+    return int(x), int(y)
 
 
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
@@ -929,6 +991,7 @@ def derive_full_res_seed_and_guard(
         full_res_gray,
         full_res_search_mask,
         full_res_seed_kernel,
+        use_knn_depth=True,
     )
     if full_res_seed_point is None:
         raise ThresholdResolutionError(

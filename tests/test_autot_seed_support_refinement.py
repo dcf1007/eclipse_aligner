@@ -18,19 +18,19 @@ def test_work_seed_kernel_is_fixed_5x5_square_in_stage_a_source():
 def test_full_seed_support_maps_from_realized_work_scale(monkeypatch):
     gray=np.zeros((6016,4000),np.uint8); work=np.zeros(cad.calculate_work_res_shape(gray.shape),bool); work[300:700,300:700]=True
     seen=[]
-    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k: seen.append(k.shape) or (1000,1000))
+    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k,**kw: seen.append((k.shape,kw.get('use_knn_depth'))) or (1000,1000))
     monkeypatch.setattr(cad,'dilate_component_mask',lambda c,m: np.ones(gray.shape,bool))
     cad.derive_full_res_seed_and_guard(gray,work,cad.generate_kernel((5,5)))
-    assert seen == [(25,25)]
+    assert seen == [((25,25),True)]
 
 
 def test_full_seed_support_stays_5_without_downscale(monkeypatch):
     gray=np.zeros((301,401),np.uint8); work=np.zeros_like(gray,bool); work[50:250,80:320]=True
     seen=[]
-    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k: seen.append(k.shape) or (200,150))
+    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k,**kw: seen.append((k.shape,kw.get('use_knn_depth'))) or (200,150))
     monkeypatch.setattr(cad,'dilate_component_mask',lambda c,m: np.ones(gray.shape,bool))
     cad.derive_full_res_seed_and_guard(gray,work,cad.generate_kernel((5,5)))
-    assert seen == [(5,5)]
+    assert seen == [((5,5),True)]
 
 
 def test_work_search_continues_below_unsupported_candidate(monkeypatch):

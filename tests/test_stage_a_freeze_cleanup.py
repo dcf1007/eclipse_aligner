@@ -22,10 +22,10 @@ def test_find_auto_threshold_requires_authoritative_uint8_gray():
 
 def test_support_mapping_uses_actual_work_kernel(monkeypatch):
     gray=np.zeros((2400,1600),np.uint8); work=np.zeros((1200,800),bool); work[300:900,200:600]=True; seen=[]
-    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k: seen.append(k.shape) or (800,1200))
+    monkeypatch.setattr(cad,'brightest_supported_component_point',lambda g,c,k,**kw: seen.append((k.shape,kw.get('use_knn_depth'))) or (800,1200))
     monkeypatch.setattr(cad,'dilate_component_mask',lambda c,m: np.ones(gray.shape,bool))
     cad.derive_full_res_seed_and_guard(gray,work,cad.generate_kernel((7,7)))
-    assert seen==[(13,13)]
+    assert seen==[((13,13),True)]
 
 def test_work_failure_reports_actual_support_kernel_geometry():
     gray=np.zeros((21,21),np.uint8); gray[10,2:19]=200

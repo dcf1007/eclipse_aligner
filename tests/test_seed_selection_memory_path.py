@@ -57,6 +57,84 @@ def test_seed_selection_does_not_materialize_float_scores(monkeypatch):
     )
 
 
+def test_unique_brightest_supported_seed_bypasses_all_depth_work(monkeypatch):
+    gray, component = _supported_disk(bool)
+    gray[25, 25] = 240
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unique candidate must not compute depth")
+
+    monkeypatch.setattr(cv2, "distanceTransform", forbidden)
+    monkeypatch.setattr(cv2, "batchDistance", forbidden)
+
+    assert cad.brightest_supported_component_point(
+        gray,
+        component,
+        SQUARE_5,
+        use_knn_depth=True,
+    ) == (25, 25)
+
+
+def test_sparse_knn_depth_avoids_full_frame_distance_transform(monkeypatch):
+    gray, component = _supported_disk(bool)
+    gray[25, 20] = 240
+    gray[25, 25] = 240
+
+    monkeypatch.setattr(
+        cv2,
+        "distanceTransform",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("full-frame distance field allocated")
+        ),
+    )
+
+    assert cad.brightest_supported_component_point(
+        gray,
+        component,
+        SQUARE_5,
+        use_knn_depth=True,
+    ) == (25, 25)
+
+
+def test_sparse_knn_depth_preserves_row_major_order_for_equal_euclidean_depth():
+    gray, component = _supported_disk(bool)
+    gray[25, 20] = 240
+    gray[25, 30] = 240
+
+    assert cad.brightest_supported_component_point(
+        gray,
+        component,
+        SQUARE_5,
+        use_knn_depth=True,
+    ) == (20, 25)
+
+
+def test_sparse_knn_depth_uses_exact_euclidean_nearest_background_distance():
+    gray = np.zeros((37, 53), dtype=np.uint8)
+    component = np.zeros_like(gray, dtype=bool)
+    component[4:33, 5:48] = True
+    component[5:18, 31:47] = False
+    gray[24, 17] = 240
+    gray[28, 30] = 240
+
+    # Direct integer squared-distance reference over every background pixel. This is
+    # deliberately independent of batchDistance and checks the sparse path's geometry.
+    candidates = np.array([[17, 24], [30, 28]], dtype=np.int32)
+    background_y, background_x = np.nonzero(~component)
+    depths = []
+    for x, y in candidates:
+        squared = (background_x - x) ** 2 + (background_y - y) ** 2
+        depths.append(int(squared.min()))
+    expected = tuple(map(int, candidates[int(np.argmax(depths))]))
+
+    assert cad.brightest_supported_component_point(
+        gray,
+        component,
+        np.ones((3, 3), dtype=np.uint8),
+        use_knn_depth=True,
+    ) == expected
+
+
 def test_seed_selection_preserves_row_major_tie_break_for_equal_depth():
     gray, component = _supported_disk(bool)
 
@@ -100,3 +178,10 @@ def test_seed_selection_source_documents_storage_reuse_and_masked_ranking():
     assert source.count("cv2.minMaxLoc") == 2
     assert "scores =" not in source
     assert "max_gray = int(gray[supported].max())" not in source
+    assert "cv2.batchDistance(" in source
+    assert "cv2.NORM_L2SQR" in source
+    assert "cv2.bitwise_xor(supported, source, dst=supported)" in source
+
+    full_res_source = inspect.getsource(cad.derive_full_res_seed_and_guard)
+    assert "use_knn_depth=True" in full_res_source
+    assert "distanceTransform" not in full_res_source
