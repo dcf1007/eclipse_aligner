@@ -1,3 +1,5 @@
+import weakref
+
 import numpy as np
 import pytest
 
@@ -130,6 +132,25 @@ def test_renderer_compares_compressed_and_array_content_by_decoded_pixels(monkey
     app.render_canvas_content(canvas, image)
     assert len(canvas.images) == image_count
     assert canvas._rendered_content is image
+
+
+def test_renderer_releases_replaced_array_before_allocating_new_render(monkeypatch):
+    app, _ = _app(monkeypatch)
+    canvas = Canvas()
+    previous = np.arange(30, dtype=np.uint8).reshape(5, 6)
+    app.render_canvas_content(canvas, previous)
+    previous_ref = weakref.ref(previous)
+    del previous
+
+    replacement = np.arange(30, dtype=np.uint8).reshape(5, 6) + 1
+    real_resize = cad.resize_img
+
+    def checked_resize(image, shape, mask=False):
+        assert previous_ref() is None
+        return real_resize(image, shape, mask=mask)
+
+    monkeypatch.setattr(cad, "resize_img", checked_resize)
+    app.render_canvas_content(canvas, replacement)
 
 
 def test_renderer_repaints_equal_content_when_viewport_changes(monkeypatch):

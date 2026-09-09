@@ -139,7 +139,11 @@ def morphological_cleanup(
     else:
         if source.ndim != 2 or source.dtype not in (bool, np.uint8):
             raise ValueError("binary morphology requires a 2D bool or uint8 mask")
-        cleaned = bool_mask_to_uint8(source if source.dtype == bool else source != 0)
+        cleaned = (
+            bool_mask_to_uint8(source)
+            if source.dtype == bool
+            else cv2.compare(source, 0, cv2.CMP_NE)
+        )
 
     cleaned = cv2.morphologyEx(
         cleaned,
@@ -484,7 +488,12 @@ def brightest_supported_component_point(
     The caller owns support geometry and the meaning of an unavailable point. Empty
     or unsupported components return ``None``; malformed caller inputs remain errors.
     """
-    source = bool_mask_to_uint8(np.asarray(component) != 0)
+    component = np.asarray(component)
+    source = (
+        bool_mask_to_uint8(component)
+        if component.dtype == bool
+        else cv2.compare(component, 0, cv2.CMP_NE)
+    )
     support_kernel = np.asarray(support_kernel, dtype=np.uint8)
     if gray.shape != source.shape:
         raise ValueError("gray and component must have identical shapes")
@@ -513,8 +522,14 @@ def brightest_supported_component_point(
 
 def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
+    binary = np.asarray(binary)
+    binary_u8 = (
+        bool_mask_to_uint8(binary)
+        if binary.dtype == bool
+        else cv2.compare(binary, 0, cv2.CMP_NE)
+    )
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        bool_mask_to_uint8(binary != 0),
+        binary_u8,
         connectivity=8,
     )
     height, width = binary.shape
@@ -586,7 +601,11 @@ def extract_component(
     if binary_mask[seed_y, seed_x] == 0:
         return None
 
-    flood = bool_mask_to_uint8(binary_mask != 0)
+    flood = (
+        bool_mask_to_uint8(binary_mask)
+        if binary_mask.dtype == bool
+        else cv2.compare(binary_mask, 0, cv2.CMP_NE)
+    )
     cv2.floodFill(flood, None, (seed_x, seed_y), 128, flags=8)
     component = flood == 128
     return component if np.any(component) else None
@@ -656,7 +675,8 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     # distanceTransform measures each non-component pixel's L2 distance to the
     # nearest zero pixel, so encode the component itself as zero and threshold the
     # resulting full-frame distance field at the requested dilation margin.
-    outside = bool_mask_to_uint8(~component)
+    outside = bool_mask_to_uint8(component)
+    cv2.bitwise_not(outside, dst=outside)
     distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
     return distance <= margin
 
@@ -666,7 +686,11 @@ def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
     if guard_mask.ndim != 2 or not np.any(guard_mask):
         raise ValueError("guard must be a non-empty two-dimensional mask")
 
-    guard_u8 = bool_mask_to_uint8(guard_mask != 0)
+    guard_u8 = (
+        bool_mask_to_uint8(guard_mask)
+        if guard_mask.dtype == bool
+        else cv2.compare(guard_mask, 0, cv2.CMP_NE)
+    )
     eroded_guard = cv2.erode(
         guard_u8,
         GUARD_BOUNDARY_KERNEL,
@@ -704,6 +728,7 @@ def find_full_res_separation_threshold(
     full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
     full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
     full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
+    del full_res_guard_boundary
 
     # Evaluate the starting T after the fixed D7 cleanup used by coarse separation.
     binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, start_T)
@@ -713,6 +738,7 @@ def find_full_res_separation_threshold(
         )
     cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
     component = extract_component(binary, full_res_seed_point)
+    del binary
     if component is None:
         raise ValueError(
             "full-resolution tracking seed disappeared after clipping to its containing guard"
@@ -729,6 +755,7 @@ def find_full_res_separation_threshold(
             )
             cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
             component = extract_component(binary, full_res_seed_point)
+            del binary
             if component is None:
                 raise ValueError(
                     "tracked full-resolution seed component disappeared while lowering T"
@@ -745,6 +772,7 @@ def find_full_res_separation_threshold(
             break
         cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
         component = extract_component(binary, full_res_seed_point)
+        del binary
         if component is None:
             raise ValueError(
                 "full-resolution tracking seed disappeared after surviving D7 cleanup"
@@ -934,7 +962,11 @@ def find_external_contour(component: np.ndarray) -> np.ndarray:
     """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
     if component.ndim != 2 or not np.any(component):
         raise ValueError("solar component is empty or not two-dimensional")
-    component_u8 = bool_mask_to_uint8(component != 0)
+    component_u8 = (
+        bool_mask_to_uint8(component)
+        if component.dtype == bool
+        else cv2.compare(component, 0, cv2.CMP_NE)
+    )
     contours, _ = cv2.findContours(
         component_u8,
         cv2.RETR_EXTERNAL,
@@ -1337,6 +1369,8 @@ def refine_threshold(
         full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
         full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
         full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
+        del full_res_guard_boundary
+        del full_res_guard_mask
         full_res_gray_float = full_res_gray.astype(np.float32)
         measurements: list[ThresholdMeasurement] = []
         compressed_masks: dict[int, bytes] = {}
@@ -1381,6 +1415,11 @@ def refine_threshold(
                 )
                 compressed_masks[threshold] = compress_image(cleaned_component)
                 candidate_contours[threshold] = contour
+                del cleaned_component
+
+            # The candidate tuple can otherwise keep a full-resolution cleaned mask
+            # alive while the raw reference for this threshold is measured.
+            del candidate
 
             # Raw geometry only anchors the largest/roughest end of the score scale.
             # Measure the first separated raw component once, then stop evaluating raw.
@@ -1388,6 +1427,7 @@ def refine_threshold(
                 raw_mask = threshold_mask.copy()
                 cv2.bitwise_and(raw_mask, full_res_guard_u8, dst=raw_mask)
                 raw_component = extract_component(raw_mask, full_res_seed_point)
+                del raw_mask
                 if (
                     raw_component is not None
                     and not np.any(
@@ -1400,6 +1440,12 @@ def refine_threshold(
                         raw_contour,
                         raw_reference_area,
                     )
+                    del raw_contour
+                del raw_component
+
+            # This threshold mask has served both cleaned-candidate and raw-reference
+            # measurement and should not overlap the next full-resolution threshold.
+            del threshold_mask
 
         if not measurements:
             raise ThresholdResolutionError(
@@ -1651,6 +1697,7 @@ def resolve_threshold(
         full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
         full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
         full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
+        del full_res_guard_boundary
         threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
         candidate = extract_separated_seed_component(
             threshold_mask,
@@ -1658,11 +1705,13 @@ def resolve_threshold(
             full_res_guard_u8,
             full_res_guard_boundary_indices,
         )
+        del threshold_mask
         if candidate is None:
             raise ThresholdResolutionError(
                 f"No separated cleaned solar component exists at selected T={threshold}"
             )
         component, contour = candidate
+        del candidate
 
         solar_data = SolarData(
             threshold=threshold,
@@ -2356,8 +2405,8 @@ class DetectorApp:
             textvariable=self.center_preview_text,
         ).grid(row=0, column=1, sticky="w", pady=(0, 4))
 
-        # The canvas is only a display surface. Transparency is retained in the
-        # BGRA preview raster itself; it is not simulated by matching Tk colors.
+        # The canvas is only a display surface. It renders the supplied retained
+        # grayscale, BGR/BGRA, compressed color, or empty content directly.
         self.threshold_canvas = tk.Canvas(
             frame, bg="#202020", highlightthickness=1, highlightbackground="#808080"
         )
@@ -2462,7 +2511,7 @@ class DetectorApp:
                 # including replacement of stale downstream BGR overlays.
                 self.render_canvas_content(
                     self.threshold_canvas,
-                    bool_mask_to_uint8(refined_component != 0),
+                    bool_mask_to_uint8(refined_component),
                 )
 
             self.status.set(
@@ -2658,6 +2707,7 @@ class DetectorApp:
 
         previous_content = getattr(canvas, "_rendered_content", None)
         decoded_content = None
+        decoded_previous_content = None
 
         if content is previous_content:
             equivalent = True
@@ -2700,6 +2750,11 @@ class DetectorApp:
         # Retain exactly the representation supplied by the caller. Immutable bytes
         # stay compressed; ndarray content is retained by reference rather than copied.
         canvas._rendered_content = content
+
+        # The canvas now owns the replacement content. Drop obsolete local references
+        # before allocating the fitted raster and encoded PNG for the new render.
+        del decoded_previous_content
+        del previous_content
 
         # NumPy and resize_img both use (height, width), so keep that ordering here.
         canvas_shape = np.asarray(

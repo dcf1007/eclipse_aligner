@@ -40,6 +40,11 @@ def main() -> None:
     new_mask = lambda: cad.bool_mask_to_uint8(mask)
     assert np.array_equal(old_mask(), new_mask())
 
+    binary_u8 = new_mask()
+    old_uint8_normalize = lambda: cad.bool_mask_to_uint8(binary_u8 != 0)
+    new_uint8_normalize = lambda: cv2.compare(binary_u8, 0, cv2.CMP_NE)
+    assert np.array_equal(old_uint8_normalize(), new_uint8_normalize())
+
     guard = (xx - center_x) ** 2 + (yy - center_y) ** 2 <= (radius * 1.15) ** 2
     guard_u8 = cad.bool_mask_to_uint8(guard)
     binary = cad.bool_mask_to_uint8(mask)
@@ -81,6 +86,8 @@ def main() -> None:
 
     print(f"bool -> uint8 old: {timed(old_mask):.6f} s")
     print(f"bool -> uint8 new: {timed(new_mask):.6f} s")
+    print(f"uint8 normalize old: {timed(old_uint8_normalize):.6f} s")
+    print(f"uint8 normalize new: {timed(new_uint8_normalize):.6f} s")
     print(f"guard clip old:   {timed(old_clip):.6f} s")
     print(f"guard clip new:   {timed(new_clip):.6f} s")
     print(f"boundary old:     {timed(old_boundary_contact):.6f} s")

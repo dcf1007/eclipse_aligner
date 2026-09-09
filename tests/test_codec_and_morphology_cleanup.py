@@ -144,6 +144,15 @@ def test_morphological_cleanup_mask_mode_matches_explicit_open_close():
     assert np.array_equal(cad.morphological_cleanup(mask, kernel), expected)
 
 
+def test_morphological_cleanup_uint8_mask_mode_matches_bool_membership():
+    mask_u8 = np.zeros((31, 31), np.uint8)
+    mask_u8[6:25, 6:25] = 9
+    mask_u8[3, 3] = 200
+    kernel = cad.generate_kernel((3, 3), round_kernel=True)
+    expected = cad.morphological_cleanup(mask_u8 != 0, kernel)
+    assert np.array_equal(cad.morphological_cleanup(mask_u8, kernel), expected)
+
+
 def test_solardata_masks_use_shared_self_describing_codec_and_reuse_exact_state(monkeypatch):
     gray = np.zeros((81, 81), np.uint8)
     cv2.circle(gray, (40, 40), 18, 180, -1)

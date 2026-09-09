@@ -66,7 +66,8 @@ def test_no_in_pane_placeholder_text():
 
 def test_canvas_is_only_display_surface():
     assert 'bg="#202020"' in TEXT
-    assert "Transparency is retained in the" in TEXT
+    assert "The canvas is only a display surface." in TEXT
+    assert "grayscale, BGR/BGRA, compressed color, or empty content directly" in TEXT
 
 
 def test_new_image_uses_and_stores_default_threshold_when_auto_t_fails(
