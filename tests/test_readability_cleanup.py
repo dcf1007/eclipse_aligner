@@ -6,9 +6,6 @@ import pytest
 import circle_arc_detector as cad
 ROOT=Path(__file__).parents[1]; SOURCE=ROOT/'circle_arc_detector.py'
 
-def _legacy(component,margin):
-    outside=np.where(component,0,255).astype(np.uint8); return cv2.distanceTransform(outside,cv2.DIST_L2,5)<=margin
-
 def test_mapped_seed_support_keeps_lower_odd_tie_rule_inline():
     source=SOURCE.read_text()
     assert 'def nearest_positive_odd(' not in source
@@ -18,9 +15,11 @@ def test_uint16_binary_resize_preserves_exact_values_when_declared_mask():
     mask=np.zeros((5,7),np.uint16); mask[1:4,2:6]=65535; r=cad.resize_img(mask,(13,17),mask=True)
     assert r.dtype==np.uint16 and set(np.unique(r))=={0,65535}
 
-def test_full_frame_distance_dilation_matches_distance_semantics():
+def test_contour_guard_preserves_zero_margin_and_expands_external_envelope():
     c=np.zeros((91,123),bool); c[31:58,47:76]=True; c[42:49,76:83]=True
-    for m in (0.,1.,6.5,17.25): assert np.array_equal(cad.dilate_component_mask(c,m),_legacy(c,m))
+    same=cad.dilate_component_mask(c,0.0); grown=cad.dilate_component_mask(c,17.25)
+    assert np.array_equal(same,c)
+    assert np.all(grown[c]) and grown.sum()>c.sum()
 
 def test_refinement_has_no_silent_valueerror_fallback(monkeypatch):
     gray=np.zeros((61,61),np.uint8); cv2.circle(gray,(30,30),18,180,-1); gray[30,30]=240

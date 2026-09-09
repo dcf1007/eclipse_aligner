@@ -75,7 +75,10 @@ def test_edge_descriptor_uses_one_profile_helper_without_old_scaffolding():
     ):
         assert removed not in TEXT
     block = TEXT.split("def sample_grayscale_profiles(", 1)[1].split("\n\ndef ", 1)[0]
-    assert "math.hypot(0.5, 0.5)" in block
+    assert "simplify_raster_contour(contour)" in block
+    simplify_block = TEXT.split("def simplify_raster_contour(", 1)[1].split("\n\ndef ", 1)[0]
+    assert "math.hypot(0.5, 0.5)" in simplify_block
+    assert "cv2.approxPolyDP" in simplify_block
     assert "cv2.GaussianBlur" not in block
 
 

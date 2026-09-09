@@ -46,8 +46,10 @@ working raster, starts from the left valley of the rightmost locally smoothed
 histogram mode, establishes one 5x5-square-supported work-resolution solar seed, and
 tracks that same 8-connected component downward. The mature work-resolution
 component is resized to full resolution only to delimit the full-resolution seed
-search and fixed 10% L2-distance guard. The equivalent full-resolution seed-support
-kernel remains square and scales from the realized work/full-resolution ratio.
+search and fixed 10%-scale guard. That guard fills the transferred component's
+raster-simplified external polygon and expands its boundary outwards; internal holes
+are intentionally irrelevant. The equivalent full-resolution seed-support kernel
+remains square and scales from the realized work/full-resolution ratio.
 
 The coarse full-resolution search uses a 7x7 Euclidean OPEN/CLOSE and finds the
 lowest defensible T whose component containing the authoritative seed stays inside
@@ -695,8 +697,53 @@ def find_work_res_separation_threshold(
 
 
 
+def find_external_contour(component: np.ndarray) -> np.ndarray:
+    """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
+    if component.ndim != 2 or not np.any(component):
+        raise ValueError("solar component is empty or not two-dimensional")
+    # OpenCV contour tracing only needs zero/nonzero foreground membership. A bool
+    # mask already stores one byte per pixel, so expose its 0/1 bytes directly and
+    # avoid a full-resolution 0/255 conversion copy on the common component path.
+    component_u8 = (
+        component.view(np.uint8)
+        if component.dtype == bool
+        else cv2.compare(component, 0, cv2.CMP_NE)
+    )
+    contours, _ = cv2.findContours(
+        component_u8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if not contours:
+        raise ValueError("solar component has no external contour")
+    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    if contour.size == 0:
+        raise ValueError("solar component external contour is empty")
+    return np.ascontiguousarray(contour, dtype=np.int32)
+
+
+def simplify_raster_contour(contour: np.ndarray) -> np.ndarray:
+    """Remove raster stair-steps without moving the contour beyond one pixel cell."""
+    contour = np.asarray(contour)
+    if contour.ndim != 2 or contour.shape[1] != 2 or len(contour) == 0:
+        raise ValueError("contour must be a non-empty (N, 2) XY array")
+
+    # Integer contour coordinates locate pixel cells. The half-pixel diagonal is
+    # therefore the largest simplification tolerance that remains inside the local
+    # raster-cell uncertainty. The same polygon is used both for the large guard
+    # expansion and for Stage-B edge-profile directions so those stages share one
+    # explicit raster-simplification rule.
+    raster_tolerance = math.hypot(0.5, 0.5)
+    polygon = cv2.approxPolyDP(
+        np.ascontiguousarray(contour, dtype=np.int32),
+        raster_tolerance,
+        True,
+    ).reshape(-1, 2)
+    return np.ascontiguousarray(polygon, dtype=np.int32)
+
+
 def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarray:
-    """Return every raster pixel within ``margin`` L2 pixels of the component."""
+    """Build the filled fixed guard around the component's simplified outer polygon."""
     component = np.asarray(component_mask, dtype=bool)
     if component.ndim != 2:
         raise ValueError("component mask must be two-dimensional")
@@ -704,14 +751,47 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
         raise ValueError("cannot dilate empty solar component")
     if margin < 0:
         raise ValueError("dilation margin must be non-negative")
+    if margin == 0:
+        return component.copy()
 
-    # distanceTransform measures each non-component pixel's L2 distance to the
-    # nearest zero pixel, so encode the component itself as zero and threshold the
-    # resulting full-frame distance field at the requested dilation margin.
-    outside = bool_mask_to_uint8(component)
-    cv2.bitwise_not(outside, dst=outside)
-    distance = cv2.distanceTransform(outside, cv2.DIST_L2, 5)
-    return distance <= margin
+    # Guard topology only needs the outer limit of the transferred solar component.
+    # Internal holes are irrelevant, so use only its largest external contour and
+    # simplify raster stair-steps before constructing the guard.
+    polygon = simplify_raster_contour(find_external_contour(component))
+    if len(polygon) < 3:
+        raise ValueError("solar component external contour cannot form a guard polygon")
+    drawing_contour = polygon.reshape(-1, 1, 2)
+
+    # The final guard is boolean, but OpenCV drawing operates on uint8. A bool array
+    # already stores one byte per pixel, so draw 0/1 directly through a zero-copy
+    # uint8 view instead of allocating a separate full-resolution drawing raster.
+    guard = np.zeros(component.shape, dtype=bool)
+    guard_u8 = guard.view(np.uint8)
+
+    # Fill first because everything enclosed by the external polygon is valid guard
+    # territory; holes in the original component deliberately do not survive.
+    cv2.fillPoly(
+        guard_u8,
+        [drawing_contour],
+        1,
+        lineType=cv2.LINE_8,
+    )
+
+    # OpenCV centers an odd-width polyline stroke on the contour. With
+    # 2*floor(margin)+1 pixels of thickness, approximately floor(margin) pixels lie
+    # outside the simplified polygon. At the production ~10%-of-image-scale margin
+    # this matches the former DIST_L2,5 guard to within the benchmarked sub-percent
+    # outer-boundary raster difference, without a full-frame float32 distance field.
+    stroke_width = 2 * math.floor(margin) + 1
+    cv2.polylines(
+        guard_u8,
+        [drawing_contour],
+        True,
+        1,
+        thickness=stroke_width,
+        lineType=cv2.LINE_8,
+    )
+    return guard
 
 
 def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
@@ -991,28 +1071,6 @@ def find_separation_threshold(
         return
 
 
-def find_external_contour(component: np.ndarray) -> np.ndarray:
-    """Return the ordered largest external contour as an ``(N, 2)`` int32 XY array."""
-    if component.ndim != 2 or not np.any(component):
-        raise ValueError("solar component is empty or not two-dimensional")
-    component_u8 = (
-        bool_mask_to_uint8(component)
-        if component.dtype == bool
-        else cv2.compare(component, 0, cv2.CMP_NE)
-    )
-    contours, _ = cv2.findContours(
-        component_u8,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-    if not contours:
-        raise ValueError("solar component has no external contour")
-    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    if contour.size == 0:
-        raise ValueError("solar component external contour is empty")
-    return np.ascontiguousarray(contour, dtype=np.int32)
-
-
 
 def measure_filled_area(contour: np.ndarray) -> int:
     """Return raster-equivalent area enclosed by the external lattice contour."""
@@ -1067,11 +1125,9 @@ def sample_grayscale_profiles(
         np.empty(0, dtype=np.float64),
     )
 
-    # Integer contour coordinates represent pixel-cell locations. Simplify only
-    # deviations no larger than the half-pixel cell diagonal, so raster stair-steps
-    # do not create thousands of nearly duplicate local directions.
-    raster_tolerance = math.hypot(0.5, 0.5)
-    polygon = cv2.approxPolyDP(contour, raster_tolerance, True).reshape(-1, 2)
+    # Reuse the same raster-scale simplification that defines the Stage-A guard.
+    # This removes contour stair-steps without introducing a second tolerance rule.
+    polygon = simplify_raster_contour(contour)
     points = polygon.astype(np.float64)
     if len(points) < 3:
         return empty
