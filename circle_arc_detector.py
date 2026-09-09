@@ -165,6 +165,13 @@ def resize_img(
     mask: bool = False,
 ) -> np.ndarray:
     """Resize to an explicit NumPy ``(height, width)`` shape."""
+    # A bool input used as an ordinary raster is intentionally being interpolated
+    # rather than preserved as a discrete processing mask. Promote it to 0/255
+    # uint8 first so AREA/LANCZOS may smooth its edge and the result remains
+    # grayscale uint8. ``mask=True`` keeps the separate exact-mask contract below.
+    if img.dtype == bool and not mask:
+        img = bool_mask_to_uint8(img)
+
     original_dtype = img.dtype
     original_height, original_width = img.shape[:2]
     height, width = shape
@@ -2506,12 +2513,11 @@ class DetectorApp:
                 return
 
             if hasattr(self, "threshold_canvas"):
-                # The processing pane retains the plain solar mask as 2D uint8.
-                # render_canvas_content() owns byte-equivalence and repaint decisions,
-                # including replacement of stale downstream BGR overlays.
+                # Retain the authoritative boolean solar component. The renderer owns
+                # display resizing/conversion and byte-equivalence/repaint decisions.
                 self.render_canvas_content(
                     self.threshold_canvas,
-                    bool_mask_to_uint8(refined_component),
+                    refined_component,
                 )
 
             self.status.set(
@@ -2757,13 +2763,9 @@ class DetectorApp:
         del previous_content
 
         # NumPy and resize_img both use (height, width), so keep that ordering here.
-        canvas_shape = np.asarray(
-            (
-                max(2, canvas.winfo_height() - 2),
-                max(2, canvas.winfo_width() - 2),
-            )
-        )
-        canvas_size = tuple(int(value) for value in canvas_shape)
+        canvas_height = max(2, canvas.winfo_height() - 2)
+        canvas_width = max(2, canvas.winfo_width() - 2)
+        canvas_size = (canvas_height, canvas_width)
 
         if (
             equivalent
@@ -2787,10 +2789,14 @@ class DetectorApp:
         else:
             render_raster = content
 
-        raster_shape = np.asarray(render_raster.shape[:2])
-        scale = np.min(canvas_shape / raster_shape)
-        fitted_shape = tuple(
-            int(value) for value in np.rint(raster_shape * scale)
+        raster_height, raster_width = render_raster.shape[:2]
+        scale = min(
+            canvas_height / raster_height,
+            canvas_width / raster_width,
+        )
+        fitted_shape = (
+            round(raster_height * scale),
+            round(raster_width * scale),
         )
 
         scaled_raster = resize_img(render_raster, fitted_shape)

@@ -64,7 +64,7 @@ def test_apply_changed_setting_persists_then_renders_grayscale_and_refined_compo
     assert app.image_state["x"]["settings"].threshold == 11
     assert calls[0][1] == 11
     assert np.array_equal(rendered[0][1], app.gray_image)
-    assert np.array_equal(rendered[1][1], cad.bool_mask_to_uint8(refined))
+    assert np.array_equal(rendered[1][1], refined)
     assert app.image_state["x"]["solar_data"].threshold == 11
 
 
@@ -100,7 +100,7 @@ def test_nonthreshold_setting_delegates_plain_mask_repaint_decision_to_renderer(
     assert app.image_state["x"]["settings"].min_radius == 1100
     assert calls == [10]
     assert len(rendered) == 1
-    assert np.array_equal(rendered[0][1], cad.bool_mask_to_uint8(refined))
+    assert np.array_equal(rendered[0][1], refined)
 
 
 def test_nonthreshold_setting_clears_stale_downstream_overlay_to_plain_mask(monkeypatch):
@@ -116,7 +116,7 @@ def test_nonthreshold_setting_clears_stale_downstream_overlay_to_plain_mask(monk
     )
     app.apply_changed_setting("min_radius", 1100)
     assert len(rendered) == 1
-    assert np.array_equal(rendered[0], cad.bool_mask_to_uint8(refined))
+    assert np.array_equal(rendered[0], refined)
 
 
 def test_apply_changed_setting_does_not_hide_valueerror(monkeypatch):

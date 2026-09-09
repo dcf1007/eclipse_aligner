@@ -15,6 +15,30 @@ def test_resize_img_uses_numpy_height_width_order_for_asymmetric_shapes():
     assert resized.shape == (7, 11)
 
 
+
+
+def test_resize_img_bool_as_ordinary_raster_returns_uint8():
+    source = np.array(
+        [
+            [False, True, False],
+            [True, True, False],
+        ],
+        dtype=bool,
+    )
+    resized = cad.resize_img(source, source.shape)
+    assert resized.dtype == np.uint8
+    assert np.array_equal(resized, source.astype(np.uint8) * 255)
+
+
+def test_resize_img_bool_as_ordinary_raster_allows_smoothed_display_values():
+    source = np.zeros((2, 2), dtype=bool)
+    source[0, 0] = True
+    resized = cad.resize_img(source, (5, 5))
+    assert resized.dtype == np.uint8
+    assert resized.shape == (5, 5)
+    assert np.any((resized > 0) & (resized < 255))
+
+
 def test_resize_img_mask_shape_order_is_asymmetric_and_exact():
     source = np.zeros((3, 5), bool)
     source[1, 2] = True

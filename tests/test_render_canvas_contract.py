@@ -66,6 +66,7 @@ def _app(monkeypatch):
 @pytest.mark.parametrize(
     "content",
     (
+        np.zeros((3, 4), bool),
         np.zeros((3, 4), np.uint8),
         np.zeros((3, 4, 3), np.uint8),
         np.zeros((3, 4, 4), np.uint8),
@@ -250,3 +251,44 @@ def test_completed_resize_does_nothing_for_empty_canvas(monkeypatch):
 
     assert canvas._resize_render_job is None
     assert calls == []
+
+
+def test_renderer_passes_bool_content_to_resize_and_retains_bool(monkeypatch):
+    app, _ = _app(monkeypatch)
+    canvas = Canvas(width=20, height=20)
+    content = np.zeros((5, 6), dtype=bool)
+    content[1:4, 2:5] = True
+    real_resize = cad.resize_img
+    calls = []
+
+    def recorded_resize(image, shape, mask=False):
+        calls.append((image, shape, mask))
+        return real_resize(image, shape, mask=mask)
+
+    monkeypatch.setattr(cad, "resize_img", recorded_resize)
+    app.render_canvas_content(canvas, content)
+
+    assert canvas._rendered_content is content
+    assert calls == [(content, (15, 18), False)]
+
+
+def test_renderer_skips_bool_resize_for_equal_pixels_at_same_viewport(monkeypatch):
+    app, _ = _app(monkeypatch)
+    canvas = Canvas(width=20, height=20)
+    first = np.zeros((5, 6), dtype=bool)
+    first[1:4, 2:5] = True
+    second = first.copy()
+    real_resize = cad.resize_img
+    calls = []
+
+    def recorded_resize(image, shape, mask=False):
+        calls.append((image, shape, mask))
+        return real_resize(image, shape, mask=mask)
+
+    monkeypatch.setattr(cad, "resize_img", recorded_resize)
+    app.render_canvas_content(canvas, first)
+    calls.clear()
+    app.render_canvas_content(canvas, second)
+
+    assert calls == []
+    assert canvas._rendered_content is second
