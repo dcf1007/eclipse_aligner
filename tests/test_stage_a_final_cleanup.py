@@ -5,9 +5,9 @@ import pytest
 import circle_arc_detector as cad
 SOURCE=Path(cad.__file__).read_text()
 
-def test_resize_same_shape_is_exact_copy_without_opencv(monkeypatch):
+def test_resize_same_shape_returns_existing_raster_without_opencv(monkeypatch):
     image=np.arange(7*3,dtype=np.uint8).reshape(7,3); monkeypatch.setattr(cad.cv2,'resize',lambda *_a,**_k: (_ for _ in ()).throw(AssertionError('opencv called')))
-    r=cad.resize_img(image,(7,3)); assert np.array_equal(r,image) and r is not image
+    r=cad.resize_img(image,(7,3)); assert r is image
 
 def test_resize_uses_area_when_height_shrinks(monkeypatch):
     image=np.zeros((7,3),np.uint8); seen={}

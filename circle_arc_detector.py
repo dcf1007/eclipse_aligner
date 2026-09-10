@@ -155,62 +155,47 @@ def resize_img(
     shape: tuple[int, int],
     mask: bool = False,
 ) -> np.ndarray:
-    """Resize to an explicit NumPy ``(height, width)`` shape."""
-    # A bool input used as an ordinary raster is intentionally being interpolated
-    # rather than preserved as a discrete processing mask. Promote it to 0/255
-    # uint8 first so AREA/LANCZOS may smooth its edge and the result remains
-    # grayscale uint8. ``mask=True`` keeps the separate exact-mask contract below.
-    if img.dtype == bool and not mask:
-        img = img.astype(np.uint8)
-        img *= 255
-
+    """Resize to ``(height, width)``; return the existing raster when already that size."""
     original_dtype = img.dtype
     original_height, original_width = img.shape[:2]
     height, width = shape
 
     if height <= 0 or width <= 0:
         raise ValueError("resize dimensions must be positive")
-    if (height, width) == (original_height, original_width):
-        return img.copy()
 
-    resized_mask = None
-    resize_destination = None
+    if original_dtype == bool:
+        if img.ndim != 2:
+            raise ValueError("boolean resize input must be two-dimensional")
+
+        if not mask:
+            # Ordinary bool rasters are displayed as 0/255 uint8 so interpolation
+            # can produce intermediate grayscale edge values.
+            img = img.astype(np.uint8)
+            img *= 255
+
+    if (height, width) == (original_height, original_width):
+        return img
+
     if mask:
         interpolation = cv2.INTER_NEAREST_EXACT
-        if img.dtype == bool:
-            # OpenCV cannot consume bool directly. Expose the authoritative
-            # 0/1 bytes without copying and let OpenCV write the resized mask
-            # directly into bool-owned storage through its uint8 view.
-            resize_source = img.view(np.uint8)
-            resized_mask = np.empty((height, width), dtype=bool)
-            resize_destination = resized_mask.view(np.uint8)
-        else:
-            resize_source = img
+        if original_dtype == bool:
+            # OpenCV cannot resize bool directly. Its canonical 0/1 bytes are
+            # already a valid uint8 mask, so expose them without copying.
+            img = img.view(np.uint8)
     elif height < original_height or width < original_width:
-        resize_source = img
         interpolation = cv2.INTER_AREA
     else:
-        resize_source = img
         interpolation = cv2.INTER_LANCZOS4
 
-    # Pass dst only for the bool-mask path that actually preallocates one.
-    # Keeping one direct resize call preserves resize_img as the sole owner
-    # of OpenCV resize policy while ordinary raster callers keep the normal
-    # allocation behavior.
-    resize_arguments = {"interpolation": interpolation}
-    if resize_destination is not None:
-        resize_arguments["dst"] = resize_destination
-
     resized = cv2.resize(
-        resize_source,
+        img,
         (width, height),  # OpenCV alone uses (width, height).
-        **resize_arguments,
+        interpolation=interpolation,
     )
-    return (
-        resized_mask
-        if resized_mask is not None
-        else resized.astype(original_dtype, copy=False)
-    )
+
+    if original_dtype == bool and mask:
+        return resized.view(np.bool_)
+    return resized
 
 
 def compress_image(image: np.ndarray) -> bytes:

@@ -7,15 +7,15 @@ import pytest
 import circle_arc_detector as cad
 
 
-def test_bool_mask_resize_uses_zero_copy_opencv_views(monkeypatch):
+def test_bool_mask_resize_uses_zero_copy_opencv_source_view(monkeypatch):
     source = np.zeros((5, 7), dtype=bool)
     source[1:4, 2:6] = True
     real_resize = cv2.resize
     seen = []
 
-    def resize(src, size, dst=None, interpolation=None):
-        seen.append((src, dst, interpolation))
-        return real_resize(src, size, dst=dst, interpolation=interpolation)
+    def resize(src, size, interpolation=None):
+        seen.append((src, size, interpolation))
+        return real_resize(src, size, interpolation=interpolation)
 
     monkeypatch.setattr(cv2, "resize", resize)
 
@@ -23,9 +23,10 @@ def test_bool_mask_resize_uses_zero_copy_opencv_views(monkeypatch):
 
     assert resized.dtype == bool
     assert seen and np.shares_memory(seen[0][0], source)
-    assert np.shares_memory(seen[0][1], resized)
-    assert seen[0][0].dtype == np.uint8 and seen[0][1].dtype == np.uint8
+    assert seen[0][0].dtype == np.uint8
+    assert seen[0][1] == (17, 13)
     assert seen[0][2] == cv2.INTER_NEAREST_EXACT
+    assert not np.shares_memory(resized, source)
 
 
 def test_one_bit_decoder_reuses_unpackbits_storage_as_bool():

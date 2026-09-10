@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import circle_arc_detector as cad
 
@@ -45,6 +46,23 @@ def test_resize_img_mask_shape_order_is_asymmetric_and_exact():
     resized = cad.resize_img(source, (9, 15), mask=True)
     assert resized.dtype == bool
     assert resized.shape == (9, 15)
+
+
+def test_resize_img_same_size_numeric_returns_existing_raster():
+    source = np.arange(15, dtype=np.uint8).reshape(3, 5)
+    assert cad.resize_img(source, source.shape) is source
+
+
+def test_resize_img_same_size_bool_mask_returns_existing_mask():
+    source = np.zeros((3, 5), dtype=bool)
+    source[1, 2] = True
+    assert cad.resize_img(source, source.shape, mask=True) is source
+
+
+def test_resize_img_rejects_multichannel_bool_input():
+    source = np.zeros((3, 5, 2), dtype=bool)
+    with pytest.raises(ValueError, match="boolean resize input must be two-dimensional"):
+        cad.resize_img(source, (7, 11))
 
 
 def test_generate_kernel_uses_numpy_height_width_order():
