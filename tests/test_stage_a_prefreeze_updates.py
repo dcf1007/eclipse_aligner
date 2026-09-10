@@ -17,10 +17,10 @@ def test_coarse_d7_removes_thin_background_bridge_and_returns_component():
 
 def test_stage_b_consumes_same_stage_a_seed_and_guard(monkeypatch):
     gray=np.zeros((81,81),np.uint8); cv2.circle(gray,(40,40),20,180,-1); gray[40,40]=240; state={'auto_threshold_result':cad.AutoThresholdResult()}
-    cad.find_separation_threshold(gray,state); result=state['auto_threshold_result']; seed=result.full_res_seed_point; guard=cad.decompress_image(result.full_res_separation_guard_mask); boundary=cad.find_guard_boundary(guard); seen=[]
-    expected_guard_u8=cad.bool_mask_to_uint8(guard); expected_boundary_indices=np.flatnonzero(boundary)
+    cad.find_separation_threshold(gray,state); result=state['auto_threshold_result']; seed=result.full_res_seed_point; guard=cad.decompress_image(result.full_res_separation_guard_mask); seen=[]
+    expected_boundary_indices=cad.find_guard_boundary_indices(guard)
     real=cad.extract_separated_seed_component
-    def record(mask,s,g,b): seen.append((s,np.array_equal(g,expected_guard_u8),np.array_equal(b,expected_boundary_indices))); return real(mask,s,g,b)
+    def record(mask,s,g,b): seen.append((s,g.dtype==bool and np.array_equal(g,guard),np.array_equal(b,expected_boundary_indices))); return real(mask,s,g,b)
     monkeypatch.setattr(cad,'extract_separated_seed_component',record); cad.refine_threshold(gray,state)
     assert seen and all(s==seed and same_guard and same_boundary for s,same_guard,same_boundary in seen)
 

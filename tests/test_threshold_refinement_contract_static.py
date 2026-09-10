@@ -10,7 +10,7 @@ def test_stage_b_contract_consumes_stage_a_result_state():
     assert 'find_separation_threshold(' not in block
 
 def test_shared_component_extraction_and_separation_naming():
-    assert TEXT.count('cv2.floodFill(')==1 and 'def extract_component(' in TEXT and 'def find_guard_boundary(' in TEXT and 'def find_separation_threshold(' in TEXT
+    assert TEXT.count('cv2.floodFill(')==1 and 'def extract_component(' in TEXT and 'def find_guard_boundary_indices(' in TEXT and 'def find_guard_boundary(' not in TEXT and 'def find_separation_threshold(' in TEXT
     assert 'find_lowest_full_res_threshold' not in TEXT
 
 def test_edge_control_uses_current_profile_radius_without_old_scaffolding():

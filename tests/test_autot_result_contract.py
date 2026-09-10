@@ -274,7 +274,7 @@ def test_stage_b_domain_failure_is_registered_and_not_propagated(monkeypatch):
     cad.find_separation_threshold(gray, {"auto_threshold_result": result})
     monkeypatch.setattr(
         cad,
-        "find_guard_boundary",
+        "find_guard_boundary_indices",
         lambda *_: (_ for _ in ()).throw(cad.ThresholdResolutionError("bad guard")),
     )
 

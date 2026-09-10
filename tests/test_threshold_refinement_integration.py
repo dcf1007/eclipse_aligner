@@ -19,4 +19,4 @@ def test_find_auto_threshold_keeps_separation_t_when_no_quality_improvement_wins
 
 def test_common_component_extractor_is_only_flood_fill_implementation():
     from pathlib import Path
-    source=Path(cad.__file__).read_text(); assert source.count('cv2.floodFill(')==1 and source.count('def extract_component(')==1 and source.count('def find_guard_boundary(')==1
+    source=Path(cad.__file__).read_text(); assert source.count('cv2.floodFill(')==1 and source.count('def extract_component(')==1 and source.count('def find_guard_boundary_indices(')==1 and 'def find_guard_boundary(' not in source

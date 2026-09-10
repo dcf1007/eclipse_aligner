@@ -174,13 +174,15 @@ def test_seed_selection_source_documents_storage_reuse_and_masked_ranking():
     # Keep the memory contract visible in the implementation rather than allowing
     # future cleanup to silently reintroduce the removed full-frame temporaries.
     assert "component.view(np.uint8)" in source
-    assert "supported.view(np.bool_)" in source
+    assert "supported = np.empty(component.shape, dtype=bool)" in source
+    assert "supported.view(np.uint8)" in source
     assert source.count("cv2.minMaxLoc") == 2
     assert "scores =" not in source
     assert "max_gray = int(gray[supported].max())" not in source
     assert "cv2.batchDistance(" in source
     assert "cv2.NORM_L2SQR" in source
-    assert "cv2.bitwise_xor(supported, source, dst=supported)" in source
+    assert "cv2.bitwise_xor(" in source
+    assert "dst=supported.view(np.uint8)" in source
 
     full_res_source = inspect.getsource(cad.derive_full_res_seed_and_guard)
     assert "use_knn_depth=True" in full_res_source

@@ -30,11 +30,11 @@ def test_derive_full_res_seed_and_guard_matches_stage_a_identity_products():
 
 
 def test_extract_separated_seed_component_runs_exact_progressive_p357(monkeypatch):
-    threshold_mask = np.zeros((81, 93), np.uint8)
-    cv2.circle(threshold_mask, (46, 40), 18, 255, -1)
+    threshold_mask = np.zeros((81, 93), bool)
+    cv2.circle(threshold_mask.view(np.uint8), (46, 40), 18, 1, -1)
     guard = np.zeros((81, 93), bool)
     guard[10:71, 12:81] = True
-    boundary = cad.find_guard_boundary(guard)
+    boundary_indices = cad.find_guard_boundary_indices(guard)
     calls = []
     real = cad.morphological_cleanup
 
@@ -46,8 +46,8 @@ def test_extract_separated_seed_component_runs_exact_progressive_p357(monkeypatc
     candidate = cad.extract_separated_seed_component(
         threshold_mask,
         (46, 40),
-        cad.bool_mask_to_uint8(guard),
-        np.flatnonzero(boundary),
+        guard,
+        boundary_indices,
     )
     assert candidate is not None
     component, contour = candidate
@@ -57,12 +57,12 @@ def test_extract_separated_seed_component_runs_exact_progressive_p357(monkeypatc
 
 
 def test_extract_separated_seed_component_rejects_guard_boundary_contact():
-    threshold_mask = np.full((41, 51), 255, np.uint8)
+    threshold_mask = np.ones((41, 51), bool)
     guard = np.ones((41, 51), bool)
-    boundary = cad.find_guard_boundary(guard)
+    boundary_indices = cad.find_guard_boundary_indices(guard)
     assert cad.extract_separated_seed_component(
         threshold_mask,
         (25, 20),
-        cad.bool_mask_to_uint8(guard),
-        np.flatnonzero(boundary),
+        guard,
+        boundary_indices,
     ) is None

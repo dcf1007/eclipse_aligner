@@ -41,7 +41,11 @@ downstream actions may construct genuinely missing SolarData, but never retry an
 already-recorded failed outcome.
 
 The automatic-threshold algorithm uses authoritative 8-bit grayscale with fixed
-semantics ``dark = gray <= T`` and ``light = gray > T``. It derives a <=1200-pixel
+semantics ``dark = gray <= T`` and ``light = gray > T``. Binary processing rasters
+are authoritative NumPy boolean masks; OpenCV APIs that require 8-bit storage receive
+zero-copy ``view(np.uint8)`` adapters over those same 0/1 mask bytes.
+
+It derives a <=1200-pixel
 working raster, starts from the left valley of the rightmost locally smoothed
 histogram mode, establishes one 5x5-square-supported work-resolution solar seed, and
 tracks that same 8-connected component downward. The mature work-resolution
@@ -186,10 +190,19 @@ def resize_img(
     if (height, width) == (original_height, original_width):
         return img.copy()
 
+    resized_mask = None
+    resize_destination = None
     if mask:
-        # OpenCV cannot resize bool directly; preserve mask membership with exact nearest.
-        resize_source = bool_mask_to_uint8(img) if img.dtype == bool else img
         interpolation = cv2.INTER_NEAREST_EXACT
+        if img.dtype == bool:
+            # OpenCV cannot consume bool directly. Expose the authoritative
+            # 0/1 bytes without copying and let OpenCV write the resized mask
+            # directly into bool-owned storage through its uint8 view.
+            resize_source = img.view(np.uint8)
+            resized_mask = np.empty((height, width), dtype=bool)
+            resize_destination = resized_mask.view(np.uint8)
+        else:
+            resize_source = img
     elif height < original_height or width < original_width:
         resize_source = img
         interpolation = cv2.INTER_AREA
@@ -197,12 +210,24 @@ def resize_img(
         resize_source = img
         interpolation = cv2.INTER_LANCZOS4
 
+    # Pass dst only for the bool-mask path that actually preallocates one.
+    # Keeping one direct resize call preserves resize_img as the sole owner
+    # of OpenCV resize policy while ordinary raster callers keep the normal
+    # allocation behavior.
+    resize_arguments = {"interpolation": interpolation}
+    if resize_destination is not None:
+        resize_arguments["dst"] = resize_destination
+
     resized = cv2.resize(
         resize_source,
         (width, height),  # OpenCV alone uses (width, height).
-        interpolation=interpolation,
+        **resize_arguments,
     )
-    return resized.astype(original_dtype, copy=False)
+    return (
+        resized_mask
+        if resized_mask is not None
+        else resized.astype(original_dtype, copy=False)
+    )
 
 
 def compress_image(image: np.ndarray) -> bytes:
@@ -308,7 +333,8 @@ def decompress_image(payload: bytes) -> np.ndarray:
             count=expected_bytes,
             offset=header_size,
         )
-        return np.unpackbits(packed, count=sample_count).reshape(shape) != 0
+        # unpackbits already produces canonical 0/1 bytes; reuse them as bool.
+        return np.unpackbits(packed, count=sample_count).reshape(shape).view(np.bool_)
 
     if bit_depth == 8:
         bytes_per_sample = 1
@@ -533,11 +559,12 @@ def brightest_supported_component_point(
     if not np.any(source):
         return None
 
-    # Erosion already returns an 8-bit binary raster. Keep that storage instead of
-    # allocating a second full-frame bool mask with ``!= 0``.
-    supported = cv2.erode(
+    # Keep support membership authoritative as bool; OpenCV writes through its view.
+    supported = np.empty(component.shape, dtype=bool)
+    cv2.erode(
         source,
         support_kernel,
+        dst=supported.view(np.uint8),
         iterations=1,
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
@@ -547,19 +574,16 @@ def brightest_supported_component_point(
 
     # Obtain the primary brightness winner directly under the support mask. This
     # avoids materializing the packed ``gray[supported]`` advanced-indexing copy.
-    max_gray = int(cv2.minMaxLoc(gray, mask=supported)[1])
+    max_gray = int(cv2.minMaxLoc(gray, mask=supported.view(np.uint8))[1])
 
-    # The support mask is no longer needed in its original form. Reuse its bytes as
-    # the brightest-supported mask: unsupported pixels stay false, while supported
-    # pixels are replaced in place by whether they equal the winning gray value.
-    supported_bool = supported.view(np.bool_)
-    np.equal(gray, max_gray, out=supported_bool, where=supported_bool)
+    # Reuse the same bool storage as the brightest-supported mask.
+    np.equal(gray, max_gray, out=supported, where=supported)
 
     # Materialize only the already-filtered candidate coordinates. This both gives
     # the full-resolution nearest-neighbor path its tiny query set and lets every
     # caller bypass depth computation completely when support/brightness leave one
     # unique winner.
-    candidate_locations = cv2.findNonZero(supported)
+    candidate_locations = cv2.findNonZero(supported.view(np.uint8))
     if candidate_locations is None:
         return None
     candidate_points = candidate_locations.reshape(-1, 2)
@@ -572,7 +596,7 @@ def brightest_supported_component_point(
         # transform. Its raster is small, while work-resolution bright plateaus can
         # contain thousands of candidates and are a poor sparse-search workload.
         distance = cv2.distanceTransform(source, cv2.DIST_L2, 5)
-        max_location = cv2.minMaxLoc(distance, mask=supported)[3]
+        max_location = cv2.minMaxLoc(distance, mask=supported.view(np.uint8))[3]
         return int(max_location[0]), int(max_location[1])
 
     # Sort explicitly so equal Euclidean depths retain the historical row-major
@@ -587,13 +611,13 @@ def brightest_supported_component_point(
     cv2.dilate(
         source,
         np.ones((3, 3), dtype=np.uint8),
-        dst=supported,
+        dst=supported.view(np.uint8),
         iterations=1,
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    cv2.bitwise_xor(supported, source, dst=supported)
-    boundary_locations = cv2.findNonZero(supported)
+    cv2.bitwise_xor(supported.view(np.uint8), source, dst=supported.view(np.uint8))
+    boundary_locations = cv2.findNonZero(supported.view(np.uint8))
     if boundary_locations is None:
         raise ValueError("component has no in-raster background boundary")
 
@@ -621,7 +645,7 @@ def largest_enclosed_bright_component(binary: np.ndarray) -> np.ndarray | None:
     """Return the largest 8-connected bright component enclosed by the raster."""
     binary = np.asarray(binary)
     binary_u8 = (
-        bool_mask_to_uint8(binary)
+        binary.view(np.uint8)
         if binary.dtype == bool
         else cv2.compare(binary, 0, cv2.CMP_NE)
     )
@@ -687,10 +711,10 @@ def extract_component(
     binary_mask: np.ndarray,
     seed_point: tuple[int, int],
 ) -> np.ndarray | None:
-    """Return the 8-connected component of ``binary_mask`` containing ``seed_point``."""
+    """Return the 8-connected boolean component containing ``seed_point``."""
+    binary_mask = np.asarray(binary_mask)
     if binary_mask.ndim != 2:
         raise ValueError("binary mask must be two-dimensional")
-
     seed_x, seed_y = seed_point
     height, width = binary_mask.shape
     if not (0 <= seed_x < width and 0 <= seed_y < height):
@@ -698,15 +722,13 @@ def extract_component(
     if binary_mask[seed_y, seed_x] == 0:
         return None
 
-    flood = (
-        bool_mask_to_uint8(binary_mask)
-        if binary_mask.dtype == bool
-        else cv2.compare(binary_mask, 0, cv2.CMP_NE)
-    )
-    cv2.floodFill(flood, None, (seed_x, seed_y), 128, flags=8)
-    component = flood == 128
+    # Allocate the independent result directly as bool. Its uint8 view temporarily
+    # uses value 2 for floodFill, then the same bytes are canonicalized back to 0/1.
+    component = binary_mask.copy() if binary_mask.dtype == bool else binary_mask != 0
+    flood = component.view(np.uint8)
+    cv2.floodFill(flood, None, (seed_x, seed_y), 2, flags=8)
+    np.equal(flood, 2, out=component)
     return component if np.any(component) else None
-
 
 
 def find_work_res_separation_threshold(
@@ -856,25 +878,28 @@ def dilate_component_mask(component_mask: np.ndarray, margin: float) -> np.ndarr
     return guard
 
 
-def find_guard_boundary(guard_mask: np.ndarray) -> np.ndarray:
-    """Return the one-pixel inner boundary of a non-empty boolean guard mask."""
-    if guard_mask.ndim != 2 or not np.any(guard_mask):
-        raise ValueError("guard must be a non-empty two-dimensional mask")
+def find_guard_boundary_indices(guard_mask: np.ndarray) -> np.ndarray:
+    """Return flat indices of the one-pixel inner boundary of a boolean guard."""
+    guard_mask = np.asarray(guard_mask)
+    if guard_mask.ndim != 2 or guard_mask.dtype != bool or not np.any(guard_mask):
+        raise ValueError("guard must be a non-empty two-dimensional bool mask")
 
-    guard_u8 = (
-        bool_mask_to_uint8(guard_mask)
-        if guard_mask.dtype == bool
-        else cv2.compare(guard_mask, 0, cv2.CMP_NE)
-    )
-    eroded_guard = cv2.erode(
-        guard_u8,
-        GUARD_BOUNDARY_KERNEL,
-        iterations=1,
-        borderType=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ) != 0
-    return guard_mask & ~eroded_guard
-
+    # The caller already owns the guard. One bool scratch serves erosion and boundary;
+    # OpenCV sees only zero-copy uint8 views of the canonical 0/1 bytes.
+    boundary = np.empty_like(guard_mask)
+    boundary_u8 = boundary.view(np.uint8)
+    guard_u8 = guard_mask.view(np.uint8)
+    cv2.erode(guard_u8, GUARD_BOUNDARY_KERNEL, dst=boundary_u8, iterations=1,
+              borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    cv2.bitwise_xor(boundary_u8, guard_u8, dst=boundary_u8)
+    locations = cv2.findNonZero(boundary_u8)
+    if locations is None:
+        return np.empty(0, dtype=np.intp)
+    points = locations.reshape(-1, 2)
+    indices = points[:, 1].astype(np.intp)
+    indices *= guard_mask.shape[1]
+    indices += points[:, 0]
+    return indices
 
 
 def find_full_res_separation_threshold(
@@ -888,8 +913,12 @@ def find_full_res_separation_threshold(
         raise ValueError("grayscale image must be two-dimensional")
     if not 0 <= start_T <= 255:
         raise ValueError("start threshold must be 0..255")
-    if full_res_guard_mask.ndim != 2 or full_res_guard_mask.shape != full_res_gray.shape:
-        raise ValueError("full-resolution guard and grayscale image must have identical shapes")
+    if (
+        full_res_guard_mask.ndim != 2
+        or full_res_guard_mask.dtype != bool
+        or full_res_guard_mask.shape != full_res_gray.shape
+    ):
+        raise ValueError("full-resolution guard must be a boolean mask matching grayscale")
     if not np.any(full_res_guard_mask):
         raise ValueError("full-resolution Auto-T guard is empty")
 
@@ -900,10 +929,7 @@ def find_full_res_separation_threshold(
     if not full_res_guard_mask[seed_y, seed_x]:
         raise ValueError("full-resolution tracking seed lies outside the Auto-T guard")
 
-    full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
-    full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
-    full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
-    del full_res_guard_boundary
+    full_res_guard_boundary_indices = find_guard_boundary_indices(full_res_guard_mask)
 
     # Evaluate the starting T after the fixed D7 cleanup used by coarse separation.
     binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, start_T)
@@ -911,7 +937,8 @@ def find_full_res_separation_threshold(
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
         )
-    cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
+    cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
+    binary = binary.view(np.bool_)
     component = extract_component(binary, full_res_seed_point)
     del binary
     if component is None:
@@ -928,7 +955,8 @@ def find_full_res_separation_threshold(
                 SEPARATION_KERNEL,
                 threshold,
             )
-            cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
+            cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
+            binary = binary.view(np.bool_)
             component = extract_component(binary, full_res_seed_point)
             del binary
             if component is None:
@@ -945,7 +973,8 @@ def find_full_res_separation_threshold(
         binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, threshold)
         if binary[seed_y, seed_x] == 0:
             break
-        cv2.bitwise_and(binary, full_res_guard_u8, dst=binary)
+        cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
+        binary = binary.view(np.bool_)
         component = extract_component(binary, full_res_seed_point)
         del binary
         if component is None:
@@ -1470,14 +1499,22 @@ def measure_edge_alignment(
 def extract_separated_seed_component(
     threshold_mask: np.ndarray,
     seed_point: tuple[int, int],
-    guard_u8: np.ndarray,
+    guard_mask: np.ndarray,
     guard_boundary_indices: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Return the P3/P5/P7-cleaned seeded component and contour when separated."""
+    if threshold_mask.ndim != 2 or threshold_mask.dtype != bool:
+        raise ValueError("threshold mask must be a two-dimensional bool mask")
+    if guard_mask.ndim != 2 or guard_mask.dtype != bool or guard_mask.shape != threshold_mask.shape:
+        raise ValueError("guard must be a boolean mask matching threshold mask")
+
     cleaned = threshold_mask
     for kernel in SOLAR_CLEANUP_KERNELS:
         cleaned = morphological_cleanup(cleaned, kernel)
-    cv2.bitwise_and(cleaned, guard_u8, dst=cleaned)
+    # morphological_cleanup still returns uint8 for now. The 0/1 guard view clips and
+    # canonicalizes those same bytes so downstream processing again owns a bool mask.
+    cv2.bitwise_and(cleaned, guard_mask.view(np.uint8), dst=cleaned)
+    cleaned = cleaned.view(np.bool_)
     component = extract_component(cleaned, seed_point)
     if component is None or np.any(component.ravel()[guard_boundary_indices]):
         return None
@@ -1518,11 +1555,7 @@ def refine_threshold(
         raise ValueError("full-resolution seed must lie inside the fixed guard")
 
     try:
-        full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
-        full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
-        full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
-        del full_res_guard_boundary
-        del full_res_guard_mask
+        full_res_guard_boundary_indices = find_guard_boundary_indices(full_res_guard_mask)
         full_res_gray_float = full_res_gray.astype(np.float32)
         measurements: list[ThresholdMeasurement] = []
         compressed_masks: dict[int, bytes] = {}
@@ -1532,12 +1565,12 @@ def refine_threshold(
 
         max_threshold = min(255, base_threshold + MAX_T_REFINEMENT_STEPS)
         for threshold in range(base_threshold, max_threshold + 1):
-            threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+            threshold_mask = full_res_gray > threshold
 
             candidate = extract_separated_seed_component(
                 threshold_mask,
                 full_res_seed_point,
-                full_res_guard_u8,
+                full_res_guard_mask,
                 full_res_guard_boundary_indices,
             )
 
@@ -1577,7 +1610,7 @@ def refine_threshold(
             # Measure the first separated raw component once, then stop evaluating raw.
             if raw_reference_area is None:
                 raw_mask = threshold_mask.copy()
-                cv2.bitwise_and(raw_mask, full_res_guard_u8, dst=raw_mask)
+                np.logical_and(raw_mask, full_res_guard_mask, out=raw_mask)
                 raw_component = extract_component(raw_mask, full_res_seed_point)
                 del raw_mask
                 if (
@@ -1817,15 +1850,12 @@ def resolve_threshold(
                 work_res_seed_kernel,
             )
 
-        full_res_guard_boundary = find_guard_boundary(full_res_guard_mask)
-        full_res_guard_u8 = bool_mask_to_uint8(full_res_guard_mask)
-        full_res_guard_boundary_indices = np.flatnonzero(full_res_guard_boundary)
-        del full_res_guard_boundary
-        threshold_mask = cv2.compare(full_res_gray, threshold, cv2.CMP_GT)
+        full_res_guard_boundary_indices = find_guard_boundary_indices(full_res_guard_mask)
+        threshold_mask = full_res_gray > threshold
         candidate = extract_separated_seed_component(
             threshold_mask,
             full_res_seed_point,
-            full_res_guard_u8,
+            full_res_guard_mask,
             full_res_guard_boundary_indices,
         )
         del threshold_mask
