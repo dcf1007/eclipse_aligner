@@ -9,7 +9,7 @@ def _guard(shape=(41,51)):
 
 def test_full_res_seed_is_checked_after_d7_cleanup():
     source=inspect.getsource(cad.find_full_res_separation_threshold)
-    assert source.index('morphological_cleanup(') < source.index('if not working_mask[seed_y, seed_x]:')
+    assert source.index('morphological_cleanup(') < source.index('if not processing_mask[seed_y, seed_x]:')
 
 def test_full_res_seed_must_survive_d7_cleanup():
     gray=np.zeros((41,51),np.uint8); gray[20,25]=200

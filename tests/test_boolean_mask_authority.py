@@ -2,6 +2,7 @@ import inspect
 
 import cv2
 import numpy as np
+import pytest
 
 import circle_arc_detector as cad
 
@@ -16,9 +17,6 @@ def test_bool_mask_resize_uses_zero_copy_opencv_views(monkeypatch):
         seen.append((src, dst, interpolation))
         return real_resize(src, size, dst=dst, interpolation=interpolation)
 
-    monkeypatch.setattr(cad, "bool_mask_to_uint8", lambda *_: (_ for _ in ()).throw(
-        AssertionError("processing mask must not be expanded to 0/255")
-    ))
     monkeypatch.setattr(cv2, "resize", resize)
 
     resized = cad.resize_img(source, (13, 17), mask=True)
@@ -42,18 +40,22 @@ def test_one_bit_decoder_reuses_unpackbits_storage_as_bool():
     assert ".reshape(shape) != 0" not in source
 
 
-def test_largest_component_uses_bool_storage_as_opencv_input(monkeypatch):
+def test_largest_component_uses_bool_storage_as_opencv_input():
     binary = np.zeros((31, 41), dtype=bool)
     binary[5:20, 8:25] = True
-    monkeypatch.setattr(cad, "bool_mask_to_uint8", lambda *_: (_ for _ in ()).throw(
-        AssertionError("bool component proposal must use its uint8 view")
-    ))
-
     component = cad.largest_enclosed_bright_component(binary)
 
     assert component is not None
     assert component.dtype == bool
     assert np.all(component[5:20, 8:25])
+
+
+def test_component_extraction_rejects_non_boolean_processing_raster():
+    binary = np.zeros((17, 19), dtype=np.uint8)
+    binary[3:14, 4:15] = 1
+
+    with pytest.raises(ValueError, match="authoritative.*bool"):
+        cad.extract_component(binary, (8, 8))
 
 
 def test_component_extraction_allocates_boolean_result_and_preserves_input():
@@ -72,7 +74,7 @@ def test_component_extraction_allocates_boolean_result_and_preserves_input():
     assert not component[15, 35]
 
 
-def test_guard_boundary_indices_match_established_inner_boundary_without_guard_copy(monkeypatch):
+def test_guard_boundary_indices_match_established_inner_boundary_without_guard_copy():
     guard = np.zeros((61, 83), dtype=bool)
     guard[7:54, 11:72] = True
     guard[25:31, 34:42] = False
@@ -88,9 +90,6 @@ def test_guard_boundary_indices_match_established_inner_boundary_without_guard_c
     ) != 0
     expected = np.flatnonzero(guard & ~eroded)
 
-    monkeypatch.setattr(cad, "bool_mask_to_uint8", lambda *_: (_ for _ in ()).throw(
-        AssertionError("guard boundary must use the authoritative bool storage")
-    ))
     actual = cad.find_guard_boundary_indices(guard)
 
     assert np.array_equal(actual, expected)
@@ -193,16 +192,16 @@ def test_morphological_cleanup_uses_bool_owner_as_opencv_source_and_destination(
     assert all(np.shares_memory(dst, mask) for _, dst, _ in seen)
 
 
-def test_extract_separated_seed_component_consumes_the_supplied_working_mask():
-    working_mask = np.zeros((81, 93), dtype=bool)
-    cv2.circle(working_mask.view(np.uint8), (46, 40), 18, 1, -1)
-    working_mask[5, 5] = True
-    guard = np.zeros_like(working_mask)
+def test_extract_separated_seed_component_consumes_the_supplied_processing_mask():
+    processing_mask = np.zeros((81, 93), dtype=bool)
+    cv2.circle(processing_mask.view(np.uint8), (46, 40), 18, 1, -1)
+    processing_mask[5, 5] = True
+    guard = np.zeros_like(processing_mask)
     guard[10:71, 12:81] = True
-    before = working_mask.copy()
+    before = processing_mask.copy()
 
     candidate = cad.extract_separated_seed_component(
-        working_mask,
+        processing_mask,
         (46, 40),
         guard,
         cad.find_guard_boundary_indices(guard),
@@ -211,15 +210,15 @@ def test_extract_separated_seed_component_consumes_the_supplied_working_mask():
     assert candidate is not None
     component, _ = candidate
     assert component.dtype == bool
-    assert not np.array_equal(working_mask, before)
-    assert np.all(working_mask.view(np.uint8) <= 1)
-    assert not working_mask[5, 5]
+    assert not np.array_equal(processing_mask, before)
+    assert np.all(processing_mask.view(np.uint8) <= 1)
+    assert not processing_mask[5, 5]
 
 
 def test_reused_cv_threshold_writes_gray_gt_t_into_existing_bool_storage():
     gray = np.arange(15 * 19, dtype=np.uint8).reshape(15, 19)
-    working_mask = gray > 17
-    allocation = working_mask
+    processing_mask = gray > 17
+    allocation = processing_mask
 
     for threshold in (63, 127, 201):
         _, returned_view = cv2.threshold(
@@ -227,9 +226,9 @@ def test_reused_cv_threshold_writes_gray_gt_t_into_existing_bool_storage():
             threshold,
             1,
             cv2.THRESH_BINARY,
-            dst=working_mask.view(np.uint8),
+            dst=processing_mask.view(np.uint8),
         )
-        assert working_mask is allocation
-        assert np.shares_memory(returned_view, working_mask)
-        assert np.array_equal(working_mask, gray > threshold)
-        assert np.all(working_mask.view(np.uint8) <= 1)
+        assert processing_mask is allocation
+        assert np.shares_memory(returned_view, processing_mask)
+        assert np.array_equal(processing_mask, gray > threshold)
+        assert np.all(processing_mask.view(np.uint8) <= 1)

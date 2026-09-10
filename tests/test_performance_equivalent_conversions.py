@@ -4,22 +4,13 @@ import numpy as np
 import circle_arc_detector as cad
 
 
-def test_bool_mask_to_uint8_is_exact_zero_255_conversion():
-    mask = np.array([[False, True, False], [True, True, False]], dtype=bool)
-    converted = cad.bool_mask_to_uint8(mask)
-    assert converted.dtype == np.uint8
-    assert np.array_equal(
-        converted,
-        np.array([[0, 255, 0], [255, 255, 0]], dtype=np.uint8),
-    )
-
-
 def test_uint8_binary_normalization_matches_bool_conversion_without_bool_temporary():
     mask_u8 = np.array(
         [[0, 1, 2, 255], [7, 0, 128, 0]],
         dtype=np.uint8,
     )
-    expected = cad.bool_mask_to_uint8(mask_u8 != 0)
+    expected = (mask_u8 != 0).astype(np.uint8)
+    expected *= 255
     converted = cv2.compare(mask_u8, 0, cv2.CMP_NE)
     assert np.array_equal(converted, expected)
 

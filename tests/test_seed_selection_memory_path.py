@@ -17,18 +17,15 @@ def _supported_disk(dtype=bool):
     return gray, component
 
 
-def test_bool_component_seed_selection_does_not_expand_to_0255_copy(monkeypatch):
+def test_bool_component_seed_selection_does_not_expand_to_0255_copy():
     gray, component = _supported_disk(bool)
     gray[25, 25] = 240
 
     # The optimized bool path must use the existing one-byte mask storage as a
-    # zero-copy uint8 0/1 view. Calling the generic 0/255 converter here would
-    # recreate a full-frame byte copy that this path intentionally avoids.
-    monkeypatch.setattr(
-        cad,
-        "bool_mask_to_uint8",
-        lambda *_: (_ for _ in ()).throw(AssertionError("bool mask copied")),
-    )
+    # zero-copy uint8 0/1 view rather than materializing a 0/255 conversion copy.
+    source = inspect.getsource(cad.brightest_supported_component_point)
+    assert "component.view(np.uint8)" in source
+    assert "component.astype(np.uint8)" not in source
 
     assert cad.brightest_supported_component_point(gray, component, SQUARE_5) == (
         25,

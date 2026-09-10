@@ -127,10 +127,11 @@ def test_stageb_converts_full_resolution_gray_to_float32_once_before_candidate_l
     assert "full_res_gray.astype(np.float32" not in profile_block
 
 
-def test_bool_mask_conversion_is_centralized_without_np_where_integer_intermediates():
-    assert "def bool_mask_to_uint8(" in TEXT
-    assert "mask_u8 = mask.astype(np.uint8)" in TEXT
-    assert "mask_u8 *= 255" in TEXT
+def test_bool_to_0255_conversion_is_local_to_ordinary_raster_resize():
+    resize_block = TEXT.split("def resize_img(", 1)[1].split("\n\ndef ", 1)[0]
+    assert "def bool_mask_to_uint8(" not in TEXT
+    assert "img = img.astype(np.uint8)" in resize_block
+    assert "img *= 255" in resize_block
     assert "np.where(source != 0, 255, 0)" not in TEXT
     assert "np.where(binary_mask != 0, 255, 0)" not in TEXT
     assert "np.where(component != 0, 255, 0)" not in TEXT
