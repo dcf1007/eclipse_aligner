@@ -120,11 +120,14 @@ def test_gui_button_callbacks_name_the_widget_boundary():
         assert f"def {name}(" in TEXT
 
 
-def test_stageb_converts_full_resolution_gray_to_float32_once_before_candidate_loop():
+def test_stageb_samples_edge_profiles_from_authoritative_uint8_gray():
     refine_block = TEXT.split("def refine_threshold(", 1)[1].split("\n\ndef ", 1)[0]
     profile_block = TEXT.split("def sample_grayscale_profiles(", 1)[1].split("\n\ndef ", 1)[0]
-    assert refine_block.count("full_res_gray.astype(np.float32)") == 1
-    assert "full_res_gray.astype(np.float32" not in profile_block
+    assert "full_res_gray.astype(np.float32)" not in refine_block
+    assert "full_res_gray_float" not in TEXT
+    assert "full_res_gray.dtype != np.uint8" in profile_block
+    assert "cv2.remap(" in profile_block
+    assert "full_res_gray," in profile_block
 
 
 def test_bool_to_0255_conversion_is_local_to_ordinary_raster_resize():

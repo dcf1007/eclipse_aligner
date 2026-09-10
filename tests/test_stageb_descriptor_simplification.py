@@ -59,7 +59,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
     cv2.circle(mask, (110, 110), 55, 255, -1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     contour = contours[0].reshape(-1, 2).astype(np.int32)
-    profiles, lengths = cad.sample_grayscale_profiles(gray.astype(np.float32), contour)
+    profiles, lengths = cad.sample_grayscale_profiles(gray, contour)
     assert profiles.shape[1] == 2 * cad.EDGE_PROFILE_RADIUS_PX + 1
     assert len(profiles) == len(lengths)
     assert 0 < len(profiles) < len(contour)
@@ -69,7 +69,7 @@ def test_profile_helper_returns_polygon_side_profiles_only():
 def test_clean_error_function_edge_gets_high_reliability_and_finite_distance():
     gray = _erf_edge_image(center=120.0, sigma=3.0)
     contour = _rectangle_contour(45, 45, 116, 174)
-    distance, reliability = cad.measure_edge_alignment(gray.astype(np.float32), contour)
+    distance, reliability = cad.measure_edge_alignment(gray, contour)
     assert math.isfinite(distance)
     assert 0.0 <= distance < 15.0
     assert reliability > 0.25
@@ -81,9 +81,18 @@ def test_non_sigmoid_profile_reduces_edge_reliability():
     disturbance = 55.0 * np.sin((x - 105.0) * math.pi / 6.0)
     disturbed = np.clip(clean.astype(np.float64) + disturbance[None, :], 0, 255).astype(np.uint8)
     contour = _rectangle_contour(45, 45, 116, 174)
-    _, clean_reliability = cad.measure_edge_alignment(clean.astype(np.float32), contour)
-    _, disturbed_reliability = cad.measure_edge_alignment(disturbed.astype(np.float32), contour)
+    _, clean_reliability = cad.measure_edge_alignment(clean, contour)
+    _, disturbed_reliability = cad.measure_edge_alignment(disturbed, contour)
     assert disturbed_reliability < clean_reliability
+
+
+def test_edge_profile_helpers_require_authoritative_uint8_grayscale():
+    gray = np.tile(np.arange(220, dtype=np.uint8), (220, 1))
+    contour = _rectangle_contour(45, 45, 116, 174)
+    with pytest.raises(ValueError, match="uint8"):
+        cad.sample_grayscale_profiles(gray.astype(np.float32), contour)
+    with pytest.raises(ValueError, match="uint8"):
+        cad.measure_edge_alignment(gray.astype(np.float32), contour)
 
 
 def test_stageb_source_has_only_one_edge_profile_helper_and_no_solidity_descriptor():
@@ -105,6 +114,7 @@ def test_stageb_source_has_only_one_edge_profile_helper_and_no_solidity_descript
     assert "def sample_grayscale_profiles(" in text
     assert "def measure_edge_alignment(" in text
     assert "def measure_hole_quality(" in text
+    assert "full_res_gray_float" not in text
     assert "edge_reliability**2" not in text
     assert "0.5 * q_solidity" not in text
     assert "math.erf(" in text
