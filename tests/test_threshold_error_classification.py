@@ -25,7 +25,7 @@ def test_work_res_tracked_component_disappearance_is_invariant_error(monkeypatch
 def test_full_res_seed_disappearance_after_guard_clipping_is_invariant_error(monkeypatch):
     gray = np.full((9, 9), 200, np.uint8)
     guard = np.ones_like(gray, bool)
-    binary = np.full_like(gray, 255)
+    binary = np.ones_like(gray, dtype=bool)
     monkeypatch.setattr(cad, "morphological_cleanup", lambda *_: binary.copy())
     monkeypatch.setattr(cad, "extract_component", lambda *_: None)
     with pytest.raises(ValueError, match="after clipping"):
@@ -39,7 +39,7 @@ def test_full_res_tracked_component_disappearance_while_lowering_is_invariant_er
     guard = np.ones_like(gray, bool)
     component = np.zeros_like(gray, bool)
     component[3:6, 3:6] = True
-    binary = np.full_like(gray, 255)
+    binary = np.ones_like(gray, dtype=bool)
     components = iter((component, None))
     monkeypatch.setattr(cad, "morphological_cleanup", lambda *_: binary.copy())
     monkeypatch.setattr(cad, "extract_component", lambda *_: next(components))
@@ -53,7 +53,7 @@ def test_full_res_seed_disappearance_after_surviving_cleanup_is_invariant_error(
     gray = np.full((9, 9), 200, np.uint8)
     guard = np.ones_like(gray, bool)
     component = guard.copy()
-    binary = np.full_like(gray, 255)
+    binary = np.ones_like(gray, dtype=bool)
     components = iter((component, None))
     monkeypatch.setattr(cad, "morphological_cleanup", lambda *_: binary.copy())
     monkeypatch.setattr(cad, "extract_component", lambda *_: next(components))

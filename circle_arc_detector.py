@@ -127,45 +127,37 @@ def generate_kernel(
 
 
 def morphological_cleanup(
-    source: np.ndarray,
+    mask: np.ndarray,
     kernel: np.ndarray,
-    threshold: int | None = None,
 ) -> np.ndarray:
-    """Apply one OPEN->CLOSE cleanup to grayscale-at-T or an existing binary mask."""
-    source = np.asarray(source)
+    """Consume one boolean mask through one in-place OPEN->CLOSE cleanup."""
+    mask = np.asarray(mask)
     kernel = np.asarray(kernel, dtype=np.uint8)
+    if mask.ndim != 2 or mask.dtype != bool:
+        raise ValueError(
+            "binary morphology requires an authoritative two-dimensional bool mask"
+        )
     if kernel.ndim != 2 or kernel.size == 0 or not np.any(kernel):
         raise ValueError("kernel must be a non-empty two-dimensional mask")
 
-    if threshold is not None:
-        if source.ndim != 2 or source.dtype != np.uint8:
-            raise ValueError(
-                "thresholded morphology requires authoritative 2D uint8 grayscale"
-            )
-        if not isinstance(threshold, (int, np.integer)) or not 0 <= int(threshold) <= 255:
-            raise ValueError("threshold must be an integer from 0 to 255")
-        cleaned = cv2.compare(source, int(threshold), cv2.CMP_GT)
-    else:
-        if source.ndim != 2 or source.dtype not in (bool, np.uint8):
-            raise ValueError("binary morphology requires a 2D bool or uint8 mask")
-        cleaned = (
-            bool_mask_to_uint8(source)
-            if source.dtype == bool
-            else cv2.compare(source, 0, cv2.CMP_NE)
-        )
-
-    cleaned = cv2.morphologyEx(
-        cleaned,
+    # The bool raster owns the processing state. OpenCV needs uint8 storage, so
+    # expose the same canonical 0/1 bytes and write OPEN and CLOSE back into them.
+    mask_u8 = mask.view(np.uint8)
+    cv2.morphologyEx(
+        mask_u8,
         cv2.MORPH_OPEN,
         kernel,
+        dst=mask_u8,
         iterations=1,
     )
-    return cv2.morphologyEx(
-        cleaned,
+    cv2.morphologyEx(
+        mask_u8,
         cv2.MORPH_CLOSE,
         kernel,
+        dst=mask_u8,
         iterations=1,
     )
+    return mask
 
 
 def resize_img(
@@ -931,16 +923,16 @@ def find_full_res_separation_threshold(
 
     full_res_guard_boundary_indices = find_guard_boundary_indices(full_res_guard_mask)
 
-    # Evaluate the starting T after the fixed D7 cleanup used by coarse separation.
-    binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, start_T)
-    if binary[seed_y, seed_x] == 0:
+    # This reusable bool raster starts as gray > start_T. After each threshold is
+    # consumed by D7 cleanup and guard clipping, the next T overwrites the same bytes.
+    working_mask = full_res_gray > start_T
+    morphological_cleanup(working_mask, SEPARATION_KERNEL)
+    if not working_mask[seed_y, seed_x]:
         raise ThresholdResolutionError(
             f"Full-resolution tracking seed does not survive D7 cleanup at start T={start_T}"
         )
-    cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
-    binary = binary.view(np.bool_)
-    component = extract_component(binary, full_res_seed_point)
-    del binary
+    np.logical_and(working_mask, full_res_guard_mask, out=working_mask)
+    component = extract_component(working_mask, full_res_seed_point)
     if component is None:
         raise ValueError(
             "full-resolution tracking seed disappeared after clipping to its containing guard"
@@ -950,15 +942,18 @@ def find_full_res_separation_threshold(
         best_T = start_T
         best_component = component
         for threshold in range(start_T - 1, -1, -1):
-            binary = morphological_cleanup(
+            # The previous threshold contents are dead. Rebuild gray > T directly in
+            # the existing bool-owned storage instead of allocating another full mask.
+            cv2.threshold(
                 full_res_gray,
-                SEPARATION_KERNEL,
                 threshold,
+                1,
+                cv2.THRESH_BINARY,
+                dst=working_mask.view(np.uint8),
             )
-            cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
-            binary = binary.view(np.bool_)
-            component = extract_component(binary, full_res_seed_point)
-            del binary
+            morphological_cleanup(working_mask, SEPARATION_KERNEL)
+            np.logical_and(working_mask, full_res_guard_mask, out=working_mask)
+            component = extract_component(working_mask, full_res_seed_point)
             if component is None:
                 raise ValueError(
                     "tracked full-resolution seed component disappeared while lowering T"
@@ -970,13 +965,18 @@ def find_full_res_separation_threshold(
         return best_T, best_component
 
     for threshold in range(start_T + 1, 256):
-        binary = morphological_cleanup(full_res_gray, SEPARATION_KERNEL, threshold)
-        if binary[seed_y, seed_x] == 0:
+        cv2.threshold(
+            full_res_gray,
+            threshold,
+            1,
+            cv2.THRESH_BINARY,
+            dst=working_mask.view(np.uint8),
+        )
+        morphological_cleanup(working_mask, SEPARATION_KERNEL)
+        if not working_mask[seed_y, seed_x]:
             break
-        cv2.bitwise_and(binary, full_res_guard_mask.view(np.uint8), dst=binary)
-        binary = binary.view(np.bool_)
-        component = extract_component(binary, full_res_seed_point)
-        del binary
+        np.logical_and(working_mask, full_res_guard_mask, out=working_mask)
+        component = extract_component(working_mask, full_res_seed_point)
         if component is None:
             raise ValueError(
                 "full-resolution tracking seed disappeared after surviving D7 cleanup"
@@ -1497,28 +1497,32 @@ def measure_edge_alignment(
 
 
 def extract_separated_seed_component(
-    threshold_mask: np.ndarray,
+    working_mask: np.ndarray,
     seed_point: tuple[int, int],
     guard_mask: np.ndarray,
     guard_boundary_indices: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return the P3/P5/P7-cleaned seeded component and contour when separated."""
-    if threshold_mask.ndim != 2 or threshold_mask.dtype != bool:
-        raise ValueError("threshold mask must be a two-dimensional bool mask")
-    if guard_mask.ndim != 2 or guard_mask.dtype != bool or guard_mask.shape != threshold_mask.shape:
-        raise ValueError("guard must be a boolean mask matching threshold mask")
+    """Consume a bool working mask through P3/P5/P7 and return its separated component."""
+    if working_mask.ndim != 2 or working_mask.dtype != bool:
+        raise ValueError("working mask must be a two-dimensional bool mask")
+    if (
+        guard_mask.ndim != 2
+        or guard_mask.dtype != bool
+        or guard_mask.shape != working_mask.shape
+    ):
+        raise ValueError("guard must be a boolean mask matching working mask")
 
-    cleaned = threshold_mask
+    # Progressive cleanup owns this working raster: every kernel modifies the same
+    # bool storage in place, then guard clipping consumes those same bytes.
     for kernel in SOLAR_CLEANUP_KERNELS:
-        cleaned = morphological_cleanup(cleaned, kernel)
-    # morphological_cleanup still returns uint8 for now. The 0/1 guard view clips and
-    # canonicalizes those same bytes so downstream processing again owns a bool mask.
-    cv2.bitwise_and(cleaned, guard_mask.view(np.uint8), dst=cleaned)
-    cleaned = cleaned.view(np.bool_)
-    component = extract_component(cleaned, seed_point)
+        morphological_cleanup(working_mask, kernel)
+    np.logical_and(working_mask, guard_mask, out=working_mask)
+
+    component = extract_component(working_mask, seed_point)
     if component is None or np.any(component.ravel()[guard_boundary_indices]):
         return None
     return component, find_external_contour(component)
+
 
 
 def refine_threshold(
@@ -1564,11 +1568,22 @@ def refine_threshold(
         raw_reference_roughness: float | None = None
 
         max_threshold = min(255, base_threshold + MAX_T_REFINEMENT_STEPS)
+
+        # Allocate the one Stage-B threshold workspace normally at the first T. Every
+        # later threshold, and any raw-reference reconstruction, reuses these bytes.
+        working_mask = full_res_gray > base_threshold
         for threshold in range(base_threshold, max_threshold + 1):
-            threshold_mask = full_res_gray > threshold
+            if threshold != base_threshold:
+                cv2.threshold(
+                    full_res_gray,
+                    threshold,
+                    1,
+                    cv2.THRESH_BINARY,
+                    dst=working_mask.view(np.uint8),
+                )
 
             candidate = extract_separated_seed_component(
-                threshold_mask,
+                working_mask,
                 full_res_seed_point,
                 full_res_guard_mask,
                 full_res_guard_boundary_indices,
@@ -1606,13 +1621,18 @@ def refine_threshold(
             # alive while the raw reference for this threshold is measured.
             del candidate
 
-            # Raw geometry only anchors the largest/roughest end of the score scale.
-            # Measure the first separated raw component once, then stop evaluating raw.
+            # P3/P5/P7 consumed working_mask. Only while the raw score reference is
+            # unresolved, restore gray > T into that same storage and inspect it raw.
             if raw_reference_area is None:
-                raw_mask = threshold_mask.copy()
-                np.logical_and(raw_mask, full_res_guard_mask, out=raw_mask)
-                raw_component = extract_component(raw_mask, full_res_seed_point)
-                del raw_mask
+                cv2.threshold(
+                    full_res_gray,
+                    threshold,
+                    1,
+                    cv2.THRESH_BINARY,
+                    dst=working_mask.view(np.uint8),
+                )
+                np.logical_and(working_mask, full_res_guard_mask, out=working_mask)
+                raw_component = extract_component(working_mask, full_res_seed_point)
                 if (
                     raw_component is not None
                     and not np.any(
@@ -1628,9 +1648,8 @@ def refine_threshold(
                     del raw_contour
                 del raw_component
 
-            # This threshold mask has served both cleaned-candidate and raw-reference
-            # measurement and should not overlap the next full-resolution threshold.
-            del threshold_mask
+        # The one reusable full-resolution mask has now served the complete window.
+        del working_mask
 
         if not measurements:
             raise ThresholdResolutionError(
@@ -1851,14 +1870,14 @@ def resolve_threshold(
             )
 
         full_res_guard_boundary_indices = find_guard_boundary_indices(full_res_guard_mask)
-        threshold_mask = full_res_gray > threshold
+        working_mask = full_res_gray > threshold
         candidate = extract_separated_seed_component(
-            threshold_mask,
+            working_mask,
             full_res_seed_point,
             full_res_guard_mask,
             full_res_guard_boundary_indices,
         )
-        del threshold_mask
+        del working_mask
         if candidate is None:
             raise ThresholdResolutionError(
                 f"No separated cleaned solar component exists at selected T={threshold}"

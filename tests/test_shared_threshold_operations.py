@@ -38,9 +38,9 @@ def test_extract_separated_seed_component_runs_exact_progressive_p357(monkeypatc
     calls = []
     real = cad.morphological_cleanup
 
-    def record(source, kernel, threshold=None):
+    def record(mask, kernel):
         calls.append(kernel.shape)
-        return real(source, kernel, threshold)
+        return real(mask, kernel)
 
     monkeypatch.setattr(cad, "morphological_cleanup", record)
     candidate = cad.extract_separated_seed_component(

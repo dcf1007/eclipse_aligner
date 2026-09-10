@@ -37,20 +37,8 @@ def test_refinement_window_is_base_through_base_plus_ten(monkeypatch):
     assert result.separation_threshold_complete
     base_threshold = result.full_res_separation_threshold
 
-    seen = []
-    real = cad.morphological_cleanup
-
-    def record(source, kernel, threshold=None):
-        if threshold is not None:
-            seen.append(threshold)
-        return real(source, kernel, threshold)
-
-    monkeypatch.setattr(cad, "morphological_cleanup", record)
     monkeypatch.setattr(cad, "measure_edge_alignment", lambda *_: (0.5, 1.0))
     cad.refine_threshold(gray, {"auto_threshold_result": result})
-    # Stage B thresholds once then applies P357 to the existing mask, so no
-    # threshold-mode morphology is used during refinement.
-    assert seen == []
     assert base_threshold <= result.full_res_refined_threshold <= min(
         255, base_threshold + cad.MAX_T_REFINEMENT_STEPS
     )
@@ -67,9 +55,9 @@ def test_refinement_inlines_progressive_p357_cleanup(monkeypatch):
     calls = []
     real = cad.morphological_cleanup
 
-    def record(source, kernel, threshold=None):
+    def record(mask, kernel):
         calls.append(kernel.shape)
-        return real(source, kernel, threshold)
+        return real(mask, kernel)
 
     monkeypatch.setattr(cad, "morphological_cleanup", record)
     monkeypatch.setattr(cad, "measure_edge_alignment", lambda *_: (0.5, 1.0))

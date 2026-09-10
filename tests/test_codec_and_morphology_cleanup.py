@@ -122,35 +122,31 @@ def test_contour_decoder_rejects_empty_and_incomplete_points():
         cad.decompress_contour(zlib.compress(b"1234567"))
 
 
-def test_morphological_cleanup_threshold_mode_matches_explicit_open_close():
-    gray = np.zeros((31, 31), np.uint8)
-    gray[6:25, 6:25] = 180
-    gray[3, 3] = 255
-    kernel = cad.generate_kernel((5, 5), round_kernel=True)
-    expected = cv2.compare(gray, 100, cv2.CMP_GT)
-    expected = cv2.morphologyEx(expected, cv2.MORPH_OPEN, kernel)
-    expected = cv2.morphologyEx(expected, cv2.MORPH_CLOSE, kernel)
-    assert np.array_equal(cad.morphological_cleanup(gray, kernel, 100), expected)
-
-
-def test_morphological_cleanup_mask_mode_matches_explicit_open_close():
+def test_morphological_cleanup_matches_explicit_open_close_in_place():
     mask = np.zeros((31, 31), bool)
     mask[6:25, 6:25] = True
     mask[3, 3] = True
-    kernel = cad.generate_kernel((3, 3), round_kernel=True)
-    expected = np.where(mask, 255, 0).astype(np.uint8)
-    expected = cv2.morphologyEx(expected, cv2.MORPH_OPEN, kernel)
-    expected = cv2.morphologyEx(expected, cv2.MORPH_CLOSE, kernel)
-    assert np.array_equal(cad.morphological_cleanup(mask, kernel), expected)
+    kernel = cad.generate_kernel((5, 5), round_kernel=True)
+
+    expected_u8 = mask.astype(np.uint8) * 255
+    expected_u8 = cv2.morphologyEx(expected_u8, cv2.MORPH_OPEN, kernel)
+    expected_u8 = cv2.morphologyEx(expected_u8, cv2.MORPH_CLOSE, kernel)
+    expected = expected_u8 != 0
+
+    returned = cad.morphological_cleanup(mask, kernel)
+
+    assert returned is mask
+    assert returned.dtype == bool
+    assert np.array_equal(returned, expected)
+    assert np.all(returned.view(np.uint8) <= 1)
 
 
-def test_morphological_cleanup_uint8_mask_mode_matches_bool_membership():
-    mask_u8 = np.zeros((31, 31), np.uint8)
-    mask_u8[6:25, 6:25] = 9
-    mask_u8[3, 3] = 200
+def test_morphological_cleanup_rejects_non_boolean_processing_rasters():
     kernel = cad.generate_kernel((3, 3), round_kernel=True)
-    expected = cad.morphological_cleanup(mask_u8 != 0, kernel)
-    assert np.array_equal(cad.morphological_cleanup(mask_u8, kernel), expected)
+    with pytest.raises(ValueError, match="authoritative.*bool"):
+        cad.morphological_cleanup(np.zeros((31, 31), np.uint8), kernel)
+    with pytest.raises(ValueError, match="authoritative.*bool"):
+        cad.morphological_cleanup(np.zeros((31, 31), np.float32), kernel)
 
 
 def test_solardata_masks_use_shared_self_describing_codec_and_reuse_exact_state(monkeypatch):

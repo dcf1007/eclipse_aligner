@@ -161,3 +161,75 @@ def test_coarse_full_resolution_result_is_boolean():
 
     assert component.dtype == bool
     assert np.all(component.view(np.uint8) <= 1)
+
+
+
+def test_morphological_cleanup_uses_bool_owner_as_opencv_source_and_destination(monkeypatch):
+    mask = np.zeros((41, 53), dtype=bool)
+    cv2.circle(mask.view(np.uint8), (26, 20), 12, 1, -1)
+    mask[3, 3] = True
+    kernel = cad.generate_kernel((5, 5), round_kernel=True)
+    before = mask.copy()
+    expected_u8 = before.astype(np.uint8) * 255
+    expected_u8 = cv2.morphologyEx(expected_u8, cv2.MORPH_OPEN, kernel)
+    expected_u8 = cv2.morphologyEx(expected_u8, cv2.MORPH_CLOSE, kernel)
+    expected = expected_u8 != 0
+
+    real = cv2.morphologyEx
+    seen = []
+
+    def morphology(src, op, morphology_kernel, dst=None, iterations=1):
+        seen.append((src, dst, op))
+        return real(src, op, morphology_kernel, dst=dst, iterations=iterations)
+
+    monkeypatch.setattr(cv2, "morphologyEx", morphology)
+    returned = cad.morphological_cleanup(mask, kernel)
+
+    assert returned is mask
+    assert np.array_equal(mask, expected)
+    assert np.all(mask.view(np.uint8) <= 1)
+    assert [entry[2] for entry in seen] == [cv2.MORPH_OPEN, cv2.MORPH_CLOSE]
+    assert all(np.shares_memory(src, mask) for src, _, _ in seen)
+    assert all(np.shares_memory(dst, mask) for _, dst, _ in seen)
+
+
+def test_extract_separated_seed_component_consumes_the_supplied_working_mask():
+    working_mask = np.zeros((81, 93), dtype=bool)
+    cv2.circle(working_mask.view(np.uint8), (46, 40), 18, 1, -1)
+    working_mask[5, 5] = True
+    guard = np.zeros_like(working_mask)
+    guard[10:71, 12:81] = True
+    before = working_mask.copy()
+
+    candidate = cad.extract_separated_seed_component(
+        working_mask,
+        (46, 40),
+        guard,
+        cad.find_guard_boundary_indices(guard),
+    )
+
+    assert candidate is not None
+    component, _ = candidate
+    assert component.dtype == bool
+    assert not np.array_equal(working_mask, before)
+    assert np.all(working_mask.view(np.uint8) <= 1)
+    assert not working_mask[5, 5]
+
+
+def test_reused_cv_threshold_writes_gray_gt_t_into_existing_bool_storage():
+    gray = np.arange(15 * 19, dtype=np.uint8).reshape(15, 19)
+    working_mask = gray > 17
+    allocation = working_mask
+
+    for threshold in (63, 127, 201):
+        _, returned_view = cv2.threshold(
+            gray,
+            threshold,
+            1,
+            cv2.THRESH_BINARY,
+            dst=working_mask.view(np.uint8),
+        )
+        assert working_mask is allocation
+        assert np.shares_memory(returned_view, working_mask)
+        assert np.array_equal(working_mask, gray > threshold)
+        assert np.all(working_mask.view(np.uint8) <= 1)
